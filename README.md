@@ -84,3 +84,53 @@ pip install 'quack-kernels[dev,cu13]' --extra-index-url https://download.pytorch
 # Do not use uv for CUDA 13.x installs yet; use pip instead.
 # See https://github.com/NVIDIA/cutlass/issues/3259
 ```
+
+## Conda development environment (CUDA 12.9)
+
+Create a clean environment rather than cloning an existing environment, which may bring in
+incompatible CUDA or CUTLASS packages:
+
+```bash
+conda create --name zh_quack_env312 python=3.12 pip -y
+conda activate zh_quack_env312
+python -m pip install --upgrade pip
+```
+
+From the repository root, install the CUDA 12.9 build of PyTorch first. Using the CUDA-specific
+index prevents pip from selecting a CUDA 13 build that requires a newer driver:
+
+```bash
+python -m pip install "torch==2.13.0" \
+  --index-url https://download.pytorch.org/whl/cu129
+python -m pip install \
+  "cuda-python==12.9.4" \
+  "cuda-bindings==12.9.4"
+```
+
+Install QuACK in editable mode so changes to this checkout are used by new Python processes:
+
+```bash
+python -m pip install -e '.[dev]'
+```
+
+Validate the environment and editable installation:
+
+```bash
+python -m pip check
+python -c "import quack, torch; print(torch.__version__, torch.version.cuda); print(torch.cuda.is_available()); print(quack.__file__)"
+```
+
+Finally, run a small numerical GPU check:
+
+```bash
+python - <<'PY'
+import torch
+
+from quack.softmax import softmax
+
+x = torch.randn(2, 1024, device="cuda", dtype=torch.bfloat16)
+y = softmax(x)
+torch.testing.assert_close(y, torch.softmax(x, dim=-1), atol=1e-2, rtol=1e-2)
+print("QuACK works:", y.shape, torch.cuda.get_device_name())
+PY
+```
