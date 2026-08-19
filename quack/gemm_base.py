@@ -793,7 +793,10 @@ class GemmBase:
                 cute.size(mB, mode=[0]),
                 self.cta_tile_shape_mnk[1] * self.cluster_shape_mnk[1],
             )
-            group_size = min(scheduler_args.max_swizzle_size, num_clusters_n)
+            # Both operands are staged Int32 values. Python ``min`` would try
+            # to resolve their comparison while tracing (meta time), which
+            # raises PHASE_DYNAMIC_TO_STATIC_BOOL; emit a device-side min.
+            group_size = cutlass.min(scheduler_args.max_swizzle_size, num_clusters_n)
             tile_sched_args = GatherTableTileSchedulerArguments(
                 work_table=scheduler_args.gather_table,
                 group_size=group_size,
