@@ -70,6 +70,7 @@ def _compile_gemm(
     varlen_m,
     varlen_k,
     gather_A,
+    gather_table,
     use_tma_gather,
     has_batch_idx_permute,
     device_capacity,
@@ -178,9 +179,12 @@ def _compile_gemm(
         has_batch_idx_permute,
         l,
         has_ag=has_ag,
+        has_gather_table=gather_table,
     )
     aidx_len = m if varlen_m else (k if varlen_k else None)
-    varlen_args = make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len)
+    varlen_args = make_fake_varlen_args(
+        varlen_m, varlen_k, gather_A, aidx_len, gather_table=gather_table
+    )
     if sf_dtype is not None:
         # Padded SF buffers have a static batch dim of exactly 1 (not l): SFA for
         # varlen_m (M-padded) and varlen_k (K-padded); SFB is K-padded too for
@@ -219,6 +223,7 @@ def _compile_gemm(
         b_transposed=b_kn,
         a_mma_dtype=a_mma_dtype,
         b_mma_dtype=b_mma_dtype,
+        gather_table=gather_table,
     )
 
 
@@ -440,6 +445,12 @@ def gemm(
     # num_shards, first_shard) drive the shard-major rotated schedule and the
     # load-warp arrival gate.
     ag_args: Optional[AllGatherArguments] = None,
+    # Hopper table-scheduled gather-A: contiguous int32 [Q, 4] rows containing
+    # (expert_id, route_start, route_end, cid_n_base). Each row expands to
+    # min(max_swizzle_size, ceil(N / tile_N)) consecutive AlongN work IDs.
+    # Rows must satisfy 0 <= expert_id < E, 0 <= route_start < route_end <= R,
+    # and route_end - route_start <= cluster_M * tile_M.
+    gather_work_table: Optional[Tensor] = None,
 ) -> _GemmPlan:
     alpha_mode = scalar_mode(alpha)
     beta_mode = scalar_mode(beta)
@@ -467,6 +478,7 @@ def gemm(
         tensor_key(colvec_bias),
         tensor_key(cu_seqlens_m),
         tensor_key(cu_seqlens_k),
+        tensor_key(gather_work_table),
         A_idx is not None,
         batch_idx_permute is not None,
         tile_count_semaphore is not None,
@@ -522,6 +534,7 @@ def gemm(
             cu_seqlens_m=cu_seqlens_m,
             cu_seqlens_k=cu_seqlens_k,
             A_idx=A_idx,
+            gather_work_table=gather_work_table,
             batch_idx_permute=batch_idx_permute,
             add_to_output=add_to_output,
             rounding_mode=rounding_mode,
@@ -559,6 +572,7 @@ def gemm(
         cu_seqlens_m=cu_seqlens_m,
         cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
+        gather_work_table=gather_work_table,
         batch_idx_permute=batch_idx_permute,
         SFA=SFA,
         SFB=SFB,
@@ -586,6 +600,7 @@ def run_gemm_plan(
     cu_seqlens_m: Optional[Tensor] = None,
     cu_seqlens_k: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,
+    gather_work_table: Optional[Tensor] = None,
     batch_idx_permute: Optional[Tensor] = None,
     SFA: Optional[Tensor] = None,
     SFB: Optional[Tensor] = None,
@@ -648,7 +663,12 @@ def run_gemm_plan(
             mSFDCol=SFDCol,
         )
     scheduler_args = plan_scheduler_args(
-        plan, tile_count_semaphore, batch_idx_permute, ag_args, A=A
+        plan,
+        tile_count_semaphore,
+        batch_idx_permute,
+        ag_args,
+        A=A,
+        gather_table=gather_work_table,
     )
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
 
@@ -690,6 +710,7 @@ def _build_gemm_plan(
     cu_seqlens_m,
     cu_seqlens_k,
     A_idx,
+    gather_work_table,
     batch_idx_permute,
     add_to_output,
     rounding_mode,
@@ -711,15 +732,71 @@ def _build_gemm_plan(
     sfd_norm_const=None,
     SFDCol=None,
 ) -> _GemmPlan:
-    varlen_m = cu_seqlens_m is not None
+    gather_table = gather_work_table is not None
+    varlen_m = cu_seqlens_m is not None or gather_table
     varlen_k = cu_seqlens_k is not None
     varlen = varlen_m or varlen_k
     gather_A = A_idx is not None
     blockscaled = SFA is not None
-    assert not (varlen_m and varlen_k), "Only one of cu_seqlens_m and cu_seqlens_k"
+    assert not (cu_seqlens_m is not None and gather_table), (
+        "cu_seqlens_m and gather_work_table are mutually exclusive"
+    )
+    assert not (varlen_m and varlen_k), "Only one of varlen_m and cu_seqlens_k"
     if gather_A:
         assert varlen, "gather_A requires varlen"
         assert cluster_N == 1, "gather_A requires cluster_N=1"
+    if gather_table:
+        if get_device_capacity(A.device)[0] != 9:
+            raise ValueError("gather_work_table is currently supported only on Hopper (SM90)")
+        if not gather_A:
+            raise ValueError("gather_work_table requires A_idx")
+        if not persistent or is_dynamic_persistent:
+            raise ValueError("gather_work_table requires static persistent scheduling")
+        if pingpong:
+            raise ValueError("gather_work_table does not support pingpong yet")
+        if cluster_N != 1 or cluster_K != 1:
+            raise ValueError("gather_work_table requires cluster_N=cluster_K=1")
+        if C is not None or rowvec_bias is not None or colvec_bias is not None:
+            raise ValueError(
+                "gather_work_table currently supports only the default C=None epilogue"
+            )
+        if add_to_output or rounding_mode != RoundingMode.RN:
+            raise ValueError(
+                "gather_work_table does not support add_to_output or stochastic rounding"
+            )
+        if batch_idx_permute is not None or concat_layout or has_ag:
+            raise ValueError(
+                "gather_work_table is incompatible with batch permutation, concat, and AllGather"
+            )
+        if SFA is not None or SFB is not None or SFD is not None or SFDCol is not None:
+            raise ValueError("gather_work_table does not support block-scaled operands or outputs")
+        if split_k != 1:
+            raise ValueError("gather_work_table does not support split_k")
+        if A.ndim != 2 or B.ndim != 3 or D.ndim != 2 or A_idx.ndim != 1:
+            raise ValueError("gather_work_table expects A[T,K], B[E,N,K], D[R,N], A_idx[R]")
+        if gather_work_table.ndim != 2 or gather_work_table.shape[1] != 4:
+            raise ValueError("gather_work_table must have shape [Q, 4]")
+        if gather_work_table.dtype != torch.int32 or not gather_work_table.is_contiguous():
+            raise ValueError("gather_work_table must be a contiguous int32 tensor")
+        if gather_work_table.device != A.device or A_idx.device != A.device:
+            raise ValueError("gather_work_table, A_idx, and GEMM operands must share a device")
+        if A_idx.dtype != torch.int32:
+            raise ValueError("gather_work_table gather requires int32 A_idx")
+        if D.shape != (A_idx.shape[0], B.shape[1]):
+            raise ValueError(
+                f"D must have shape ({A_idx.shape[0]}, {B.shape[1]}), got {tuple(D.shape)}"
+            )
+        if A.shape[1] != B.shape[2]:
+            raise ValueError(f"K mismatch between A {tuple(A.shape)} and B {tuple(B.shape)}")
+        clusters_n = (B.shape[1] + tile_N - 1) // tile_N
+        work_group_size = min(max_swizzle_size, clusters_n)
+        if work_group_size <= 0 or clusters_n % work_group_size != 0:
+            raise ValueError(
+                f"gather_work_table requires clusters_n % x == 0, got clusters_n="
+                f"{clusters_n}, x={work_group_size}"
+            )
+        if gather_work_table.shape[0] == 0:
+            raise ValueError("gather_work_table must contain at least one row")
     if has_ag:
         assert not varlen and not gather_A, "AllGather+GEMM requires a dense GEMM"
         assert persistent, "AllGather+GEMM requires the persistent scheduler"
@@ -936,6 +1013,7 @@ def _build_gemm_plan(
         varlen_m,
         varlen_k,
         gather_A,
+        gather_table,
         use_tma_gather,
         batch_idx_permute is not None,
         device_capacity,
@@ -988,7 +1066,12 @@ def _build_gemm_plan(
             sr_seed=None,
         )
     scheduler_static = None
-    if not scheduler_uses_semaphore and batch_idx_permute is None and not has_ag:
+    if (
+        not scheduler_uses_semaphore
+        and batch_idx_permute is None
+        and not has_ag
+        and not gather_table
+    ):
         scheduler_static = make_scheduler_args(max_active_clusters, max_swizzle_size, None, None)
 
     return _GemmPlan(

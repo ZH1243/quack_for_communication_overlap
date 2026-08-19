@@ -1,8 +1,9 @@
 # Hopper gather GEMM runners
 
-This directory contains two standalone benchmark runners for QuACK's grouped
-GEMM on NVIDIA Hopper GPUs (SM90). They use the same uniform Mixture-of-Experts
-(MoE) routing setup but differ in where routed token rows are gathered.
+This directory contains three standalone benchmark runners for QuACK's grouped
+GEMM on NVIDIA Hopper GPUs (SM90). The original pair uses uniform
+Mixture-of-Experts (MoE) routing; the table-scheduled runner also supports
+uneven expert lengths.
 
 ## Scripts
 
@@ -30,7 +31,16 @@ The reported time **does not include** the pre-gather operation. Consequently,
 this runner measures the GEMM after pre-gathering, not the full pre-gather plus
 GEMM pipeline. Keep this distinction in mind when comparing the two scripts.
 
-Both runners exclude kernel compilation, warmup, CUDA graph capture, and the
+### `hopper_gather_table_gemm.py`
+
+Benchmarks the new Hopper table-scheduled gather-A path. It passes no
+`cu_seqlens_m`; instead, a GPU-resident contiguous int32 `[Q, 4]` table stores
+`(expert_id, route_start, route_end, cid_n_base)`. Each row expands to
+`x = min(max_swizzle_size, ceil(N / tile_N))` consecutive AlongN work IDs.
+The runner distributes routes near-evenly across experts, including true
+varlen-M when `R` is not divisible by `E`.
+
+All runners exclude kernel compilation, warmup, CUDA graph capture, and the
 correctness check from the reported kernel time.
 
 ## Requirements
@@ -62,6 +72,12 @@ Run the pre-gathered benchmark with the same settings:
 python run/hopper_pregather_gemm.py
 ```
 
+Run the table-scheduled fused gather benchmark:
+
+```bash
+python run/hopper_gather_table_gemm.py
+```
+
 An explicit example suitable for comparing their reported GEMM times is:
 
 ```bash
@@ -74,6 +90,11 @@ python run/hopper_pregather_gemm.py \
     --tokens 4096 --hidden 4096 --output-dim 4096 \
     --experts 8 --routes 8192 \
     --warmup 5 --iterations 100 --timing-samples 5
+
+python run/hopper_gather_table_gemm.py \
+    --tokens 4096 --hidden 4096 --output-dim 4096 \
+    --experts 8 --routes 8195 \
+    --warmup 5 --iterations 100 --timing-samples 5
 ```
 
 The first run of a new configuration may pause while QuACK compiles a
@@ -85,11 +106,15 @@ Use `--help` to see the command-line interface directly:
 ```bash
 python run/hopper_gather_gemm.py --help
 python run/hopper_pregather_gemm.py --help
+python run/hopper_gather_table_gemm.py --help
 ```
 
 ## Runtime parameters
 
-The two scripts accept the same parameters.
+The original fused and pre-gathered scripts accept the same parameters. The
+table runner accepts the applicable subset (it is static-persistent and does
+not expose `--pingpong`) and permits `--routes` values not divisible by the
+expert count.
 
 | Parameter | Default | Description |
 | --- | ---: | --- |

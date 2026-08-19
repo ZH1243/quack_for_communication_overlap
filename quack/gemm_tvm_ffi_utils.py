@@ -256,6 +256,7 @@ def make_scheduler_args(
     tile_count_semaphore,
     batch_idx_permute=None,
     ag_args=None,  # quack.gemm.AllGatherArguments or None
+    gather_table=None,
 ):
     return TileSchedulerOptions(
         max_active_clusters=Int32(max_active_clusters),
@@ -276,10 +277,13 @@ def make_scheduler_args(
             else None
         ),
         batch_idx_permute=batch_idx_permute,
+        gather_table=gather_table,
     )
 
 
-def make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l_sym, has_ag=False):
+def make_fake_scheduler_args(
+    has_semaphore, has_batch_idx_permute, l_sym, has_ag=False, has_gather_table=False
+):
     return TileSchedulerOptions(
         max_active_clusters=Int32(1),
         max_swizzle_size=Int32(8),
@@ -305,11 +309,16 @@ def make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l_sym, has_ag
             if has_batch_idx_permute
             else None
         ),
+        gather_table=(
+            fake_tensor(Int32, (cute.sym_int(), 4), leading_dim=1, divisibility=4)
+            if has_gather_table
+            else None
+        ),
     )
 
 
 def make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx, cu_tiles_m=None):
-    if cu_seqlens_m is None and cu_seqlens_k is None:
+    if cu_seqlens_m is None and cu_seqlens_k is None and A_idx is None:
         return None
     return VarlenArguments(
         mCuSeqlensM=cu_seqlens_m,
@@ -331,13 +340,17 @@ def compute_cu_tiles_m(cu_seqlens_m, tile_m_cta):
     return torch.cat([tiles.new_zeros(1), tiles.cumsum(0, dtype=torch.int32)])
 
 
-def make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len, has_cu_tiles_m=False):
-    if not varlen_m and not varlen_k:
+def make_fake_varlen_args(
+    varlen_m, varlen_k, gather_A, aidx_len, has_cu_tiles_m=False, gather_table=False
+):
+    if not varlen_m and not varlen_k and not gather_table:
         return None
     num_seqlens = cute.sym_int()
     return VarlenArguments(
         mCuSeqlensM=(
-            fake_tensor(Int32, (num_seqlens,), leading_dim=0, divisibility=4) if varlen_m else None
+            fake_tensor(Int32, (num_seqlens,), leading_dim=0, divisibility=4)
+            if varlen_m and not gather_table
+            else None
         ),
         mCuSeqlensK=(
             fake_tensor(Int32, (num_seqlens,), leading_dim=0, divisibility=4) if varlen_k else None
@@ -348,7 +361,7 @@ def make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len, has_cu_tiles_m
         # cu_tiles_m has num_seqs + 1 entries, same as cu_seqlens_m — share the sym.
         mCuTilesM=(
             fake_tensor(Int32, (num_seqlens,), leading_dim=0, divisibility=4)
-            if has_cu_tiles_m
+            if has_cu_tiles_m and not gather_table
             else None
         ),
     )
@@ -468,7 +481,14 @@ def validate_ag_geometry(A, ag_args, tile_M, cluster_M):
     )
 
 
-def plan_scheduler_args(plan, tile_count_semaphore, batch_idx_permute=None, ag_args=None, A=None):
+def plan_scheduler_args(
+    plan,
+    tile_count_semaphore,
+    batch_idx_permute=None,
+    ag_args=None,
+    A=None,
+    gather_table=None,
+):
     """Per-call TileSchedulerOptions for a cached plan.
 
     Must mirror make_fake_scheduler_args in the variant's _compile_* function:
@@ -491,6 +511,7 @@ def plan_scheduler_args(plan, tile_count_semaphore, batch_idx_permute=None, ag_a
         tile_count_semaphore if plan.scheduler_uses_semaphore else None,
         batch_idx_permute,
         ag_args=ag_args,
+        gather_table=gather_table,
     )
 
 
@@ -699,6 +720,7 @@ def compile_gemm_kernel(
     cd_packed=None,
     a_mma_dtype=None,
     b_mma_dtype=None,
+    gather_table=False,
 ):
     """Build GemmCls instance, apply SM90 partial, and cute.compile with TVM-FFI."""
     split_k_kwargs = {}
@@ -745,6 +767,7 @@ def compile_gemm_kernel(
             b_mma_dtype=b_mma_dtype,
             **split_k_kwargs,
         )
+    gather_table_kwargs = {"gather_table": gather_table} if device_capacity[0] == 9 else {}
     gemm_obj = GemmCls(
         Float32,
         a_dtype,
@@ -752,6 +775,7 @@ def compile_gemm_kernel(
         cluster_shape_mnk,
         gather_A=gather_A,
         concat_layout=concat_layout,
+        **gather_table_kwargs,
     )
     # mB crosses the boundary as (l, k, n); rotate_batch_last transposes it to
     # kernel order (n, k, l) at trace time. a/cd_transposed are the

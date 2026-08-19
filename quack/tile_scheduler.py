@@ -230,6 +230,9 @@ class TileSchedulerOptions(NamedTuple):
     tile_count_semaphore: Optional[cute.Pointer] = None
     batch_idx_permute: Optional[cute.Tensor] = None
     ag: Optional[AgSchedulerArguments] = None
+    # Hopper gather-A table scheduler. Rows are
+    # (expert_id, route_start, route_end, cid_n_base), int32 and contiguous.
+    gather_table: Optional[cute.Tensor] = None
 
 
 @dataclass
@@ -1051,6 +1054,187 @@ class TileScheduler:
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
         return self.__class__(*(tuple(obj_list)), loc=self._loc)
+
+
+@dataclass
+class GatherTableTileSchedulerArguments:
+    """Arguments for the SM90 table-driven gather-A scheduler.
+
+    Each table row expands to ``group_size`` consecutive N-cluster work IDs.
+    The table has already encoded the AlongN swizzle, including its serpentine
+    M order, so the device scheduler only performs one divmod and one metadata
+    lookup per work tile.
+    """
+
+    work_table: cute.Tensor
+    group_size: Int32
+    tile_shape_mn: cutlass.Constexpr[cute.Shape]
+    cluster_shape_mnk: cutlass.Constexpr[cute.Shape]
+    persistence_mode: cutlass.Constexpr[PersistenceMode] = PersistenceMode.STATIC
+
+
+class GatherTableTileScheduler(TileScheduler):
+    """Persistent scheduler for Hopper grouped GEMM with fused gather-A.
+
+    The ordinary scheduler record is ``(pid_m, pid_n, batch, valid)``. This
+    specialization keeps the same 16-byte transport but publishes
+    ``(route_start_for_cta, pid_n, route_end, expert_id)``. ``expert_id == -1``
+    is the terminal record. Since gather-A does not support split-K, tile_idx's
+    otherwise-static split slot can carry route_end to the loader and epilogue.
+    """
+
+    @dataclass
+    class Params:
+        problem_shape_ncluster_mnl: cute.Shape
+        work_table: cute.Tensor
+        group_size_fdd: FastDivmod
+        tile_shape_mn: cutlass.Constexpr[cute.Shape]
+        tile_count_semaphore: Optional[cute.Pointer]
+        batch_idx_permute: Optional[cute.Tensor]
+        cluster_shape_mnk: cutlass.Constexpr[cute.Shape]
+        persistence_mode: cutlass.Constexpr[PersistenceMode]
+        num_split_k: cutlass.Constexpr[int] = 1
+        ag: Optional[AgParams] = None
+
+        @staticmethod
+        @cute.jit
+        def create(
+            args: GatherTableTileSchedulerArguments, *, loc=None, ip=None
+        ) -> "GatherTableTileScheduler.Params":
+            assert args.persistence_mode == PersistenceMode.STATIC, (
+                "gather-table scheduler currently requires static persistence"
+            )
+            return GatherTableTileScheduler.Params(
+                (None, None, 1),
+                args.work_table,
+                FastDivmod(args.group_size),
+                args.tile_shape_mn,
+                None,
+                None,
+                args.cluster_shape_mnk,
+                args.persistence_mode,
+            )
+
+    @staticmethod
+    def to_underlying_arguments(
+        args: GatherTableTileSchedulerArguments, *, loc=None, ip=None
+    ) -> Params:
+        return GatherTableTileScheduler.Params.create(args, loc=loc, ip=ip)
+
+    @staticmethod
+    def get_grid_shape(
+        params: Params,
+        max_active_clusters: Int32,
+        *,
+        loc=None,
+        ip=None,
+    ) -> Tuple[Int32, Int32, Int32]:
+        num_work = Int32(params.work_table.shape[0]) * params.group_size_fdd.divisor
+        num_persistent_clusters = cutlass.min(max_active_clusters, num_work)
+        return (
+            params.cluster_shape_mnk[0],
+            params.cluster_shape_mnk[1],
+            params.cluster_shape_mnk[2] * num_persistent_clusters,
+        )
+
+    @cute.jit
+    def _delinearize_work_idx(
+        self,
+        work_idx: Int32,
+        bidz: Optional[Int32] = None,
+        is_valid_: Optional[Boolean] = None,
+        *,
+        block_zero_only: bool = False,
+        loc=None,
+        ip=None,
+    ) -> WorkTileInfo:
+        params = self.params
+        num_work = Int32(params.work_table.shape[0]) * params.group_size_fdd.divisor
+        is_valid = work_idx < num_work
+        if const_expr(is_valid_ is not None):
+            is_valid &= is_valid_
+
+        route_start = Int32(0)
+        route_end = Int32(0)
+        pid_n = Int32(0)
+        expert_id = Int32(-1)
+        if is_valid:
+            table_idx, n_in_group = divmod(work_idx, params.group_size_fdd)
+            # Only lane 0 touches HBM. The scheduler warp then broadcasts the
+            # descriptor before its lanes perform the per-CTA remote stores.
+            if cute.arch.lane_idx() == 0:
+                expert_id = params.work_table[table_idx, 0]
+                route_start = params.work_table[table_idx, 1]
+                route_end = params.work_table[table_idx, 2]
+                pid_n = params.work_table[table_idx, 3] + n_in_group
+            expert_id = cute.arch.shuffle_sync(expert_id, 0)
+            route_start = cute.arch.shuffle_sync(route_start, 0)
+            route_end = cute.arch.shuffle_sync(route_end, 0)
+            pid_n = cute.arch.shuffle_sync(pid_n, 0)
+
+            if const_expr(not block_zero_only and cute.size(params.cluster_shape_mnk) > 1):
+                bidx_in_cluster = cute.arch.block_in_cluster_idx()
+                route_start = cutlass.min(
+                    route_start + bidx_in_cluster[0] * params.tile_shape_mn[0], route_end
+                )
+                pid_n += bidx_in_cluster[1]
+
+        return WorkTileInfo((route_start, pid_n, route_end, expert_id), Boolean(is_valid))
+
+    @cute.jit
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        params = self.params
+        iket.range_push("fetch_wait")
+        self._scheduler_pipeline.consumer_wait(self._pipeline_state)
+        iket.range_pop()
+        iket.range_push("fetch_decode")
+        route_start, pid_n, route_end, expert_id = [
+            self._sched_smem[i, self._pipeline_state.index] for i in range(4)
+        ]
+        if const_expr(cute.size(params.cluster_shape_mnk) > 1):
+            cute.arch.fence_view_async_shared()
+        self._scheduler_pipeline.consumer_release(self._pipeline_state)
+        self._pipeline_state.advance()
+        iket.range_pop()
+        return WorkTileInfo(
+            (route_start, pid_n, route_end, expert_id), Boolean(expert_id >= Int32(0))
+        )
+
+    @cute.jit
+    def write_work_tile_to_smem(self, work_tile_info: WorkTileInfo, *, loc=None, ip=None):
+        params = self.params
+        pipeline_state_producer = self._producer_state()
+        self._scheduler_pipeline.producer_acquire(pipeline_state_producer)
+        sched_data = [work_tile_info.tile_idx[i] for i in range(4)]
+        lane_idx = cute.arch.lane_idx()
+        if lane_idx < cute.size(params.cluster_shape_mnk):
+            pipeline_idx = self._pipeline_state.index
+            if const_expr(cute.size(params.cluster_shape_mnk) == 1):
+                for i in cutlass.range_constexpr(4):
+                    self._sched_smem[i, pipeline_idx] = sched_data[i]
+                self._scheduler_pipeline.producer_commit(self._pipeline_state)
+            else:
+                peer_cta_rank = lane_idx
+                bidx_in_cluster = peer_cta_rank % params.cluster_shape_mnk[0]
+                bidy_in_cluster = (
+                    peer_cta_rank // params.cluster_shape_mnk[0]
+                ) % params.cluster_shape_mnk[1]
+                route_start = cutlass.min(
+                    sched_data[0] + bidx_in_cluster * params.tile_shape_mn[0], sched_data[2]
+                )
+                mbar_ptr = self._scheduler_pipeline.producer_get_barrier(self._pipeline_state)
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    mbar_ptr, SCHED_SLOT_BYTES, peer_cta_rank
+                )
+                utils.store_shared_remote_x4(
+                    route_start,
+                    sched_data[1] + bidy_in_cluster,
+                    sched_data[2],
+                    sched_data[3],
+                    smem_ptr=self._sched_smem[None, pipeline_idx].iterator,
+                    mbar_ptr=mbar_ptr,
+                    peer_cta_rank_in_cluster=peer_cta_rank,
+                )
 
 
 @cute.jit

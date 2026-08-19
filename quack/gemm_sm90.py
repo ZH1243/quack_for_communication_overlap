@@ -139,6 +139,7 @@ class GemmSm90(GemmTmaBase):
     """
 
     arch = 90
+    gather_table = False
     # Base (pre-refinement) C-load stage depth in _compute_stages: SM90's TMA
     # epilogue dispatch policy StagesC = min(EpiTiles, 4). SM120 overrides to
     # 2 (its CUTLASS builder uses StagesC = StagesD = min(EpiTiles, 2) — the
@@ -166,6 +167,7 @@ class GemmSm90(GemmTmaBase):
         split_k_mode: int = SplitKMode.SERIAL,
         mma_is_rs: bool = False,
         transform_a: Optional[Callable] = None,
+        gather_table: bool = False,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -217,9 +219,12 @@ class GemmSm90(GemmTmaBase):
         if mma_is_rs:
             assert not self.fp8_slow_accum, "mma_is_rs requires 16-bit A for now"
         self.gather_A = gather_A
+        self.gather_table = gather_table
         self.concat_layout = concat_layout or ()
         if gather_A:
             assert cluster_shape_mnk[1] == 1, "Cluster shape N must be 1 for gather A "
+        if gather_table:
+            assert gather_A and is_persistent and not use_clc_persistence
         self._init_split_k(split_k, split_k_mode)
 
         self.cluster_shape_mnk = cluster_shape_mnk
@@ -650,7 +655,7 @@ class GemmSm90(GemmTmaBase):
         if const_expr(varlen_args is None):
             varlen_args = VarlenArguments()
         assert (varlen_args.mAIdx is not None) == self.gather_A
-        varlen_m = varlen_args.mCuSeqlensM is not None
+        varlen_m = varlen_args.mCuSeqlensM is not None or self.gather_table
         varlen_k = varlen_args.mCuSeqlensK is not None
         # Stash for epilogue ops (epi_to_underlying_arguments runs later and
         # SFD needs the varlen mode to shape its logical scale layout).
@@ -770,7 +775,9 @@ class GemmSm90(GemmTmaBase):
             c_smem_layout = cute.slice_(self.epi_c_smem_layout_staged, (None, None, 0))
             self.epi_load_bytes_per_stage += cute.size_in_bytes(self.c_dtype, c_smem_layout)
 
-        TileSchedulerCls = self.get_scheduler_class(varlen_m=varlen_m)
+        TileSchedulerCls = self.get_scheduler_class(
+            varlen_m=varlen_m, gather_table=self.gather_table
+        )
         tile_sched_args = self.get_scheduler_arguments(
             mA, mB, mD, scheduler_args, varlen_args, epilogue_args
         )
@@ -933,7 +940,7 @@ class GemmSm90(GemmTmaBase):
 
         from cutlass.cute.experimental import iket
 
-        varlen_m = const_expr(varlen_params.cu_seqlens_m is not None)
+        varlen_m = const_expr(varlen_params.cu_seqlens_m is not None or self.gather_table)
         varlen_k = const_expr(varlen_params.cu_seqlens_k is not None)
         assert not (varlen_m and varlen_k)
         if const_expr(self.gather_A):
@@ -1056,7 +1063,17 @@ class GemmSm90(GemmTmaBase):
                 if const_expr(cute.size(cluster_layout_mnk) > 1):
                     is_scheduler_warp = is_scheduler_warp and cute.arch.block_idx_in_cluster() == 0
                 tile_scheduler = TileSchedulerCls()
-                work_tile = tile_scheduler.initial_work_tile_info()
+                if const_expr(self.gather_table):
+                    # Unlike the generic scheduler, seed tile 0 through the
+                    # same cluster-wide descriptor pipeline as every later
+                    # tile. Only CTA 0's designated scheduler warp reads HBM.
+                    if is_scheduler_warp:
+                        tile_scheduler.write_work_tile_to_smem(
+                            tile_scheduler.initial_work_tile_info()
+                        )
+                    work_tile = tile_scheduler.get_current_work()
+                else:
+                    work_tile = tile_scheduler.initial_work_tile_info()
                 ag_last_gate = Int32(-1)  # 1-entry satisfied-gate cache (see ag_wait_m_tile)
                 ab_producer_state = make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.ab_stage
@@ -1251,7 +1268,11 @@ class GemmSm90(GemmTmaBase):
                 pipeline.PipelineUserType.Producer, self.epi_c_stage
             )
             tile_scheduler = TileSchedulerCls()
-            work_tile = tile_scheduler.initial_work_tile_info()
+            work_tile = (
+                tile_scheduler.get_current_work()
+                if const_expr(self.gather_table)
+                else tile_scheduler.initial_work_tile_info()
+            )
             if const_expr(self.pingpong):
                 if warp_idx >= 4:
                     # Advance 2nd Math WG pipeline states to the end of 1st Math WG
@@ -1347,13 +1368,26 @@ class GemmSm90(GemmTmaBase):
                     d_batch_idx = batch_idx
                     if const_expr(self.split_k > 1 and self.split_k_mode == SplitKMode.SEPARATE):
                         d_batch_idx = tile_scheduler.get_combined_batch_idx(batch_idx, split_idx)
+                    if const_expr(self.gather_table):
+                        route_start, route_end = tile_coord_mnkl[0], tile_coord_mnkl[2]
+                        d_tensor = copy_utils.offset_ragged_tensor(
+                            mD_mnl,
+                            route_start,
+                            cutlass.max(route_end - route_start, Int32(0)),
+                            ragged_dim=0,
+                            ptr_shift=True,
+                        )
+                        d_tile_coord = (Int32(0), tile_coord_mnkl[1], None, d_batch_idx)
+                    else:
+                        d_tensor = varlen_manager.offset_batch_epi(mD_mnl, d_batch_idx)
+                        d_tile_coord = tile_coord_mnkl
                     copy_D, _, _ = self.epilog_gmem_copy_and_partition(
                         tma_atom_d,
-                        varlen_manager.offset_batch_epi(mD_mnl, d_batch_idx),
+                        d_tensor,
                         self.cta_tile_shape_mnk[:2],
                         self.epi_tile,
                         sD,
-                        tile_coord_mnkl,
+                        d_tile_coord,
                     )
 
                 copy_C = None
@@ -1571,16 +1605,21 @@ class GemmSm90(GemmTmaBase):
     ):
         """Create copy_A and prefetch_A for gather_A (shared by SM90/SM120 DMA)."""
         varlen_m = varlen_manager.varlen_m
-        mAIdx_mk = varlen_manager.offset_batch_AIdx(batch_idx)
-        if const_expr(varlen_m):
-            gAIdx = cute.local_tile(mAIdx_mk, (self.cta_tile_shape_mnk[0],), (tile_coord_mnkl[0],))
+        if const_expr(self.gather_table):
+            route_start, route_end = tile_coord_mnkl[0], tile_coord_mnkl[2]
+            mAIdx_mk = cute.domain_offset((route_start,), varlen_manager.params.mAIdx)
+            gAIdx = cute.local_tile(mAIdx_mk, (self.cta_tile_shape_mnk[0],), (0,))
             mA_mk = mA_mkl
         else:
+            mAIdx_mk = varlen_manager.offset_batch_AIdx(batch_idx)
+        if const_expr(varlen_m and not self.gather_table):
+            gAIdx = cute.local_tile(mAIdx_mk, (self.cta_tile_shape_mnk[0],), (tile_coord_mnkl[0],))
+            mA_mk = mA_mkl
+        elif const_expr(not self.gather_table):
             gAIdx = cute.flat_divide(mAIdx_mk, (self.cta_tile_shape_mnk[2],))
             mA_mk = cute.local_tile(
                 mA_mkl, (self.cta_tile_shape_mnk[0],), (tile_coord_mnkl[0], None)
             )
-        len_m = varlen_manager.len_m(batch_idx)
         len_k = varlen_manager.len_k(batch_idx)
         tiled_copy_A = self._make_gmem_tiled_copy_A(
             mA_mkl.element_type, self.a_layout, self.num_ab_load_warps * 32
@@ -1588,7 +1627,17 @@ class GemmSm90(GemmTmaBase):
         dma_tidx = cute.arch.thread_idx()[0] - cute.arch.WARP_SIZE * self.ab_load_warp_id
         thr_copy_A = tiled_copy_A.get_slice(dma_tidx)
         copy_A, prefetch_A = None, None
-        if const_expr(varlen_m):
+        if const_expr(self.gather_table):
+            copy_A = copy_utils.gather_m_get_copy_fn(
+                thr_copy_A,
+                mA_mk,
+                sA,
+                gAIdx,
+                limit_m=cutlass.max(route_end - route_start, Int32(0)),
+                limit_k=len_k,
+            )
+        elif const_expr(varlen_m):
+            len_m = varlen_manager.len_m(batch_idx)
             copy_A = copy_utils.gather_m_get_copy_fn(
                 thr_copy_A,
                 mA_mk,

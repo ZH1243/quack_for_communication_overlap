@@ -70,7 +70,8 @@ class GemmSymmetricMixin(GemmDefaultEpiMixin):
         rounding_mode: cutlass.Constexpr[int] = RoundingMode.RN
         sr_seed: Optional[Int32 | cute.Tensor] = None
 
-    def get_scheduler_class(self, varlen_m: bool = False):
+    def get_scheduler_class(self, varlen_m: bool = False, gather_table: bool = False):
+        assert not gather_table, "symmetric GEMM does not support the gather work table"
         return TriangularTileScheduler
 
     @cute.jit

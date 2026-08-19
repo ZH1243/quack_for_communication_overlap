@@ -22,6 +22,8 @@ from quack.gemm_config import SplitKMode
 from quack.pipeline import PipelineTmaAsync, PipelineTmaCpAsync
 from quack.sync import Semaphore
 from quack.tile_scheduler import (
+    GatherTableTileScheduler,
+    GatherTableTileSchedulerArguments,
     PersistenceMode,
     TileScheduler,
     TileSchedulerArguments,
@@ -756,8 +758,10 @@ class GemmBase:
                         epi_store_pipeline.producer_tail()
         return epi_read_state, epi_producer_state
 
-    def get_scheduler_class(self, varlen_m: bool = False):
+    def get_scheduler_class(self, varlen_m: bool = False, gather_table: bool = False):
         """Return the scheduler class to use. Override in subclasses for custom schedulers."""
+        if gather_table:
+            return GatherTableTileScheduler
         return TileScheduler if not varlen_m else VarlenMTileScheduler
 
     def resolve_epi_m_major(self, epilogue_args: EpilogueArguments):
@@ -782,7 +786,22 @@ class GemmBase:
                 persistence_mode = PersistenceMode.DYNAMIC
             else:
                 persistence_mode = PersistenceMode.STATIC
-        if const_expr(varlen_args.mCuSeqlensM is None):
+        if const_expr(scheduler_args.gather_table is not None):
+            assert self.arch == 90 and self.gather_A and self.is_persistent
+            assert persistence_mode == PersistenceMode.STATIC
+            num_clusters_n = cute.ceil_div(
+                cute.size(mB, mode=[0]),
+                self.cta_tile_shape_mnk[1] * self.cluster_shape_mnk[1],
+            )
+            group_size = min(scheduler_args.max_swizzle_size, num_clusters_n)
+            tile_sched_args = GatherTableTileSchedulerArguments(
+                work_table=scheduler_args.gather_table,
+                group_size=group_size,
+                tile_shape_mn=self.cta_tile_shape_mnk[:2],
+                cluster_shape_mnk=self.cluster_shape_mnk,
+                persistence_mode=persistence_mode,
+            )
+        elif const_expr(varlen_args.mCuSeqlensM is None):
             num_problems = (
                 mD.shape[2]
                 if mD is not None
