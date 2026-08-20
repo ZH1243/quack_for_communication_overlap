@@ -27,7 +27,8 @@ and route-index buffers without materializing their concatenation:
 
 Multi-buffer table rows contain ``(expert_id, cid_n_base, start_0, end_0,
 ..., start_b-1, end_b-1)``. Routes are packed in expert-major order and, within
-an expert, in increasing buffer order.
+an expert, in increasing buffer order. ``--balanced-multi-buffer-gather``
+instead balances every M-cluster tile across the nonempty input buffers.
 
 Example:
 
@@ -38,6 +39,9 @@ Example:
     python run/hopper_gather_table_gemm.py --multi-buffer-gather \
         --num-input-buffers 3 --tokens-per-buffer 4096 \
         --routes-per-buffer 8195 --hidden 4096 --output-dim 4096 --experts 8
+
+    python run/hopper_gather_table_gemm.py --multi-buffer-gather \
+        --balanced-multi-buffer-gather --num-input-buffers 3
 """
 
 from __future__ import annotations
@@ -63,6 +67,7 @@ class TableGatherInputs:
     A_idx: torch.Tensor | tuple[torch.Tensor, ...]
     work_table: torch.Tensor
     route_offsets: tuple[tuple[int, ...], ...]
+    output_segments: tuple[tuple[int, int, int, int], ...]
     output: torch.Tensor
     work_group_size: int
 
@@ -82,6 +87,11 @@ def parse_args() -> argparse.Namespace:
         help="Gather directly from multiple independent X/A_idx buffers",
     )
     parser.add_argument("--num-input-buffers", type=int, default=2)
+    parser.add_argument(
+        "--balanced-multi-buffer-gather",
+        action="store_true",
+        help="Balance each M-cluster tile across all nonempty input buffers",
+    )
     parser.add_argument(
         "--tokens-per-buffer",
         type=int,
@@ -159,6 +169,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("tokens-per-buffer and routes-per-buffer must be positive")
     if args.multi_buffer_gather and args.num_input_buffers < 2:
         raise ValueError("num-input-buffers must be at least 2 in multi-buffer mode")
+    if args.balanced_multi_buffer_gather and not args.multi_buffer_gather:
+        raise ValueError("balanced-multi-buffer-gather requires multi-buffer-gather")
     counts = (
         multi_buffer_route_counts(routes, args.experts, args.num_input_buffers)
         if args.multi_buffer_gather
@@ -224,8 +236,19 @@ def build_multi_buffer_work_table(
     cluster_m: int,
     max_swizzle_size: int,
     device: torch.device,
-) -> tuple[torch.Tensor, tuple[tuple[int, ...], ...], int]:
-    """Build expert-major cluster rows spanning independent route buffers."""
+    balance_buffers: bool = False,
+) -> tuple[
+    torch.Tensor,
+    tuple[tuple[int, ...], ...],
+    tuple[tuple[int, int, int, int], ...],
+    int,
+]:
+    """Build expert-major cluster rows spanning independent route buffers.
+
+    In the default mode, each M-cluster tile drains one buffer before moving
+    to the next. In balanced mode, each tile uses a max-min fair allocation
+    across all buffers that still have routes for the current expert.
+    """
     num_buffers = len(counts_by_buffer)
     experts = len(counts_by_buffer[0])
     route_offsets: list[list[int]] = []
@@ -240,36 +263,94 @@ def build_multi_buffer_work_table(
     assert clusters_n % x == 0
     cluster_rows = tile_m * cluster_m
     rows: list[tuple[int, ...]] = []
+    output_segments: list[tuple[int, int, int, int]] = []
 
     for expert in range(experts):
         expert_counts = [counts_by_buffer[j][expert] for j in range(num_buffers)]
-        packed_offsets = [0]
-        for count in expert_counts:
-            packed_offsets.append(packed_offsets[-1] + count)
-        clusters_m = math.ceil(packed_offsets[-1] / cluster_rows)
+        consumed = [0] * num_buffers
+        cluster_ranges: list[tuple[int, ...]] = []
+        while sum(consumed) < sum(expert_counts):
+            remaining = [count - cursor for count, cursor in zip(expert_counts, consumed)]
+            capacity = min(cluster_rows, sum(remaining))
+            allocations = (
+                balanced_buffer_allocations(remaining, capacity)
+                if balance_buffers
+                else sequential_buffer_allocations(remaining, capacity)
+            )
+            ranges: list[int] = []
+            for j, allocation in enumerate(allocations):
+                start = route_offsets[j][expert] + consumed[j]
+                end = start + allocation
+                ranges.extend((start, end))
+                if allocation:
+                    output_segments.append((expert, j, start, end))
+                consumed[j] += allocation
+            cluster_ranges.append(tuple(ranges))
+
         for n_group in range(clusters_n // x):
-            m_clusters = range(clusters_m)
+            m_clusters = range(len(cluster_ranges))
             if n_group % 2:
-                m_clusters = reversed(range(clusters_m))
+                m_clusters = reversed(range(len(cluster_ranges)))
             cid_n_base = n_group * x
             for cid_m in m_clusters:
-                packed_start = cid_m * cluster_rows
-                packed_end = min(packed_start + cluster_rows, packed_offsets[-1])
-                ranges: list[int] = []
-                for j in range(num_buffers):
-                    count = expert_counts[j]
-                    local_start = min(max(packed_start - packed_offsets[j], 0), count)
-                    local_end = min(max(packed_end - packed_offsets[j], 0), count)
-                    ranges.extend(
-                        (
-                            route_offsets[j][expert] + local_start,
-                            route_offsets[j][expert] + local_end,
-                        )
-                    )
-                rows.append((expert, cid_n_base, *ranges))
+                rows.append((expert, cid_n_base, *cluster_ranges[cid_m]))
 
     table = torch.tensor(rows, dtype=torch.int32, device=device)
-    return table, tuple(tuple(offsets) for offsets in route_offsets), x
+    return (
+        table,
+        tuple(tuple(offsets) for offsets in route_offsets),
+        tuple(output_segments),
+        x,
+    )
+
+
+def sequential_buffer_allocations(remaining: list[int], capacity: int) -> list[int]:
+    """Fill one tile by draining buffers in increasing index order."""
+    allocations = [0] * len(remaining)
+    for j, available in enumerate(remaining):
+        allocation = min(available, capacity)
+        allocations[j] = allocation
+        capacity -= allocation
+        if capacity == 0:
+            break
+    return allocations
+
+
+def balanced_buffer_allocations(remaining: list[int], capacity: int) -> list[int]:
+    """Max-min balance one tile across buffers, without exceeding availability."""
+    allocations = [0] * len(remaining)
+    available = remaining.copy()
+    active = [j for j, count in enumerate(available) if count]
+    while capacity and active:
+        share = capacity // len(active)
+        minimum = min(available[j] for j in active)
+        if minimum <= share:
+            for j in active:
+                allocations[j] += minimum
+                available[j] -= minimum
+            capacity -= minimum * len(active)
+            active = [j for j in active if available[j]]
+            continue
+
+        for j in active:
+            allocations[j] += share
+            available[j] -= share
+        capacity -= share * len(active)
+        if capacity:
+            # Prefer assigning the small integer remainder to one buffer. If
+            # none can supply it alone, drain the residual capacities in order.
+            remainder_owner = next((j for j in active if available[j] >= capacity), None)
+            if remainder_owner is not None:
+                allocations[remainder_owner] += capacity
+                capacity = 0
+            else:
+                for j in active:
+                    allocation = min(available[j], capacity)
+                    allocations[j] += allocation
+                    capacity -= allocation
+                    if capacity == 0:
+                        break
+    return allocations
 
 
 @torch.inference_mode()
@@ -300,7 +381,7 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> TableGathe
                 offset += count
             idx_buffers.append(A_idx_j)
         A_idx = tuple(idx_buffers)
-        work_table, offsets, x = build_multi_buffer_work_table(
+        work_table, offsets, output_segments, x = build_multi_buffer_work_table(
             counts_by_buffer,
             output_dim=args.output_dim,
             tile_m=args.tile_m,
@@ -308,6 +389,7 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> TableGathe
             cluster_m=args.cluster_m,
             max_swizzle_size=args.max_swizzle_size,
             device=device,
+            balance_buffers=args.balanced_multi_buffer_gather,
         )
         total_routes = args.num_input_buffers * routes
     else:
@@ -331,9 +413,13 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> TableGathe
             max_swizzle_size=args.max_swizzle_size,
             device=device,
         )
+        output_segments = tuple(
+            (expert, 0, offsets[0][expert], offsets[0][expert + 1])
+            for expert in range(args.experts)
+        )
         total_routes = args.routes
     output = torch.empty((total_routes, args.output_dim), dtype=dtype, device=device)
-    return TableGatherInputs(X, W, A_idx, work_table, offsets, output, x)
+    return TableGatherInputs(X, W, A_idx, work_table, offsets, output_segments, output, x)
 
 
 def make_launch(args: argparse.Namespace, inputs: TableGatherInputs):
@@ -400,19 +486,18 @@ def check_correctness(inputs: TableGatherInputs, *, atol: float, rtol: float) ->
     max_abs_error = 0.0
     X_buffers = inputs.X if isinstance(inputs.X, tuple) else (inputs.X,)
     idx_buffers = inputs.A_idx if isinstance(inputs.A_idx, tuple) else (inputs.A_idx,)
-    experts = len(inputs.route_offsets[0]) - 1
-    for expert in range(experts):
-        output_offset = sum(offsets[expert] for offsets in inputs.route_offsets)
-        for X_j, A_idx_j, offsets in zip(X_buffers, idx_buffers, inputs.route_offsets):
-            start, end = offsets[expert : expert + 2]
-            if start == end:
-                continue
-            reference = X_j[A_idx_j[start:end].long()].float() @ inputs.W[expert].float()
-            reference = reference.to(inputs.output.dtype)
-            actual = inputs.output[output_offset : output_offset + end - start]
-            max_abs_error = max(max_abs_error, (actual - reference).abs().max().item())
-            torch.testing.assert_close(actual, reference, atol=atol, rtol=rtol)
-            output_offset += end - start
+    output_offset = 0
+    for expert, buffer_idx, start, end in inputs.output_segments:
+        if start == end:
+            continue
+        X_j, A_idx_j = X_buffers[buffer_idx], idx_buffers[buffer_idx]
+        reference = X_j[A_idx_j[start:end].long()].float() @ inputs.W[expert].float()
+        reference = reference.to(inputs.output.dtype)
+        actual = inputs.output[output_offset : output_offset + end - start]
+        max_abs_error = max(max_abs_error, (actual - reference).abs().max().item())
+        torch.testing.assert_close(actual, reference, atol=atol, rtol=rtol)
+        output_offset += end - start
+    assert output_offset == inputs.output.shape[0]
     return max_abs_error
 
 
@@ -448,7 +533,8 @@ def main() -> None:
     print(
         f"Kernel: tile=({args.tile_m}, {args.tile_n}, {args.tile_k or 'auto'}), "
         f"cluster=({args.cluster_m}, 1, 1), static persistent, table gather=cp.async, "
-        f"multi-buffer={args.multi_buffer_gather}"
+        f"multi-buffer={args.multi_buffer_gather}, "
+        f"balanced-buffers={args.balanced_multi_buffer_gather}"
     )
     print("Compiling and warming up the specialized QuACK kernel...")
 
