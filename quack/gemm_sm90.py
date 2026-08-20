@@ -1625,7 +1625,7 @@ class GemmSm90(GemmTmaBase):
             mAIdx_mk = cute.domain_offset((route_start,), varlen_manager.params.mAIdx)
             gAIdx = cute.local_tile(mAIdx_mk, (self.cta_tile_shape_mnk[0],), (0,))
             mA_mk = mA_mkl
-        else:
+        elif const_expr(not self.gather_table):
             mAIdx_mk = varlen_manager.offset_batch_AIdx(batch_idx)
         if const_expr(varlen_m and not self.gather_table):
             gAIdx = cute.local_tile(mAIdx_mk, (self.cta_tile_shape_mnk[0],), (tile_coord_mnkl[0],))
