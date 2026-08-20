@@ -325,7 +325,10 @@ def make_fake_scheduler_args(
                     4 if gather_table_num_buffers == 1 else 2 + 2 * gather_table_num_buffers,
                 ),
                 leading_dim=1,
-                divisibility=4,
+                # Rows are 4 Int32 wide in legacy mode and 2 + 2*b wide in
+                # multi-buffer mode. Even b therefore guarantees only
+                # 2-element divisibility (for example b=32 => 66).
+                divisibility=4 if gather_table_num_buffers % 2 else 2,
             )
             if has_gather_table
             else None
