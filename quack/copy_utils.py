@@ -1542,6 +1542,84 @@ def gather_m_get_copy_fn(
 
 
 @cute.jit
+def multi_buffer_gather_m_get_copy_fn(
+    thr_copy_A: cute.ThrCopy,
+    mAs: tuple,
+    sA: cute.Tensor,
+    gAIdxs: tuple,
+    route_ranges: tuple,
+    limit_k: Int32,
+) -> Callable:
+    """Gather one packed A tile from independent X/A_idx buffers.
+
+    ``route_ranges`` contains CTA-clipped ``(start_j, end_j)`` pairs. Their
+    rows are packed into sA in buffer order; exactly one buffer owns each
+    valid destination row. The buffer tuple length is compile-time static.
+    """
+    num_buffers = const_expr(len(mAs))
+    assert len(gAIdxs) == num_buffers and len(route_ranges) == 2 * num_buffers
+    tile_M, tile_K = cute.size(sA, mode=[0]), cute.size(sA, mode=[1])
+    tAsA = partition_D_position_independent(thr_copy_A, sA)
+    assert tAsA.shape[2] == 1
+    tAsA = cute.group_modes(cute.slice_(tAsA, (None, None, 0, None)), 0, 2)
+
+    elems_per_load = cute.size(tAsA.shape[0][0])
+    cA = cute.make_identity_tensor((tile_M, tile_K))
+    tAcA = thr_copy_A.partition_S(cA)
+    t0AcA = thr_copy_A.get_slice(0).partition_S(cA)
+    limit_k = limit_k - tAcA[0][1]
+    rows_per_thread = const_expr(cute.size(tAcA.shape, mode=[1]))
+    cols_per_thread = const_expr(cute.size(tAcA.shape, mode=[2]))
+
+    row_preds = [cute.make_rmem_tensor(rows_per_thread, Boolean) for _ in range(num_buffers)]
+    row_indices = [cute.make_rmem_tensor(rows_per_thread, Int32) for _ in range(num_buffers)]
+    for j in cutlass.range_constexpr(num_buffers):
+        prefix = Int32(0)
+        for h in cutlass.range_constexpr(j):
+            prefix += route_ranges[2 * h + 1] - route_ranges[2 * h]
+        length = route_ranges[2 * j + 1] - route_ranges[2 * j]
+        for m in cutlass.range_constexpr(rows_per_thread):
+            row = tAcA[0, m, 0][0]
+            pred = row >= prefix
+            pred &= row < prefix + length
+            row_preds[j][m] = pred
+            if pred:
+                row_indices[j][m] = gAIdxs[j][route_ranges[2 * j] + row - prefix]
+            else:
+                row_indices[j][m] = Int32(0)
+
+    mAs_k = [cute.logical_divide(mA, (None, tile_K)) for mA in mAs]
+
+    def copy_fn(src_idx, dst_idx, pred: cutlass.Constexpr[bool] = False):
+        tApA_k = None
+        if const_expr(pred):
+            tApA_k = cute.make_rmem_tensor(cols_per_thread, Boolean)
+            limit_k_cur = limit_k - src_idx * tile_K
+            for k in cutlass.range(cols_per_thread, unroll_full=True):
+                tApA_k[k] = t0AcA[0, 0, k][1] < limit_k_cur
+        for j in cutlass.range_constexpr(num_buffers):
+            mA_cur = mAs_k[j][None, (None, src_idx)]
+            for m in cutlass.range_constexpr(rows_per_thread):
+                if row_preds[j][m]:
+                    mA_row = cute.tiled_divide(
+                        cute.append_ones(
+                            mA_cur[row_indices[j][m], None], up_to_rank=2
+                        ),
+                        (elems_per_load, 1),
+                    )[None, None, 0]
+                    assert cute.size(tAcA.shape, mode=[2]) == 1
+                    ki = tAcA[0, 0, 0][1] // elems_per_load
+                    cute.copy(
+                        thr_copy_A,
+                        mA_row[None, ki],
+                        tAsA[(None, m), dst_idx],
+                        pred=tApA_k,
+                    )
+
+    return copy_fn
+
+
+@cute.jit
 def gather_k_get_copy_fn(
     thr_copy_A: cute.ThrCopy,
     mA: cute.Tensor,  # (tile_M, whatever)

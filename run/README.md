@@ -40,6 +40,20 @@ Benchmarks the new Hopper table-scheduled gather-A path. It passes no
 The runner distributes routes near-evenly across experts, including true
 varlen-M when `R` is not divisible by `E`.
 
+It also has an opt-in multi-buffer mode. Each `X_j` and `A_idx_j` is a
+separate CUDA allocation, and the kernel gathers from them directly without
+materializing `torch.cat(X_j)`:
+
+```bash
+python run/hopper_gather_table_gemm.py --multi-buffer-gather \
+    --num-input-buffers 3 --tokens-per-buffer 4096 \
+    --routes-per-buffer 8195 --hidden 4096 --output-dim 4096 --experts 8
+```
+
+The multi-buffer work table has shape `[Q, 2 + 2*b]`, with rows
+`(expert_id, cid_n_base, start_0, end_0, ..., start_b-1, end_b-1)`. Output is
+expert-major, with routes ordered by input-buffer index inside each expert.
+
 All runners exclude kernel compilation, warmup, CUDA graph capture, and the
 correctness check from the reported kernel time.
 
@@ -123,6 +137,10 @@ expert count.
 | `--output-dim`, `-N` | `4096` | GEMM output dimension (`N`). |
 | `--experts`, `-E` | `8` | Number of experts (`E`). |
 | `--routes`, `-R` | `8192` | Total routed token assignments (`R`). Must be divisible by `--experts`. |
+| `--multi-buffer-gather` | off | Read separate `X_j`/`A_idx_j` allocations through the wider gather table. |
+| `--num-input-buffers` | `2` | Number of input buffers in multi-buffer mode. |
+| `--tokens-per-buffer` | `--tokens` | Number of rows in each `X_j`. |
+| `--routes-per-buffer` | `--routes` | Number of entries in each `A_idx_j`. |
 | `--dtype` | `bf16` | Input/output dtype: `bf16` or `fp16`. |
 | `--device` | `0` | CUDA device index. |
 | `--seed` | `0` | Random seed used to create inputs and routing. |

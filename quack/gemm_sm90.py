@@ -168,6 +168,7 @@ class GemmSm90(GemmTmaBase):
         mma_is_rs: bool = False,
         transform_a: Optional[Callable] = None,
         gather_table: bool = False,
+        gather_table_num_buffers: int = 1,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -220,11 +221,16 @@ class GemmSm90(GemmTmaBase):
             assert not self.fp8_slow_accum, "mma_is_rs requires 16-bit A for now"
         self.gather_A = gather_A
         self.gather_table = gather_table
+        self.gather_table_num_buffers = gather_table_num_buffers
+        self.multi_buffer_gather = gather_table_num_buffers > 1
         self.concat_layout = concat_layout or ()
         if gather_A:
             assert cluster_shape_mnk[1] == 1, "Cluster shape N must be 1 for gather A "
         if gather_table:
             assert gather_A and is_persistent and not use_clc_persistence
+            assert gather_table_num_buffers >= 1
+        else:
+            assert gather_table_num_buffers == 1
         self._init_split_k(split_k, split_k_mode)
 
         self.cluster_shape_mnk = cluster_shape_mnk
@@ -982,9 +988,12 @@ class GemmSm90(GemmTmaBase):
             # responses also use i128 copies, so this stays 16-byte aligned.
             # No drain-mailbox tail (+6 Int32, cf. gemm_sm100): this kernel never
             # calls cancel_pending_tail — add the tail if that ever changes.
+            sched_fields = const_expr(
+                4 if not self.multi_buffer_gather else 4 + 2 * self.gather_table_num_buffers
+            )
             sched_data = smem.allocate_tensor(
                 Int32,
-                cute.make_layout((4, self.sched_stage)),
+                cute.make_layout((sched_fields, self.sched_stage)),
                 byte_alignment=16,
                 partition=SmemPartition.RESERVED,
             )
@@ -1127,7 +1136,12 @@ class GemmSm90(GemmTmaBase):
                         )
                     else:
                         copy_A, prefetch_A = self._make_gather_A_copy(
-                            mA_mkl, sA, varlen_manager, tile_coord_mnkl, batch_idx
+                            mA_mkl,
+                            sA,
+                            varlen_manager,
+                            tile_coord_mnkl,
+                            batch_idx,
+                            tile_sched_params,
                         )
                     copy_AuxA = None
                     if const_expr(self.aux_a is not None):
@@ -1602,10 +1616,11 @@ class GemmSm90(GemmTmaBase):
         varlen_manager: VarlenManager,
         tile_coord_mnkl,
         batch_idx: Int32,
+        tile_sched_params,
     ):
         """Create copy_A and prefetch_A for gather_A (shared by SM90/SM120 DMA)."""
         varlen_m = varlen_manager.varlen_m
-        if const_expr(self.gather_table):
+        if const_expr(self.gather_table and not self.multi_buffer_gather):
             route_start, route_end = tile_coord_mnkl[0], tile_coord_mnkl[2]
             mAIdx_mk = cute.domain_offset((route_start,), varlen_manager.params.mAIdx)
             gAIdx = cute.local_tile(mAIdx_mk, (self.cta_tile_shape_mnk[0],), (0,))
@@ -1627,7 +1642,19 @@ class GemmSm90(GemmTmaBase):
         dma_tidx = cute.arch.thread_idx()[0] - cute.arch.WARP_SIZE * self.ab_load_warp_id
         thr_copy_A = tiled_copy_A.get_slice(dma_tidx)
         copy_A, prefetch_A = None, None
-        if const_expr(self.gather_table):
+        if const_expr(self.multi_buffer_gather):
+            multi_args = tile_sched_params.multi_buffer_gather
+            mAs = (mA_mkl, *multi_args.x_buffers)
+            gAIdxs = (varlen_manager.params.mAIdx, *multi_args.a_idx_buffers)
+            copy_A = copy_utils.multi_buffer_gather_m_get_copy_fn(
+                thr_copy_A,
+                mAs,
+                sA,
+                gAIdxs,
+                tile_coord_mnkl[4:],
+                limit_k=len_k,
+            )
+        elif const_expr(self.gather_table):
             copy_A = copy_utils.gather_m_get_copy_fn(
                 thr_copy_A,
                 mA_mk,

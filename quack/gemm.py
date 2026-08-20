@@ -23,6 +23,7 @@ from quack.gemm_default_epi import (
     GemmDefaultSm120,
 )
 from quack.rounding import RoundingMode
+from quack.tile_scheduler import MultiBufferGatherArguments
 from quack.gemm_tvm_ffi_utils import (
     fake_batched,
     get_majors,
@@ -71,6 +72,7 @@ def _compile_gemm(
     varlen_k,
     gather_A,
     gather_table,
+    gather_table_num_buffers,
     use_tma_gather,
     has_batch_idx_permute,
     device_capacity,
@@ -174,16 +176,35 @@ def _compile_gemm(
         sfd_norm_const=fake_scalar(sfd_norm_const_mode),
         mSFDCol=(make_fake_sf_tensor(sfd_col_dtype, l) if sfd_col_dtype is not None else None),
     )
+    # Legacy varlen_m shares A_idx's length with D's flattened M. In the
+    # multi-buffer table path each A_idx_j has R entries while D has b * R,
+    # so the per-buffer route extent needs an independent runtime symbol.
+    aidx_len = (
+        cute.sym_int()
+        if gather_table_num_buffers > 1
+        else (m if varlen_m else (k if varlen_k else None))
+    )
+    varlen_args = make_fake_varlen_args(
+        varlen_m, varlen_k, gather_A, aidx_len, gather_table=gather_table
+    )
+    multi_buffer_gather = (
+        MultiBufferGatherArguments(
+            x_buffers=tuple(mA for _ in range(gather_table_num_buffers - 1)),
+            a_idx_buffers=tuple(
+                varlen_args.mAIdx for _ in range(gather_table_num_buffers - 1)
+            ),
+        )
+        if gather_table_num_buffers > 1
+        else None
+    )
     scheduler_args = make_fake_scheduler_args(
         (is_dynamic_persistent and device_capacity[0] <= 9),
         has_batch_idx_permute,
         l,
         has_ag=has_ag,
         has_gather_table=gather_table,
-    )
-    aidx_len = m if varlen_m else (k if varlen_k else None)
-    varlen_args = make_fake_varlen_args(
-        varlen_m, varlen_k, gather_A, aidx_len, gather_table=gather_table
+        gather_table_num_buffers=gather_table_num_buffers,
+        multi_buffer_gather=multi_buffer_gather,
     )
     if sf_dtype is not None:
         # Padded SF buffers have a static batch dim of exactly 1 (not l): SFA for
@@ -224,6 +245,7 @@ def _compile_gemm(
         a_mma_dtype=a_mma_dtype,
         b_mma_dtype=b_mma_dtype,
         gather_table=gather_table,
+        gather_table_num_buffers=gather_table_num_buffers,
     )
 
 
@@ -384,7 +406,7 @@ def gemm(
     # (l, m, k), or (m, k) unbatched dense (SM90+; B/D/C must be 2D too), or (total_m, k)
     # if varlen_m or (m, total_k) if varlen_k or (whatever, k) if gather_A_varlen_m or
     # (m, whatever) if gather_A_varlen_k
-    A: Tensor,
+    A: Tensor | tuple[Tensor, ...],
     B: Tensor,  # (l, n, k) or (n, k) or (n, total_k) if varlen_k
     D: Tensor,  # (l, m, n) or (m, n) or (total_m, n) if varlen_m
     C: Optional[Tensor],  # (l, m, n) or (m, n) or (total_m, n) if varlen_m
@@ -405,7 +427,7 @@ def gemm(
     beta: float | Tensor = 1.0,
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
     cu_seqlens_k: Optional[Tensor] = None,  # (l+1,) cumulative sum of k values for variable length
-    A_idx: Optional[Tensor] = None,  # (total_m,) or (total_k,) indices for gather_A when varlen
+    A_idx: Optional[Tensor | tuple[Tensor, ...]] = None,
     batch_idx_permute: Optional[Tensor] = None,  # (l,) permutation of batch indices for scheduler
     add_to_output: bool = False,
     rounding_mode: int = RoundingMode.RN,
@@ -445,13 +467,38 @@ def gemm(
     # num_shards, first_shard) drive the shard-major rotated schedule and the
     # load-warp arrival gate.
     ag_args: Optional[AllGatherArguments] = None,
-    # Hopper table-scheduled gather-A: contiguous int32 [Q, 4] rows containing
-    # (expert_id, route_start, route_end, cid_n_base). Each row expands to
-    # min(max_swizzle_size, ceil(N / tile_N)) consecutive AlongN work IDs.
-    # Rows must satisfy 0 <= expert_id < E, 0 <= route_start < route_end <= R,
-    # and route_end - route_start <= cluster_M * tile_M.
+    # Hopper table-scheduled gather-A. The legacy format is contiguous int32
+    # [Q, 4] rows containing (expert_id, route_start, route_end, cid_n_base).
+    # See multi_buffer_gather below for the opt-in wider row format. Each row
+    # expands to min(max_swizzle_size, ceil(N / tile_N)) AlongN work IDs.
     gather_work_table: Optional[Tensor] = None,
+    # Opt-in Hopper table gather from separately allocated A/A_idx buffers.
+    # When enabled, A and A_idx are tuples of equal length b >= 2. The table
+    # format becomes (expert_id, cid_n_base, start_0, end_0, ..., start_b-1,
+    # end_b-1), and D has sum_j len(A_idx_j) rows. The ordinary single-buffer
+    # path and its [Q, 4] table remain unchanged when this flag is false.
+    multi_buffer_gather: bool = False,
 ) -> _GemmPlan:
+    multi_buffer_gather_args = None
+    if multi_buffer_gather:
+        if not isinstance(A, (tuple, list)) or not isinstance(A_idx, (tuple, list)):
+            raise ValueError("multi_buffer_gather requires A and A_idx to be tensor sequences")
+        A_buffers, A_idx_buffers = tuple(A), tuple(A_idx)
+        if len(A_buffers) < 2 or len(A_buffers) != len(A_idx_buffers):
+            raise ValueError(
+                "multi_buffer_gather requires the same number of A and A_idx buffers (at least 2)"
+            )
+        if not all(isinstance(t, Tensor) for t in (*A_buffers, *A_idx_buffers)):
+            raise ValueError("multi_buffer_gather A and A_idx entries must be torch tensors")
+        A, A_idx = A_buffers[0], A_idx_buffers[0]
+        multi_buffer_gather_args = MultiBufferGatherArguments(
+            x_buffers=A_buffers[1:], a_idx_buffers=A_idx_buffers[1:]
+        )
+    else:
+        if isinstance(A, (tuple, list)) or isinstance(A_idx, (tuple, list)):
+            raise ValueError("tensor sequences require multi_buffer_gather=True")
+        A_buffers, A_idx_buffers = (A,), (A_idx,) if A_idx is not None else ()
+
     alpha_mode = scalar_mode(alpha)
     beta_mode = scalar_mode(beta)
     sr_seed_mode = (
@@ -479,6 +526,9 @@ def gemm(
         tensor_key(cu_seqlens_m),
         tensor_key(cu_seqlens_k),
         tensor_key(gather_work_table),
+        tuple(tensor_key(t) for t in A_buffers),
+        tuple(tensor_key(t) for t in A_idx_buffers),
+        multi_buffer_gather,
         A_idx is not None,
         batch_idx_permute is not None,
         tile_count_semaphore is not None,
@@ -535,6 +585,7 @@ def gemm(
             cu_seqlens_k=cu_seqlens_k,
             A_idx=A_idx,
             gather_work_table=gather_work_table,
+            multi_buffer_gather_args=multi_buffer_gather_args,
             batch_idx_permute=batch_idx_permute,
             add_to_output=add_to_output,
             rounding_mode=rounding_mode,
@@ -573,6 +624,7 @@ def gemm(
         cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
         gather_work_table=gather_work_table,
+        multi_buffer_gather_args=multi_buffer_gather_args,
         batch_idx_permute=batch_idx_permute,
         SFA=SFA,
         SFB=SFB,
@@ -601,6 +653,7 @@ def run_gemm_plan(
     cu_seqlens_k: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,
     gather_work_table: Optional[Tensor] = None,
+    multi_buffer_gather_args: Optional[MultiBufferGatherArguments] = None,
     batch_idx_permute: Optional[Tensor] = None,
     SFA: Optional[Tensor] = None,
     SFB: Optional[Tensor] = None,
@@ -669,6 +722,7 @@ def run_gemm_plan(
         ag_args,
         A=A,
         gather_table=gather_work_table,
+        multi_buffer_gather=multi_buffer_gather_args,
     )
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
 
@@ -711,6 +765,7 @@ def _build_gemm_plan(
     cu_seqlens_k,
     A_idx,
     gather_work_table,
+    multi_buffer_gather_args,
     batch_idx_permute,
     add_to_output,
     rounding_mode,
@@ -733,6 +788,11 @@ def _build_gemm_plan(
     SFDCol=None,
 ) -> _GemmPlan:
     gather_table = gather_work_table is not None
+    gather_table_num_buffers = (
+        len(multi_buffer_gather_args.x_buffers) + 1
+        if multi_buffer_gather_args is not None
+        else 1
+    )
     varlen_m = cu_seqlens_m is not None or gather_table
     varlen_k = cu_seqlens_k is not None
     varlen = varlen_m or varlen_k
@@ -745,6 +805,8 @@ def _build_gemm_plan(
     if gather_A:
         assert varlen, "gather_A requires varlen"
         assert cluster_N == 1, "gather_A requires cluster_N=1"
+    if multi_buffer_gather_args is not None and not gather_table:
+        raise ValueError("multi_buffer_gather requires gather_work_table")
     if gather_table:
         if get_device_capacity(A.device)[0] != 9:
             raise ValueError("gather_work_table is currently supported only on Hopper (SM90)")
@@ -774,17 +836,55 @@ def _build_gemm_plan(
             raise ValueError("gather_work_table does not support split_k")
         if A.ndim != 2 or B.ndim != 3 or D.ndim != 2 or A_idx.ndim != 1:
             raise ValueError("gather_work_table expects A[T,K], B[E,N,K], D[R,N], A_idx[R]")
-        if gather_work_table.ndim != 2 or gather_work_table.shape[1] != 4:
-            raise ValueError("gather_work_table must have shape [Q, 4]")
+        expected_table_width = (
+            4 if gather_table_num_buffers == 1 else 2 + 2 * gather_table_num_buffers
+        )
+        if gather_work_table.ndim != 2 or gather_work_table.shape[1] != expected_table_width:
+            raise ValueError(
+                f"gather_work_table must have shape [Q, {expected_table_width}]"
+            )
         if gather_work_table.dtype != torch.int32 or not gather_work_table.is_contiguous():
             raise ValueError("gather_work_table must be a contiguous int32 tensor")
         if gather_work_table.device != A.device or A_idx.device != A.device:
             raise ValueError("gather_work_table, A_idx, and GEMM operands must share a device")
         if A_idx.dtype != torch.int32:
             raise ValueError("gather_work_table gather requires int32 A_idx")
-        if D.shape != (A_idx.shape[0], B.shape[1]):
+        total_routes = A_idx.shape[0]
+        if multi_buffer_gather_args is not None:
+            for buffer_idx, (A_extra, A_idx_extra) in enumerate(
+                zip(
+                    multi_buffer_gather_args.x_buffers,
+                    multi_buffer_gather_args.a_idx_buffers,
+                ),
+                start=1,
+            ):
+                if not isinstance(A_extra, Tensor) or not isinstance(A_idx_extra, Tensor):
+                    raise ValueError("multi_buffer_gather entries must be torch tensors")
+                if (
+                    A_extra.shape != A.shape
+                    or A_extra.stride() != A.stride()
+                    or A_extra.dtype != A.dtype
+                    or A_extra.device != A.device
+                ):
+                    raise ValueError(
+                        f"A buffer {buffer_idx} must match buffer 0's shape, stride, dtype, "
+                        "and device"
+                    )
+                if (
+                    A_idx_extra.ndim != 1
+                    or A_idx_extra.shape != A_idx.shape
+                    or A_idx_extra.stride() != A_idx.stride()
+                    or A_idx_extra.dtype != torch.int32
+                    or A_idx_extra.device != A.device
+                ):
+                    raise ValueError(
+                        f"A_idx buffer {buffer_idx} must match buffer 0's shape and stride "
+                        f"and be int32 on {A.device}"
+                    )
+                total_routes += A_idx_extra.shape[0]
+        if D.shape != (total_routes, B.shape[1]):
             raise ValueError(
-                f"D must have shape ({A_idx.shape[0]}, {B.shape[1]}), got {tuple(D.shape)}"
+                f"D must have shape ({total_routes}, {B.shape[1]}), got {tuple(D.shape)}"
             )
         if A.shape[1] != B.shape[2]:
             raise ValueError(f"K mismatch between A {tuple(A.shape)} and B {tuple(B.shape)}")
@@ -1014,6 +1114,7 @@ def _build_gemm_plan(
         varlen_k,
         gather_A,
         gather_table,
+        gather_table_num_buffers,
         use_tma_gather,
         batch_idx_permute is not None,
         device_capacity,

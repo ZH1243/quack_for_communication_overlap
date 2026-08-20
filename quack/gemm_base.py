@@ -803,6 +803,7 @@ class GemmBase:
                 tile_shape_mn=self.cta_tile_shape_mnk[:2],
                 cluster_shape_mnk=self.cluster_shape_mnk,
                 persistence_mode=persistence_mode,
+                multi_buffer_gather=scheduler_args.multi_buffer_gather,
             )
         elif const_expr(varlen_args.mCuSeqlensM is None):
             num_problems = (
