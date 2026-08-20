@@ -7,7 +7,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils.blackwell_helpers as sm100_utils
 
-from cutlass import Int32, Int16, Boolean, const_expr
+from cutlass import Int64, Int32, Int16, Boolean, const_expr
 from cutlass.base_dsl.enums import Arch
 from cutlass.cute.nvgpu import cpasync, tcgen05, warp
 from cutlass.cute.nvgpu.tcgen05.mma import CtaGroup  # noqa
@@ -1571,24 +1571,41 @@ def multi_buffer_gather_m_get_copy_fn(
     rows_per_thread = const_expr(cute.size(tAcA.shape, mode=[1]))
     cols_per_thread = const_expr(cute.size(tAcA.shape, mode=[2]))
 
-    row_preds = [cute.make_rmem_tensor(rows_per_thread, Boolean) for _ in range(num_buffers)]
-    row_indices = [cute.make_rmem_tensor(rows_per_thread, Int32) for _ in range(num_buffers)]
+    # Resolve each loader row to one source address before entering the K loop.
+    # Keeping one predicate/index pair per buffer made both register pressure and
+    # the hot copy loop scale with num_buffers.  The X buffers have identical
+    # dtype/layout/stride (validated by gemm()), so a selected row address can be
+    # viewed through the first buffer's static layout.
+    row_valid = cute.make_rmem_tensor(rows_per_thread, Boolean)
+    row_ptrs = cute.make_rmem_tensor(rows_per_thread, Int64)
+    fallback_ptr = mAs[0].iterator.toint()
+    for m in cutlass.range_constexpr(rows_per_thread):
+        row_valid[m] = Boolean(False)
+        row_ptrs[m] = fallback_ptr
+
+    prefix = Int32(0)
     for j in cutlass.range_constexpr(num_buffers):
-        prefix = Int32(0)
-        for h in cutlass.range_constexpr(j):
-            prefix += route_ranges[2 * h + 1] - route_ranges[2 * h]
         length = route_ranges[2 * j + 1] - route_ranges[2 * j]
         for m in cutlass.range_constexpr(rows_per_thread):
             row = tAcA[0, m, 0][0]
             pred = row >= prefix
             pred &= row < prefix + length
-            row_preds[j][m] = pred
             if pred:
-                row_indices[j][m] = gAIdxs[j][route_ranges[2 * j] + row - prefix]
-            else:
-                row_indices[j][m] = Int32(0)
+                row_idx = gAIdxs[j][route_ranges[2 * j] + row - prefix]
+                row_ptrs[m] = mAs[j][row_idx, None].iterator.toint()
+                row_valid[m] = Boolean(True)
+        prefix += length
 
-    mAs_k = [cute.logical_divide(mA, (None, tile_K)) for mA in mAs]
+    selected_mAs_k = []
+    for m in cutlass.range_constexpr(rows_per_thread):
+        row_ptr = cute.make_ptr(
+            mAs[0].element_type,
+            row_ptrs[m],
+            mAs[0].iterator.memspace,
+            assumed_align=mAs[0].iterator.alignment,
+        )
+        selected_mA = cute.make_tensor(row_ptr, mAs[0].layout)
+        selected_mAs_k.append(cute.logical_divide(selected_mA, (None, tile_K)))
 
     def copy_fn(src_idx, dst_idx, pred: cutlass.Constexpr[bool] = False):
         tApA_k = None
@@ -1597,24 +1614,21 @@ def multi_buffer_gather_m_get_copy_fn(
             limit_k_cur = limit_k - src_idx * tile_K
             for k in cutlass.range(cols_per_thread, unroll_full=True):
                 tApA_k[k] = t0AcA[0, 0, k][1] < limit_k_cur
-        for j in cutlass.range_constexpr(num_buffers):
-            mA_cur = mAs_k[j][None, (None, src_idx)]
-            for m in cutlass.range_constexpr(rows_per_thread):
-                if row_preds[j][m]:
-                    mA_row = cute.tiled_divide(
-                        cute.append_ones(
-                            mA_cur[row_indices[j][m], None], up_to_rank=2
-                        ),
-                        (elems_per_load, 1),
-                    )[None, None, 0]
-                    assert cute.size(tAcA.shape, mode=[2]) == 1
-                    ki = tAcA[0, 0, 0][1] // elems_per_load
-                    cute.copy(
-                        thr_copy_A,
-                        mA_row[None, ki],
-                        tAsA[(None, m), dst_idx],
-                        pred=tApA_k,
-                    )
+        for m in cutlass.range_constexpr(rows_per_thread):
+            if row_valid[m]:
+                mA_cur = selected_mAs_k[m][None, (None, src_idx)]
+                mA_row = cute.tiled_divide(
+                    cute.append_ones(mA_cur[0, None], up_to_rank=2),
+                    (elems_per_load, 1),
+                )[None, None, 0]
+                assert cute.size(tAcA.shape, mode=[2]) == 1
+                ki = tAcA[0, 0, 0][1] // elems_per_load
+                cute.copy(
+                    thr_copy_A,
+                    mA_row[None, ki],
+                    tAsA[(None, m), dst_idx],
+                    pred=tApA_k,
+                )
 
     return copy_fn
 
