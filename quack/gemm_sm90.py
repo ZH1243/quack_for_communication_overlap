@@ -16,7 +16,7 @@ import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 import cutlass.utils.hopper_helpers as sm90_utils
-from cutlass import Int32, Float32, Float16, Boolean, const_expr
+from cutlass import Int64, Int32, Float32, Float16, Boolean, const_expr
 from cutlass.experimental import primitives as prims
 from cutlass.utils import LayoutEnum, SmemPartition
 
@@ -304,6 +304,14 @@ class GemmSm90(GemmTmaBase):
         )
         self.num_ab_load_warps = 1 if not self.gather_A else 4
         self.ab_load_warp_id = self.mma_warp_groups * 4
+        self.gather_address_barrier = (
+            pipeline.NamedBarrier(
+                barrier_id=int(NamedBarrierGemm.GatherAddress),
+                num_threads=self.num_ab_load_warps * cute.arch.WARP_SIZE,
+            )
+            if self.multi_buffer_gather
+            else None
+        )
 
         regs_per_thread = math.prod(self.cta_tile_shape_mnk[:2]) // (
             math.prod(self.atom_layout_mnk) * self.num_threads_per_warp_group
@@ -464,6 +472,13 @@ class GemmSm90(GemmTmaBase):
         # atoms use the smem STORAGE dtypes: identical to the element dtypes
         # except SM120 mixed-blockscaled fp4 operands, whose 16U4_ALIGN8B smem
         # footprint is one byte per element (Int8, set by _setup_tiled_mma).
+        fixed_user_smem_bytes = 0
+        if self.multi_buffer_gather:
+            address_table_bytes = Int64.width // 8 * self.cta_tile_shape_mnk[0]
+            fixed_user_smem_bytes = (
+                math.ceil(address_table_bytes / self.buffer_align_bytes)
+                * self.buffer_align_bytes
+            )
         self.ab_stage, self.epi_stage, self.epi_c_stage = self._compute_stages(
             self.cta_tile_shape_mnk,
             self.epi_tile,
@@ -488,6 +503,7 @@ class GemmSm90(GemmTmaBase):
                 (self.aux_a.bytes_per_stage() if self.aux_a is not None else 0)
                 + self._sf_smem_bytes_per_stage()
             ),
+            fixed_user_smem_bytes=fixed_user_smem_bytes,
         )
         self.sched_stage = 2 if self.pingpong else 1
 
@@ -800,6 +816,7 @@ class GemmSm90(GemmTmaBase):
         sf_dtype_storage = self.sf_dtype if self.blockscaled else Int32
         sfa_smem_size = cute.cosize(self.sfa_smem_layout_staged) if self.blockscaled else 0
         sfb_smem_size = cute.cosize(self.sfb_smem_layout_staged) if self.blockscaled else 0
+        gather_row_ptr_smem_size = self.cta_tile_shape_mnk[0] if self.multi_buffer_gather else 0
 
         @cute.struct
         class SharedStorage:
@@ -837,6 +854,10 @@ class GemmSm90(GemmTmaBase):
             sSFB: cute.struct.Align[
                 cute.struct.MemRange[sf_dtype_storage, sfb_smem_size],
                 128,
+            ]
+            sGatherRowPtrs: cute.struct.Align[
+                cute.struct.MemRange[Int64, gather_row_ptr_smem_size],
+                16,
             ]
 
         self.shared_storage = SharedStorage
@@ -1014,6 +1035,11 @@ class GemmSm90(GemmTmaBase):
         sAuxA = None
         if const_expr(self.aux_a is not None):
             sAuxA = storage.sAuxA.get_tensor(aux_a_smem_layout)
+        sGatherRowPtrs = None
+        if const_expr(self.multi_buffer_gather):
+            sGatherRowPtrs = storage.sGatherRowPtrs.get_tensor(
+                cute.make_layout(self.cta_tile_shape_mnk[0])
+            )
         sD = None
         if const_expr(has_D):
             sD = storage.sD.get_tensor(epi_smem_layout.outer, swizzle=epi_smem_layout.inner)
@@ -1142,6 +1168,7 @@ class GemmSm90(GemmTmaBase):
                             tile_coord_mnkl,
                             batch_idx,
                             tile_sched_params,
+                            sGatherRowPtrs,
                         )
                     copy_AuxA = None
                     if const_expr(self.aux_a is not None):
@@ -1617,6 +1644,7 @@ class GemmSm90(GemmTmaBase):
         tile_coord_mnkl,
         batch_idx: Int32,
         tile_sched_params,
+        sGatherRowPtrs: Optional[cute.Tensor] = None,
     ):
         """Create copy_A and prefetch_A for gather_A (shared by SM90/SM120 DMA)."""
         varlen_m = varlen_manager.varlen_m
@@ -1643,6 +1671,7 @@ class GemmSm90(GemmTmaBase):
         thr_copy_A = tiled_copy_A.get_slice(dma_tidx)
         copy_A, prefetch_A = None, None
         if const_expr(self.multi_buffer_gather):
+            assert sGatherRowPtrs is not None and self.gather_address_barrier is not None
             multi_args = tile_sched_params.multi_buffer_gather
             mAs = (mA_mkl, *multi_args.x_buffers)
             gAIdxs = (varlen_manager.params.mAIdx, *multi_args.a_idx_buffers)
@@ -1650,9 +1679,11 @@ class GemmSm90(GemmTmaBase):
                 thr_copy_A,
                 mAs,
                 sA,
+                sGatherRowPtrs,
                 gAIdxs,
                 tile_coord_mnkl[4:],
                 limit_k=len_k,
+                address_barrier=self.gather_address_barrier,
             )
         elif const_expr(self.gather_table):
             copy_A = copy_utils.gather_m_get_copy_fn(
@@ -2060,6 +2091,7 @@ class GemmSm90(GemmTmaBase):
         warp_shape_mnk: Tuple[int, int, int] | None = None,
         a_bytes_per_stage_override: Optional[int] = None,
         ab_extra_bytes_per_stage: int = 0,
+        fixed_user_smem_bytes: int = 0,
     ) -> Tuple[int, int]:
         """Computes the number of stages for A/B/C operands based on heuristics.
 
@@ -2138,7 +2170,11 @@ class GemmSm90(GemmTmaBase):
         )
 
         remaining_bytes = (
-            smem_capacity // occupancy - mbar_helpers_bytes - align_pad_bytes - epi_bytes
+            smem_capacity // occupancy
+            - mbar_helpers_bytes
+            - align_pad_bytes
+            - fixed_user_smem_bytes
+            - epi_bytes
         )
         ab_stage = remaining_bytes // ab_bytes_per_stage
 

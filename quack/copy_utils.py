@@ -1546,9 +1546,11 @@ def multi_buffer_gather_m_get_copy_fn(
     thr_copy_A: cute.ThrCopy,
     mAs: tuple,
     sA: cute.Tensor,
+    sRowPtrs: cute.Tensor,
     gAIdxs: tuple,
     route_ranges: tuple,
     limit_k: Int32,
+    address_barrier: cutlass.pipeline.NamedBarrier,
 ) -> Callable:
     """Gather one packed A tile from independent X/A_idx buffers.
 
@@ -1559,6 +1561,7 @@ def multi_buffer_gather_m_get_copy_fn(
     num_buffers = const_expr(len(mAs))
     assert len(gAIdxs) == num_buffers and len(route_ranges) == 2 * num_buffers
     tile_M, tile_K = cute.size(sA, mode=[0]), cute.size(sA, mode=[1])
+    assert cute.size(sRowPtrs) == tile_M
     tAsA = partition_D_position_independent(thr_copy_A, sA)
     assert tAsA.shape[2] == 1
     tAsA = cute.group_modes(cute.slice_(tAsA, (None, None, 0, None)), 0, 2)
@@ -1571,31 +1574,46 @@ def multi_buffer_gather_m_get_copy_fn(
     rows_per_thread = const_expr(cute.size(tAcA.shape, mode=[1]))
     cols_per_thread = const_expr(cute.size(tAcA.shape, mode=[2]))
 
-    # Resolve each loader row to one source address before entering the K loop.
-    # Keeping one predicate/index pair per buffer made both register pressure and
-    # the hot copy loop scale with num_buffers.  The X buffers have identical
-    # dtype/layout/stride (validated by gemm()), so a selected row address can be
-    # viewed through the first buffer's static layout.
+    # Cooperatively resolve one source-row base address per destination row.
+    # Exactly the 128 gather-A loader threads enter this function.  A loader
+    # owns rows ``thread + i * 128``, so buffer-range checks and A_idx loads are
+    # performed once per row instead of once by every cp.async lane for it.
+    loader_threads = const_expr(128)
+    loader_idx = thr_copy_A.thr_idx
+    rows_to_prepare = const_expr(cute.ceil_div(tile_M, loader_threads))
+    for i in cutlass.range_constexpr(rows_to_prepare):
+        row = loader_idx + i * loader_threads
+        if row < tile_M:
+            row_ptr = Int64(0)
+            prefix = Int32(0)
+            for j in cutlass.range_constexpr(num_buffers):
+                length = route_ranges[2 * j + 1] - route_ranges[2 * j]
+                pred = row >= prefix
+                pred &= row < prefix + length
+                if pred:
+                    row_idx = gAIdxs[j][route_ranges[2 * j] + row - prefix]
+                    row_ptr = mAs[j][row_idx, None].iterator.toint()
+                prefix += length
+            sRowPtrs[row] = row_ptr
+
+    # Publish the completed table before the cp.async lane groups consume it.
+    address_barrier.arrive_and_wait()
     row_valid = cute.make_rmem_tensor(rows_per_thread, Boolean)
     row_ptrs = cute.make_rmem_tensor(rows_per_thread, Int64)
-    fallback_ptr = mAs[0].iterator.toint()
     for m in cutlass.range_constexpr(rows_per_thread):
-        row_valid[m] = Boolean(False)
-        row_ptrs[m] = fallback_ptr
+        row = tAcA[0, m, 0][0]
+        row_ptrs[m] = sRowPtrs[row]
+        row_valid[m] = row_ptrs[m] != Int64(0)
 
-    prefix = Int32(0)
-    for j in cutlass.range_constexpr(num_buffers):
-        length = route_ranges[2 * j + 1] - route_ranges[2 * j]
-        for m in cutlass.range_constexpr(rows_per_thread):
-            row = tAcA[0, m, 0][0]
-            pred = row >= prefix
-            pred &= row < prefix + length
-            if pred:
-                row_idx = gAIdxs[j][route_ranges[2 * j] + row - prefix]
-                row_ptrs[m] = mAs[j][row_idx, None].iterator.toint()
-                row_valid[m] = Boolean(True)
-        prefix += length
+    # Every lane has now cached its table entries in registers.  This second
+    # rendezvous makes it safe for fast warps to reach the next persistent tile
+    # and overwrite sRowPtrs while slower warps are still issuing this tile's
+    # cp.async loads.
+    address_barrier.arrive_and_wait()
 
+    # The X buffers have identical dtype/layout/stride (validated by gemm()),
+    # so a selected row address can be viewed through the first buffer's static
+    # layout.
     selected_mAs_k = []
     for m in cutlass.range_constexpr(rows_per_thread):
         row_ptr = cute.make_ptr(

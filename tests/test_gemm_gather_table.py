@@ -17,10 +17,11 @@ pytestmark = pytest.mark.skipif(
 
 
 @torch.inference_mode()
-def test_multi_buffer_gather_selects_one_source_row():
-    """Rows spanning many buffers select one address before the K loop."""
+@pytest.mark.parametrize(("tile_m", "num_buffers"), [(64, 5), (128, 32), (192, 16)])
+def test_multi_buffer_gather_selects_one_source_row(tile_m, num_buffers):
+    """Loader threads cooperatively prepare one address for each packed row."""
     torch.manual_seed(0)
-    num_buffers, num_experts = 16, 2
+    num_experts = 2
     tokens, routes, k, n = 32, 19, 64, 128
     counts = (10, 9)
 
@@ -36,14 +37,24 @@ def test_multi_buffer_gather_selects_one_source_row():
         num_experts, n, k, dtype=torch.bfloat16, device="cuda"
     ) / math.sqrt(k)
 
-    # One 2-CTA cluster per expert. The first CTA crosses many input-buffer
-    # boundaries, while each expert's final CTA is ragged.
+    # Build one work-table row per M cluster. This covers tile_M below, equal
+    # to, and above the 128 address-preparation threads; CTA boundaries also
+    # cross input-buffer boundaries and the final cluster is ragged.
     rows = []
     expert_offsets = (0, counts[0], routes)
     for expert in range(num_experts):
         start, end = expert_offsets[expert : expert + 2]
-        ranges = tuple(value for _ in range(num_buffers) for value in (start, end))
-        rows.append((expert, 0, *ranges))
+        count = end - start
+        packed_count = num_buffers * count
+        for packed_start in range(0, packed_count, 2 * tile_m):
+            packed_end = min(packed_start + 2 * tile_m, packed_count)
+            ranges = []
+            for buffer_idx in range(num_buffers):
+                buffer_start = buffer_idx * count
+                local_start = min(max(packed_start - buffer_start, 0), count)
+                local_end = min(max(packed_end - buffer_start, 0), count)
+                ranges.extend((start + local_start, start + local_end))
+            rows.append((expert, 0, *ranges))
     work_table = torch.tensor(rows, dtype=torch.int32, device="cuda")
 
     output = torch.empty(num_buffers * routes, n, dtype=torch.bfloat16, device="cuda")
@@ -53,7 +64,7 @@ def test_multi_buffer_gather_selects_one_source_row():
         output,
         C=None,
         tile_count_semaphore=None,
-        tile_M=128,
+        tile_M=tile_m,
         tile_N=128,
         cluster_M=2,
         cluster_N=1,

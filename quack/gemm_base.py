@@ -46,6 +46,9 @@ class NamedBarrierGemm(enum.IntEnum):
     # CLC-multicast throttle: CTA0 load warp arrives once per tile started,
     # CTA0 scheduler warp syncs once per CLC query (2 warps, 64 threads).
     ClcThrottle = enum.auto()
+    # The four Hopper gather-A load warps cooperatively publish and consume
+    # one prepared source-row address per destination row.
+    GatherAddress = enum.auto()
 
 
 def reinterpret_packed_fp6(mT, dtype):
