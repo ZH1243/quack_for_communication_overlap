@@ -29,6 +29,8 @@ Multi-buffer table rows contain ``(expert_id, cid_n_base, start_0, end_0,
 ..., start_b-1, end_b-1)``. Routes are packed in expert-major order and, within
 an expert, in increasing buffer order. ``--balanced-multi-buffer-gather``
 instead balances every M-cluster tile across the nonempty input buffers.
+``--round-robin-m-clusters`` keeps all N groups for one expert/M-cluster
+consecutive, then interleaves those bundles across experts.
 
 Example:
 
@@ -42,6 +44,9 @@ Example:
 
     python run/hopper_gather_table_gemm.py --multi-buffer-gather \
         --balanced-multi-buffer-gather --num-input-buffers 3
+
+    python run/hopper_gather_table_gemm.py --multi-buffer-gather \
+        --round-robin-m-clusters --num-input-buffers 3
 """
 
 from __future__ import annotations
@@ -91,6 +96,11 @@ def parse_args() -> argparse.Namespace:
         "--balanced-multi-buffer-gather",
         action="store_true",
         help="Balance each M-cluster tile across all nonempty input buffers",
+    )
+    parser.add_argument(
+        "--round-robin-m-clusters",
+        action="store_true",
+        help="Interleave completed M-cluster bundles across experts",
     )
     parser.add_argument(
         "--tokens-per-buffer",
@@ -171,6 +181,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("num-input-buffers must be at least 2 in multi-buffer mode")
     if args.balanced_multi_buffer_gather and not args.multi_buffer_gather:
         raise ValueError("balanced-multi-buffer-gather requires multi-buffer-gather")
+    if args.round_robin_m_clusters and not args.multi_buffer_gather:
+        raise ValueError("round-robin-m-clusters requires multi-buffer-gather")
     counts = (
         multi_buffer_route_counts(routes, args.experts, args.num_input_buffers)
         if args.multi_buffer_gather
@@ -237,17 +249,20 @@ def build_multi_buffer_work_table(
     max_swizzle_size: int,
     device: torch.device,
     balance_buffers: bool = False,
+    round_robin_m_clusters: bool = False,
 ) -> tuple[
     torch.Tensor,
     tuple[tuple[int, ...], ...],
     tuple[tuple[int, int, int, int], ...],
     int,
 ]:
-    """Build expert-major cluster rows spanning independent route buffers.
+    """Build M-cluster rows spanning independent route buffers.
 
     In the default mode, each M-cluster tile drains one buffer before moving
     to the next. In balanced mode, each tile uses a max-min fair allocation
-    across all buffers that still have routes for the current expert.
+    across all buffers that still have routes for the current expert. These
+    choices affect only the ranges within a cluster. Round-robin mode instead
+    changes the order of completed expert/M-cluster bundles in the table.
     """
     num_buffers = len(counts_by_buffer)
     experts = len(counts_by_buffer[0])
@@ -264,6 +279,7 @@ def build_multi_buffer_work_table(
     cluster_rows = tile_m * cluster_m
     rows: list[tuple[int, ...]] = []
     output_segments: list[tuple[int, int, int, int]] = []
+    cluster_ranges_by_expert: list[list[tuple[int, ...]]] = []
 
     for expert in range(experts):
         expert_counts = [counts_by_buffer[j][expert] for j in range(num_buffers)]
@@ -286,14 +302,26 @@ def build_multi_buffer_work_table(
                     output_segments.append((expert, j, start, end))
                 consumed[j] += allocation
             cluster_ranges.append(tuple(ranges))
+        cluster_ranges_by_expert.append(cluster_ranges)
 
-        for n_group in range(clusters_n // x):
-            m_clusters = range(len(cluster_ranges))
-            if n_group % 2:
-                m_clusters = reversed(range(len(cluster_ranges)))
-            cid_n_base = n_group * x
-            for cid_m in m_clusters:
-                rows.append((expert, cid_n_base, *cluster_ranges[cid_m]))
+    num_n_groups = clusters_n // x
+    if round_robin_m_clusters:
+        max_m_clusters = max(map(len, cluster_ranges_by_expert), default=0)
+        for cid_m in range(max_m_clusters):
+            for expert, cluster_ranges in enumerate(cluster_ranges_by_expert):
+                if cid_m >= len(cluster_ranges):
+                    continue
+                for n_group in range(num_n_groups):
+                    rows.append((expert, n_group * x, *cluster_ranges[cid_m]))
+    else:
+        for expert, cluster_ranges in enumerate(cluster_ranges_by_expert):
+            for n_group in range(num_n_groups):
+                m_clusters = range(len(cluster_ranges))
+                if n_group % 2:
+                    m_clusters = reversed(range(len(cluster_ranges)))
+                cid_n_base = n_group * x
+                for cid_m in m_clusters:
+                    rows.append((expert, cid_n_base, *cluster_ranges[cid_m]))
 
     table = torch.tensor(rows, dtype=torch.int32, device=device)
     return (
@@ -390,6 +418,7 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> TableGathe
             max_swizzle_size=args.max_swizzle_size,
             device=device,
             balance_buffers=args.balanced_multi_buffer_gather,
+            round_robin_m_clusters=args.round_robin_m_clusters,
         )
         total_routes = args.num_input_buffers * routes
     else:
@@ -534,7 +563,8 @@ def main() -> None:
         f"Kernel: tile=({args.tile_m}, {args.tile_n}, {args.tile_k or 'auto'}), "
         f"cluster=({args.cluster_m}, 1, 1), static persistent, table gather=cp.async, "
         f"multi-buffer={args.multi_buffer_gather}, "
-        f"balanced-buffers={args.balanced_multi_buffer_gather}"
+        f"balanced-buffers={args.balanced_multi_buffer_gather}, "
+        f"round-robin-m-clusters={args.round_robin_m_clusters}"
     )
     print("Compiling and warming up the specialized QuACK kernel...")
 

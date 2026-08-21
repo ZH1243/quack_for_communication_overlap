@@ -53,6 +53,11 @@ python run/hopper_gather_table_gemm.py --multi-buffer-gather \
 The multi-buffer work table has shape `[Q, 2 + 2*b]`, with rows
 `(expert_id, cid_n_base, start_0, end_0, ..., start_b-1, end_b-1)`. Output is
 expert-major, with routes ordered by input-buffer index inside each expert.
+`--round-robin-m-clusters` changes only the scheduling order: all N-group rows
+for an expert/M-cluster stay consecutive, and those bundles are interleaved
+across experts. It can be combined independently with
+`--balanced-multi-buffer-gather`, which controls route allocation within each
+M-cluster rather than bundle ordering.
 
 All runners exclude kernel compilation, warmup, CUDA graph capture, and the
 correctness check from the reported kernel time.

@@ -74,3 +74,80 @@ def test_balanced_segments_are_not_duplicated_across_n_groups():
     assert table[2, 2:].tolist() == table[1, 2:].tolist()
     assert table[3, 2:].tolist() == table[0, 2:].tolist()
     assert sum(end - start for _, _, start, end in output_segments) == 900
+
+
+def test_round_robin_table_interleaves_complete_m_cluster_bundles():
+    table, offsets, output_segments, group_size = build_multi_buffer_work_table(
+        [[5, 2, 9], [1, 5, 0]],
+        output_dim=1024,
+        tile_m=2,
+        tile_n=256,
+        cluster_m=2,
+        max_swizzle_size=2,
+        device=torch.device("cpu"),
+        round_robin_m_clusters=True,
+    )
+
+    assert table.tolist() == [
+        [0, 0, 0, 4, 0, 0],
+        [0, 2, 0, 4, 0, 0],
+        [1, 0, 5, 7, 1, 3],
+        [1, 2, 5, 7, 1, 3],
+        [2, 0, 7, 11, 6, 6],
+        [2, 2, 7, 11, 6, 6],
+        [0, 0, 4, 5, 0, 1],
+        [0, 2, 4, 5, 0, 1],
+        [1, 0, 7, 7, 3, 6],
+        [1, 2, 7, 7, 3, 6],
+        [2, 0, 11, 15, 6, 6],
+        [2, 2, 11, 15, 6, 6],
+        [2, 0, 15, 16, 6, 6],
+        [2, 2, 15, 16, 6, 6],
+    ]
+    assert offsets == ((0, 5, 7, 16), (0, 1, 6, 6))
+    assert output_segments == (
+        (0, 0, 0, 4),
+        (0, 0, 4, 5),
+        (0, 1, 0, 1),
+        (1, 0, 5, 7),
+        (1, 1, 1, 3),
+        (1, 1, 3, 6),
+        (2, 0, 7, 11),
+        (2, 0, 11, 15),
+        (2, 0, 15, 16),
+    )
+    assert group_size == 2
+
+
+def test_round_robin_order_is_independent_of_balanced_buffer_allocation():
+    kwargs = dict(
+        output_dim=1024,
+        tile_m=2,
+        tile_n=256,
+        cluster_m=2,
+        max_swizzle_size=2,
+        device=torch.device("cpu"),
+        balance_buffers=True,
+    )
+    default_table, offsets, output_segments, _ = build_multi_buffer_work_table(
+        [[5, 2], [1, 5]], **kwargs
+    )
+    round_robin_table, rr_offsets, rr_output_segments, _ = build_multi_buffer_work_table(
+        [[5, 2], [1, 5]], **kwargs, round_robin_m_clusters=True
+    )
+
+    assert rr_offsets == offsets
+    assert rr_output_segments == output_segments
+    assert sorted(map(tuple, round_robin_table.tolist())) == sorted(
+        map(tuple, default_table.tolist())
+    )
+    assert round_robin_table[:, :2].tolist() == [
+        [0, 0],
+        [0, 2],
+        [1, 0],
+        [1, 2],
+        [0, 0],
+        [0, 2],
+        [1, 0],
+        [1, 2],
+    ]
