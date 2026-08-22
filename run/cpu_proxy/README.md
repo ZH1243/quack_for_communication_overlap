@@ -16,6 +16,7 @@ batch with either `cudaMemcpyAsync` or `cuStreamWriteValue32` on that same
 stream. `QUIT` releases the imported allocation and pinned buffers.
 
 The Python runner keeps the exported tensor storage alive and releases
-PyTorch's IPC reference counter after `QUIT`. This path requires the standard
-CUDA IPC-compatible allocator; PyTorch configurations using expandable
-segments must be disabled for this runner.
+PyTorch's IPC reference counter after `QUIT`. Both legacy 64-byte CUDA IPC
+handles and PyTorch's versioned 66-byte `cudaMalloc` handles are supported.
+Expandable-segment handles use a different import API and must be disabled for
+this runner.

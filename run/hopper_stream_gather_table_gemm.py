@@ -278,6 +278,29 @@ class CudaIpcExport:
             self.released = True
 
 
+def raw_cuda_ipc_handle(handle: bytes) -> bytes:
+    """Extract cudaIpcMemHandle_t bytes from a PyTorch IPC encoding.
+
+    Recent PyTorch versions serialize a one-byte version and a one-byte
+    allocation type before the raw cudaIpcMemHandle_t. Expandable allocations
+    use a different payload and cannot be opened with cudaIpcOpenMemHandle.
+    """
+    if len(handle) == 64:
+        return handle
+    if len(handle) >= 2 and handle[1] == ord("e"):
+        raise RuntimeError(
+            "the exported CUDA allocation uses PyTorch expandable segments, which the "
+            "CPU proxy cannot import with cudaIpcOpenMemHandle; disable expandable segments "
+            "for this process"
+        )
+    if len(handle) == 66 and handle[1] == ord("c"):
+        return handle[2:]
+    raise RuntimeError(
+        f"unexpected CUDA IPC handle encoding ({len(handle)} bytes); expected a legacy "
+        "64-byte handle or a versioned 66-byte cudaMalloc handle"
+    )
+
+
 def export_cuda_ipc_allocation(backing: torch.Tensor) -> CudaIpcExport:
     """Export the caching allocation and retain the matching IPC ref counter."""
     try:
@@ -292,18 +315,23 @@ def export_cuda_ipc_allocation(backing: torch.Tensor) -> CudaIpcExport:
     if len(shared) != 8:
         raise RuntimeError(f"unexpected CUDA IPC metadata tuple of length {len(shared)}")
     handle = bytes(shared[1])
-    if len(handle) != 64:
-        raise RuntimeError(f"unexpected CUDA IPC handle size {len(handle)} (expected 64)")
     storage_offset_bytes = int(shared[3])
     tensor_offset_bytes = backing.storage_offset() * backing.element_size()
-    return CudaIpcExport(
-        handle.hex(),
+    ipc_export = CudaIpcExport(
+        "",
         storage_offset_bytes + tensor_offset_bytes,
         storage,
         shared[0],
         shared[4],
         int(shared[5]),
     )
+    try:
+        ipc_export.handle_hex = raw_cuda_ipc_handle(handle).hex()
+    except Exception:
+        # _share_cuda_ increments this counter even if validation fails.
+        ipc_export.release()
+        raise
+    return ipc_export
 
 
 def proxy_command(

@@ -134,22 +134,48 @@ Options parse_options(int argc, char** argv) {
 }
 
 cudaIpcMemHandle_t decode_ipc_handle(const std::string& text) {
-  cudaIpcMemHandle_t handle{};
-  constexpr std::size_t bytes = sizeof(handle);
-  if (text.size() != bytes * 2) {
-    throw std::runtime_error("CUDA IPC handle must contain exactly " +
-                             std::to_string(bytes * 2) + " hexadecimal characters");
+  if (text.size() % 2 != 0) {
+    throw std::runtime_error(
+        "CUDA IPC handle must contain an even number of hexadecimal characters");
   }
-  auto* output = reinterpret_cast<unsigned char*>(&handle);
-  for (std::size_t i = 0; i < bytes; ++i) {
+
+  std::vector<unsigned char> encoded(text.size() / 2);
+  for (std::size_t i = 0; i < encoded.size(); ++i) {
     const auto pair = text.substr(2 * i, 2);
     std::size_t consumed = 0;
-    const auto value = std::stoul(pair, &consumed, 16);
+    unsigned long value = 0;
+    try {
+      value = std::stoul(pair, &consumed, 16);
+    } catch (const std::exception&) {
+      throw std::runtime_error("invalid hexadecimal CUDA IPC handle");
+    }
     if (consumed != 2) {
       throw std::runtime_error("invalid hexadecimal CUDA IPC handle");
     }
-    output[i] = static_cast<unsigned char>(value);
+    encoded[i] = static_cast<unsigned char>(value);
   }
+
+  constexpr std::size_t raw_bytes = sizeof(cudaIpcMemHandle_t);
+  std::size_t raw_offset = 0;
+  if (encoded.size() == raw_bytes) {
+    // Legacy PyTorch exported cudaIpcMemHandle_t without an envelope.
+  } else if (encoded.size() == raw_bytes + 2 &&
+             encoded[1] == static_cast<unsigned char>('c')) {
+    // Recent PyTorch versions prefix allocator IPC payloads with version and type.
+    raw_offset = 2;
+  } else if (encoded.size() >= 2 && encoded[1] == static_cast<unsigned char>('e')) {
+    throw std::runtime_error(
+        "PyTorch expandable-segment IPC handles cannot be opened with cudaIpcOpenMemHandle; "
+        "disable expandable segments for this process");
+  } else {
+    throw std::runtime_error(
+        "unsupported CUDA IPC handle encoding: expected 64 raw bytes or a 66-byte "
+        "versioned cudaMalloc handle");
+  }
+
+  cudaIpcMemHandle_t handle{};
+  auto* output = reinterpret_cast<unsigned char*>(&handle);
+  std::copy_n(encoded.begin() + raw_offset, raw_bytes, output);
   return handle;
 }
 

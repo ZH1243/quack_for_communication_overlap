@@ -7,7 +7,10 @@ from run.hopper_gather_table_gemm import (
     build_multi_buffer_work_table,
     multi_buffer_route_counts,
 )
-from run.hopper_stream_gather_table_gemm import build_stream_metadata
+from run.hopper_stream_gather_table_gemm import (
+    build_stream_metadata,
+    raw_cuda_ipc_handle,
+)
 
 
 def test_balanced_buffer_allocations_redistributes_exhausted_buffer():
@@ -180,3 +183,18 @@ def test_stream_metadata_matches_full_table_without_constructing_rows():
     assert output_segments == expected_segments
     assert group_size == expected_group_size
     assert table_rows == table.shape[0]
+
+
+def test_cuda_ipc_handle_decode_accepts_legacy_and_versioned_cuda_malloc():
+    raw = bytes(range(64))
+    assert raw_cuda_ipc_handle(raw) == raw
+    assert raw_cuda_ipc_handle(bytes([3]) + b"c" + raw) == raw
+
+
+def test_cuda_ipc_handle_validation_rejects_expandable_segments():
+    try:
+        raw_cuda_ipc_handle(bytes([3]) + b"e" + bytes(64))
+    except RuntimeError as error:
+        assert "expandable segments" in str(error)
+    else:
+        raise AssertionError("expandable-segment IPC handle was accepted")
