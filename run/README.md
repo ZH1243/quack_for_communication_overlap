@@ -87,6 +87,20 @@ python run/hopper_stream_gather_table_gemm.py --multi-buffer-gather \
     --flush-entries 2 --flush-interval-us 10 --flag-update-mode memcpy
 ```
 
+To run the C++ producer on a worker thread in the Python process, add:
+
+```bash
+python run/hopper_stream_gather_table_gemm.py --multi-buffer-gather \
+    --proxy-mode thread --flush-entries 2 --flush-interval-us 20
+```
+
+Thread mode loads `run/cpu_proxy/build/libstream_gather_proxy_thread.so`, uses
+the PyTorch table and readiness pointers directly, and creates its private CUDA
+stream in PyTorch's primary CUDA context. It therefore needs neither CUDA IPC,
+MPS, nor `--dma-kick-bytes` to avoid cross-context scheduling. The shared
+library owns one persistent native C++ worker thread, so Python can wait for
+the QuACK kernel concurrently.
+
 Use `--flag-update-mode stream-write` to publish the flag with
 `cuStreamWriteValue32` instead. The default `memcpy` mode uses
 `cudaMemcpyAsync`. In both modes, row copies and flag writes share the proxy's
@@ -102,14 +116,13 @@ construction are excluded; table transfer, configured inter-batch delays,
 scheduler polling, and GEMM are included. CUDA graphs are not used for this
 external-producer protocol.
 
-The proxy is a separate CUDA process. On systems without CUDA MPS, sufficiently
-small HtoD copies can take CUDA's front-end inline path and wait behind the
-persistent kernel's CUDA context. Run the benchmark under MPS for true
-cross-process kernel/memcpy overlap. As a diagnostic or fallback when MPS is
-unavailable, pass `--dma-kick-bytes 65536`; the proxy then issues one 64 KiB
-scratch HtoD transfer before each flush sequence so the following small copies
-are not the first work from its context. The scratch copy is timed but does not
-alter the ready-row prefix.
+In the default process mode, the proxy is a separate CUDA process. On systems
+without CUDA MPS, sufficiently small HtoD copies can take CUDA's front-end
+inline path and wait behind the persistent kernel's CUDA context. Use thread
+mode or run process mode under MPS for true overlap. As a diagnostic or
+fallback, pass `--dma-kick-bytes 65536`; the proxy then issues one 64 KiB scratch
+HtoD transfer before each flush sequence. The scratch copy is timed but does
+not alter the ready-row prefix.
 
 ## Requirements
 
@@ -218,7 +231,8 @@ expert count.
 The streaming runner accepts the table runner's parameters and additionally
 accepts `--flush-entries` (default `1`), `--flush-interval-us` (default `10`),
 `--flag-update-mode {memcpy,stream-write}`, `--dma-kick-bytes` (default `0`),
-and `--proxy-binary`. It requires `--multi-buffer-gather`.
+`--proxy-mode {process,thread}` (default `process`), `--proxy-binary`, and
+`--thread-proxy-library`. It requires `--multi-buffer-gather`.
 
 Routing is uniform: every expert receives `R / E` assignments. Without
 `--routing-with-replacement`, `R / E` cannot exceed `T`. A token is still

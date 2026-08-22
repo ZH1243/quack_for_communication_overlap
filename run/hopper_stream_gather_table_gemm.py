@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """Run Hopper multi-buffer GroupedGEMM while its gather table streams to HBM.
 
-The C++ proxy constructs the table in pinned host memory and imports one
-Python-owned CUDA allocation through CUDA IPC. It copies table rows in batches
-and publishes a ready-row prefix after every batch. The persistent scheduler
-warp waits for that prefix before reading a row.
+The C++ proxy constructs the table in pinned host memory, copies table rows in
+batches, and publishes a ready-row prefix after every batch. It can run either
+as a separate CUDA-IPC process or as a worker thread sharing PyTorch's CUDA
+context. The persistent scheduler warp waits for the prefix before reading a
+row.
 """
 
 from __future__ import annotations
 
 import argparse
+import ctypes
 import math
 import selectors
 import statistics
@@ -47,6 +49,7 @@ except ModuleNotFoundError as error:
 
 
 DEFAULT_PROXY = Path(__file__).resolve().parent / "cpu_proxy" / "build" / "stream_gather_proxy"
+DEFAULT_THREAD_PROXY = DEFAULT_PROXY.with_name("libstream_gather_proxy_thread.so")
 
 
 def parse_args() -> argparse.Namespace:
@@ -88,6 +91,18 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_PROXY,
         help="Path to the built stream_gather_proxy executable",
     )
+    parser.add_argument(
+        "--proxy-mode",
+        choices=("process", "thread"),
+        default="process",
+        help="Run the proxy as a CUDA-IPC subprocess or an in-process worker thread",
+    )
+    parser.add_argument(
+        "--thread-proxy-library",
+        type=Path,
+        default=DEFAULT_THREAD_PROXY,
+        help="Path to the in-process proxy shared library",
+    )
     return parser.parse_args()
 
 
@@ -103,9 +118,11 @@ def validate_stream_args(args: argparse.Namespace) -> None:
         )
     if args.dma_kick_bytes < 0:
         raise ValueError(f"dma-kick-bytes must be nonnegative, got {args.dma_kick_bytes}")
-    if not args.proxy_binary.is_file():
+    proxy_path = args.proxy_binary if args.proxy_mode == "process" else args.thread_proxy_library
+    if not proxy_path.is_file():
+        artifact = "CPU proxy" if args.proxy_mode == "process" else "thread proxy library"
         raise FileNotFoundError(
-            f"CPU proxy not found at {args.proxy_binary}. Build it with:\n"
+            f"{artifact} not found at {proxy_path}. Build it with:\n"
             "  cmake -S run/cpu_proxy -B run/cpu_proxy/build\n"
             "  cmake --build run/cpu_proxy/build -j"
         )
@@ -419,7 +436,7 @@ def read_proxy_line(process: subprocess.Popen[str], timeout_s: float = 30.0) -> 
 
 @torch.inference_mode()
 def run_stream_once(
-    process: subprocess.Popen[str],
+    proxy,
     launch,
     work_table: torch.Tensor,
     ready_rows: torch.Tensor,
@@ -428,18 +445,14 @@ def run_stream_once(
     work_table.fill_(-1)
     ready_rows.zero_()
     torch.cuda.synchronize(device)
-    assert process.stdin is not None
     # Queue the persistent kernel while every table row is still poisoned
     # and ready_rows is zero. Its scheduler warp starts by polling row 0.
     launch()
     start_ns = time.perf_counter_ns()
-    process.stdin.write("GO\n")
-    process.stdin.flush()
+    proxy.go()
     torch.cuda.synchronize(device)
     elapsed_ms = (time.perf_counter_ns() - start_ns) / 1e6
-    status = read_proxy_line(process)
-    if not status.startswith("DONE "):
-        raise RuntimeError(f"unexpected CPU proxy completion status: {status}")
+    proxy.wait()
     return elapsed_ms
 
 
@@ -463,6 +476,161 @@ def stop_proxy(process: subprocess.Popen[str]) -> None:
         raise RuntimeError(process.stderr.read().strip() or f"proxy exited {return_code}")
 
 
+class ProcessProxy:
+    def __init__(self, command: list[str]):
+        self.process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        try:
+            status = read_proxy_line(self.process)
+            if not status.startswith("READY "):
+                raise RuntimeError(f"unexpected CPU proxy status: {status}")
+        except Exception:
+            stop_proxy(self.process)
+            raise
+
+    def go(self) -> None:
+        assert self.process.stdin is not None
+        self.process.stdin.write("GO\n")
+        self.process.stdin.flush()
+
+    def wait(self) -> None:
+        status = read_proxy_line(self.process)
+        if not status.startswith("DONE "):
+            raise RuntimeError(f"unexpected CPU proxy completion status: {status}")
+
+    def close(self) -> None:
+        stop_proxy(self.process)
+
+
+class ThreadProxy:
+    """Run the C++ producer on one native worker thread in this process."""
+
+    ERROR_CAPACITY = 4096
+
+    def __init__(
+        self,
+        library_path: Path,
+        args: argparse.Namespace,
+        inputs: TableGatherInputs,
+        ready_rows: torch.Tensor,
+    ):
+        self.library = ctypes.CDLL(str(library_path.resolve()))
+        char_pointer = ctypes.POINTER(ctypes.c_char)
+        try:
+            create = self.library.stream_gather_thread_proxy_create
+            start = self.library.stream_gather_thread_proxy_start
+            wait = self.library.stream_gather_thread_proxy_wait
+            destroy = self.library.stream_gather_thread_proxy_destroy
+        except AttributeError as error:
+            raise RuntimeError(
+                f"{library_path} does not expose the thread-proxy API; rebuild run/cpu_proxy"
+            ) from error
+        create.argtypes = [
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            char_pointer,
+            ctypes.c_size_t,
+        ]
+        create.restype = ctypes.c_void_p
+        start.argtypes = [
+            ctypes.c_void_p,
+            char_pointer,
+            ctypes.c_size_t,
+        ]
+        start.restype = ctypes.c_int
+        wait.argtypes = [
+            ctypes.c_void_p,
+            char_pointer,
+            ctypes.c_size_t,
+        ]
+        wait.restype = ctypes.c_int
+        destroy.argtypes = [ctypes.c_void_p]
+        destroy.restype = None
+
+        routes = args.routes_per_buffer or args.routes
+        error = ctypes.create_string_buffer(self.ERROR_CAPACITY)
+        handle = create(
+            args.device,
+            inputs.work_table.data_ptr(),
+            ready_rows.data_ptr(),
+            inputs.work_table.shape[0],
+            inputs.work_table.shape[1],
+            args.experts,
+            routes,
+            args.num_input_buffers,
+            args.output_dim,
+            args.tile_m,
+            args.tile_n,
+            args.cluster_m,
+            args.max_swizzle_size,
+            args.flush_entries,
+            args.flush_interval_us,
+            args.dma_kick_bytes,
+            int(args.balanced_multi_buffer_gather),
+            int(args.round_robin_m_clusters),
+            int(args.flag_update_mode == "stream-write"),
+            error,
+            len(error),
+        )
+        if not handle:
+            message = error.value.decode(errors="replace") or "unknown initialization error"
+            raise RuntimeError(f"thread proxy initialization failed: {message}")
+        self.handle = ctypes.c_void_p(handle)
+        self.in_flight = False
+
+    def go(self) -> None:
+        if self.in_flight:
+            raise RuntimeError("thread proxy already has a flush in flight")
+        error = ctypes.create_string_buffer(self.ERROR_CAPACITY)
+        result = self.library.stream_gather_thread_proxy_start(self.handle, error, len(error))
+        if result != 0:
+            message = error.value.decode(errors="replace") or "unknown start error"
+            raise RuntimeError(f"thread proxy failed to start: {message}")
+        self.in_flight = True
+
+    def wait(self) -> None:
+        if not self.in_flight:
+            raise RuntimeError("thread proxy has no flush in flight")
+        error = ctypes.create_string_buffer(self.ERROR_CAPACITY)
+        result = self.library.stream_gather_thread_proxy_wait(self.handle, error, len(error))
+        self.in_flight = False
+        if result != 0:
+            message = error.value.decode(errors="replace") or "unknown streaming error"
+            raise RuntimeError(f"thread proxy failed: {message}")
+
+    def close(self) -> None:
+        try:
+            if self.in_flight:
+                self.wait()
+        finally:
+            if self.handle:
+                self.library.stream_gather_thread_proxy_destroy(self.handle)
+                self.handle = None
+
+
 def main() -> None:
     args = parse_args()
     validate_stream_args(args)
@@ -477,13 +645,6 @@ def main() -> None:
     torch.manual_seed(args.seed)
     inputs, ready_rows, ipc_backing = prepare_inputs(args, device)
     torch.cuda.synchronize(device)
-    ipc_export = export_cuda_ipc_allocation(ipc_backing)
-    command = proxy_command(
-        args,
-        inputs,
-        ipc_export.handle_hex,
-        ipc_export.allocation_offset_bytes,
-    )
     launch = make_launch(args, inputs, ready_rows)
 
     counts = [
@@ -502,34 +663,36 @@ def main() -> None:
     )
     print(
         f"Streaming: {args.flush_entries} rows/batch, {args.flush_interval_us} us interval, "
-        f"flag={args.flag_update_mode}, DMA-kick={args.dma_kick_bytes} bytes; balanced-buffers="
+        f"flag={args.flag_update_mode}, proxy={args.proxy_mode}, "
+        f"DMA-kick={args.dma_kick_bytes} bytes; balanced-buffers="
         f"{args.balanced_multi_buffer_gather}, round-robin-m-clusters="
         f"{args.round_robin_m_clusters}"
     )
     if not args.no_cuda_graph:
-        print("CUDA graph capture is disabled for externally produced CUDA IPC table data.")
+        print("CUDA graph capture is disabled for externally produced streaming table data.")
     print("Compiling and warming up the readiness-gated QuACK kernel...")
 
-    process = None
+    proxy = None
+    ipc_export = None
     try:
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-        status = read_proxy_line(process)
-        if not status.startswith("READY "):
-            raise RuntimeError(f"unexpected CPU proxy status: {status}")
+        if args.proxy_mode == "process":
+            ipc_export = export_cuda_ipc_allocation(ipc_backing)
+            command = proxy_command(
+                args,
+                inputs,
+                ipc_export.handle_hex,
+                ipc_export.allocation_offset_bytes,
+            )
+            proxy = ProcessProxy(command)
+        else:
+            proxy = ThreadProxy(args.thread_proxy_library, args, inputs, ready_rows)
         for _ in range(max(1, args.warmup)):
-            run_stream_once(process, launch, inputs.work_table, ready_rows, device)
+            run_stream_once(proxy, launch, inputs.work_table, ready_rows, device)
 
         timings_ms = []
         for _ in range(args.timing_samples):
             launches_ms = [
-                run_stream_once(process, launch, inputs.work_table, ready_rows, device)
+                run_stream_once(proxy, launch, inputs.work_table, ready_rows, device)
                 for _ in range(args.iterations)
             ]
             timings_ms.append(statistics.mean(launches_ms))
@@ -545,10 +708,11 @@ def main() -> None:
             print(f"Reference check: PASSED (max absolute error {max_abs_error:.6g})")
     finally:
         try:
-            if process is not None:
-                stop_proxy(process)
+            if proxy is not None:
+                proxy.close()
         finally:
-            ipc_export.release()
+            if ipc_export is not None:
+                ipc_export.release()
 
 
 if __name__ == "__main__":

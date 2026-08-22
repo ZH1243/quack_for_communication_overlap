@@ -3,9 +3,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <cstring>
 #include <cstdint>
 #include <iostream>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -54,6 +58,22 @@ struct Options {
   bool round_robin = false;
   std::string flag_mode;
 };
+
+void validate_options(const Options& options) {
+  if (options.table_rows <= 0 || options.table_width <= 0 || options.experts <= 0 ||
+      options.routes_per_buffer <= 0 || options.num_input_buffers < 2 ||
+      options.output_dim <= 0 || options.tile_m <= 0 || options.tile_n <= 0 ||
+      options.cluster_m <= 0 || options.max_swizzle_size <= 0 ||
+      options.entries_per_flush <= 0 || options.interval_us < 0) {
+    throw std::runtime_error("table and flush dimensions must be positive (interval may be zero)");
+  }
+  if (options.table_width != 2 + 2 * options.num_input_buffers) {
+    throw std::runtime_error("table width does not match the multi-buffer row format");
+  }
+  if (options.flag_mode != "memcpy" && options.flag_mode != "stream-write") {
+    throw std::runtime_error("--flag-mode must be memcpy or stream-write");
+  }
+}
 
 std::unordered_map<std::string, std::string> parse_pairs(int argc, char** argv) {
   std::unordered_map<std::string, std::string> values;
@@ -119,19 +139,7 @@ Options parse_options(int argc, char** argv) {
   options.round_robin = integer_option<int>(values, "round-robin") != 0;
   options.flag_mode = required(values, "flag-mode");
 
-  if (options.table_rows <= 0 || options.table_width <= 0 || options.experts <= 0 ||
-      options.routes_per_buffer <= 0 || options.num_input_buffers < 2 ||
-      options.output_dim <= 0 || options.tile_m <= 0 || options.tile_n <= 0 ||
-      options.cluster_m <= 0 || options.max_swizzle_size <= 0 ||
-      options.entries_per_flush <= 0 || options.interval_us < 0) {
-    throw std::runtime_error("table and flush dimensions must be positive (interval may be zero)");
-  }
-  if (options.table_width != 2 + 2 * options.num_input_buffers) {
-    throw std::runtime_error("table width does not match the multi-buffer row format");
-  }
-  if (options.flag_mode != "memcpy" && options.flag_mode != "stream-write") {
-    throw std::runtime_error("--flag-mode must be memcpy or stream-write");
-  }
+  validate_options(options);
   return options;
 }
 
@@ -372,12 +380,121 @@ PinnedTable build_table(const Options& options) {
   return table;
 }
 
-void run(const Options& options) {
-  check_driver(cuInit(0), "cuInit");
-  check_cuda(cudaSetDevice(options.device), "cudaSetDevice");
-  check_cuda(cudaFree(nullptr), "initialize CUDA runtime context");
+class FlushProxy {
+ public:
+  FlushProxy(Options options, std::int32_t* device_table, std::int32_t* device_ready)
+      : options_(std::move(options)), device_table_(device_table), device_ready_(device_ready) {}
 
-  auto table = build_table(options);
+  FlushProxy(const FlushProxy&) = delete;
+  FlushProxy& operator=(const FlushProxy&) = delete;
+
+  ~FlushProxy() {
+    if (stream_ != nullptr) {
+      cudaStreamSynchronize(stream_);
+    }
+    if (ready_values_ != nullptr) {
+      cudaFreeHost(ready_values_);
+    }
+    if (kick_device_ != nullptr) {
+      cudaFree(kick_device_);
+    }
+    if (kick_host_ != nullptr) {
+      cudaFreeHost(kick_host_);
+    }
+    if (table_.data != nullptr) {
+      cudaFreeHost(table_.data);
+    }
+    if (stream_ != nullptr) {
+      cudaStreamDestroy(stream_);
+    }
+  }
+
+  void initialize() {
+    table_ = build_table(options_);
+    check_cuda(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "cudaStreamCreate");
+    batches_ = (table_.rows + options_.entries_per_flush - 1) / options_.entries_per_flush;
+    if (options_.flag_mode == "memcpy") {
+      check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&ready_values_),
+                               batches_ * sizeof(std::int32_t), cudaHostAllocDefault),
+                 "cudaHostAlloc(readiness values)");
+      for (int batch = 0; batch < batches_; ++batch) {
+        ready_values_[batch] =
+            std::min((batch + 1) * options_.entries_per_flush, table_.rows);
+      }
+    }
+    if (options_.dma_kick_bytes != 0) {
+      check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&kick_host_), options_.dma_kick_bytes,
+                               cudaHostAllocDefault),
+                 "cudaHostAlloc(DMA kick source)");
+      check_cuda(cudaMalloc(reinterpret_cast<void**>(&kick_device_), options_.dma_kick_bytes),
+                 "cudaMalloc(DMA kick destination)");
+      std::fill_n(kick_host_, options_.dma_kick_bytes, 0);
+    }
+  }
+
+  void run_once() {
+    auto deadline = std::chrono::steady_clock::now();
+    if (options_.dma_kick_bytes != 0) {
+      // CUDA uses a front-end inline path for sufficiently small HtoD copies.
+      // In a separate CUDA context that path can wait milliseconds behind a
+      // resident persistent kernel. A preceding copy-engine-sized transfer
+      // activates this stream without publishing table rows early.
+      check_cuda(cudaMemcpyAsync(kick_device_, kick_host_, options_.dma_kick_bytes,
+                                 cudaMemcpyHostToDevice, stream_),
+                 "cudaMemcpyAsync(DMA kick)");
+    }
+    for (int batch = 0; batch < batches_; ++batch) {
+      if (batch != 0 && options_.interval_us != 0) {
+        deadline += std::chrono::microseconds(options_.interval_us);
+        std::this_thread::sleep_until(deadline);
+      }
+      const int begin = batch * options_.entries_per_flush;
+      const int end = std::min(begin + options_.entries_per_flush, table_.rows);
+      const std::size_t entries = static_cast<std::size_t>(end - begin) * table_.width;
+      check_cuda(cudaMemcpyAsync(device_table_ + static_cast<std::size_t>(begin) * table_.width,
+                                 table_.data + static_cast<std::size_t>(begin) * table_.width,
+                                 entries * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream_),
+                 "cudaMemcpyAsync(table rows)");
+      if (options_.flag_mode == "memcpy") {
+        check_cuda(cudaMemcpyAsync(device_ready_, ready_values_ + batch, sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice, stream_),
+                   "cudaMemcpyAsync(readiness flag)");
+      } else {
+        check_driver(cuStreamWriteValue32(
+                         reinterpret_cast<CUstream>(stream_),
+                         static_cast<CUdeviceptr>(
+                             reinterpret_cast<std::uintptr_t>(device_ready_)),
+                         static_cast<cuuint32_t>(end), CU_STREAM_WRITE_VALUE_DEFAULT),
+                     "cuStreamWriteValue32(readiness flag)");
+      }
+    }
+    check_cuda(cudaStreamSynchronize(stream_), "cudaStreamSynchronize");
+  }
+
+  int rows() const { return table_.rows; }
+  int width() const { return table_.width; }
+
+ private:
+  Options options_;
+  PinnedTable table_;
+  std::int32_t* device_table_ = nullptr;
+  std::int32_t* device_ready_ = nullptr;
+  cudaStream_t stream_ = nullptr;
+  int batches_ = 0;
+  std::int32_t* ready_values_ = nullptr;
+  unsigned char* kick_host_ = nullptr;
+  unsigned char* kick_device_ = nullptr;
+};
+
+void initialize_cuda(int device) {
+  check_driver(cuInit(0), "cuInit");
+  check_cuda(cudaSetDevice(device), "cudaSetDevice");
+  check_cuda(cudaFree(nullptr), "initialize CUDA runtime context");
+}
+
+void run(const Options& options) {
+  initialize_cuda(options.device);
+
   const auto handle = decode_ipc_handle(options.ipc_handle);
   void* allocation = nullptr;
   check_cuda(cudaIpcOpenMemHandle(&allocation, handle, cudaIpcMemLazyEnablePeerAccess),
@@ -388,96 +505,221 @@ void run(const Options& options) {
   auto* device_ready = reinterpret_cast<std::int32_t*>(
       allocation_bytes + options.ready_offset_bytes);
 
-  cudaStream_t stream = nullptr;
-  check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
-  const int batches = (table.rows + options.entries_per_flush - 1) /
-                      options.entries_per_flush;
-  std::int32_t* ready_values = nullptr;
-  if (options.flag_mode == "memcpy") {
-    check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&ready_values),
-                             batches * sizeof(std::int32_t), cudaHostAllocDefault),
-               "cudaHostAlloc(readiness values)");
-    for (int batch = 0; batch < batches; ++batch) {
-      ready_values[batch] = std::min((batch + 1) * options.entries_per_flush, table.rows);
-    }
-  }
-
-  unsigned char* kick_host = nullptr;
-  unsigned char* kick_device = nullptr;
-  if (options.dma_kick_bytes != 0) {
-    check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&kick_host), options.dma_kick_bytes,
-                             cudaHostAllocDefault),
-               "cudaHostAlloc(DMA kick source)");
-    check_cuda(cudaMalloc(reinterpret_cast<void**>(&kick_device), options.dma_kick_bytes),
-               "cudaMalloc(DMA kick destination)");
-    std::fill_n(kick_host, options.dma_kick_bytes, 0);
-  }
-
-  std::cout << "READY rows=" << table.rows << " width=" << table.width
-            << " dma-kick-bytes=" << options.dma_kick_bytes << std::endl;
-  std::string command;
-  while (std::getline(std::cin, command)) {
-    if (command == "QUIT") {
-      break;
-    }
-    if (command != "GO") {
-      throw std::runtime_error("expected GO or QUIT on stdin");
-    }
-
-    auto deadline = std::chrono::steady_clock::now();
-    if (options.dma_kick_bytes != 0) {
-      // CUDA uses a front-end inline path for sufficiently small HtoD copies.
-      // In a separate CUDA context that path can wait milliseconds behind a
-      // resident persistent kernel. A preceding copy-engine-sized transfer
-      // activates this stream without publishing table rows early.
-      check_cuda(cudaMemcpyAsync(kick_device, kick_host, options.dma_kick_bytes,
-                                 cudaMemcpyHostToDevice, stream),
-                 "cudaMemcpyAsync(DMA kick)");
-    }
-    for (int batch = 0; batch < batches; ++batch) {
-      if (batch != 0 && options.interval_us != 0) {
-        deadline += std::chrono::microseconds(options.interval_us);
-        std::this_thread::sleep_until(deadline);
+  try {
+    FlushProxy proxy(options, device_table, device_ready);
+    proxy.initialize();
+    std::cout << "READY rows=" << proxy.rows() << " width=" << proxy.width()
+              << " dma-kick-bytes=" << options.dma_kick_bytes << std::endl;
+    std::string command;
+    while (std::getline(std::cin, command)) {
+      if (command == "QUIT") {
+        break;
       }
-      const int begin = batch * options.entries_per_flush;
-      const int end = std::min(begin + options.entries_per_flush, table.rows);
-      const std::size_t entries = static_cast<std::size_t>(end - begin) * table.width;
-      check_cuda(cudaMemcpyAsync(device_table + static_cast<std::size_t>(begin) * table.width,
-                                 table.data + static_cast<std::size_t>(begin) * table.width,
-                                 entries * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream),
-                 "cudaMemcpyAsync(table rows)");
-      if (options.flag_mode == "memcpy") {
-        check_cuda(cudaMemcpyAsync(device_ready, ready_values + batch, sizeof(std::int32_t),
-                                   cudaMemcpyHostToDevice, stream),
-                   "cudaMemcpyAsync(readiness flag)");
-      } else {
-        check_driver(cuStreamWriteValue32(
-                         reinterpret_cast<CUstream>(stream),
-                         static_cast<CUdeviceptr>(reinterpret_cast<std::uintptr_t>(device_ready)),
-                         static_cast<cuuint32_t>(end), CU_STREAM_WRITE_VALUE_DEFAULT),
-                     "cuStreamWriteValue32(readiness flag)");
+      if (command != "GO") {
+        throw std::runtime_error("expected GO or QUIT on stdin");
       }
+      proxy.run_once();
+      std::cout << "DONE rows=" << proxy.rows() << std::endl;
     }
-    check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
-    std::cout << "DONE rows=" << table.rows << std::endl;
+  } catch (...) {
+    cudaIpcCloseMemHandle(allocation);
+    throw;
   }
-
-  if (ready_values != nullptr) {
-    check_cuda(cudaFreeHost(ready_values), "cudaFreeHost(readiness values)");
-  }
-  if (kick_device != nullptr) {
-    check_cuda(cudaFree(kick_device), "cudaFree(DMA kick destination)");
-  }
-  if (kick_host != nullptr) {
-    check_cuda(cudaFreeHost(kick_host), "cudaFreeHost(DMA kick source)");
-  }
-  check_cuda(cudaFreeHost(table.data), "cudaFreeHost(table)");
-  check_cuda(cudaStreamDestroy(stream), "cudaStreamDestroy");
   check_cuda(cudaIpcCloseMemHandle(allocation), "cudaIpcCloseMemHandle");
+}
+
+struct ThreadProxyState {
+  int device = 0;
+  std::unique_ptr<FlushProxy> proxy;
+  std::mutex mutex;
+  std::condition_variable condition;
+  bool requested = false;
+  bool outstanding = false;
+  bool completed = false;
+  bool stopping = false;
+  std::string worker_error;
+  std::thread worker;
+
+  ThreadProxyState(int device_value, std::unique_ptr<FlushProxy> proxy_value)
+      : device(device_value), proxy(std::move(proxy_value)),
+        worker(&ThreadProxyState::worker_loop, this) {}
+
+  ThreadProxyState(const ThreadProxyState&) = delete;
+  ThreadProxyState& operator=(const ThreadProxyState&) = delete;
+
+  ~ThreadProxyState() {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      stopping = true;
+    }
+    condition.notify_one();
+    if (worker.joinable()) {
+      worker.join();
+    }
+  }
+
+  void start() {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (outstanding) {
+        throw std::runtime_error("thread proxy already has a flush in flight");
+      }
+      worker_error.clear();
+      requested = true;
+      outstanding = true;
+      completed = false;
+    }
+    condition.notify_one();
+  }
+
+  void wait() {
+    std::unique_lock<std::mutex> lock(mutex);
+    if (!outstanding) {
+      throw std::runtime_error("thread proxy has no flush in flight");
+    }
+    condition.wait(lock, [this] { return completed; });
+    outstanding = false;
+    if (!worker_error.empty()) {
+      throw std::runtime_error(worker_error);
+    }
+  }
+
+  void worker_loop() noexcept {
+    while (true) {
+      std::unique_lock<std::mutex> lock(mutex);
+      condition.wait(lock, [this] { return requested || stopping; });
+      if (stopping && !requested) {
+        return;
+      }
+      requested = false;
+      lock.unlock();
+
+      std::string error;
+      try {
+        check_cuda(cudaSetDevice(device), "cudaSetDevice(worker thread)");
+        proxy->run_once();
+      } catch (const std::exception& exception) {
+        error = exception.what();
+      } catch (...) {
+        error = "unknown exception in thread proxy worker";
+      }
+
+      lock.lock();
+      worker_error = std::move(error);
+      completed = true;
+      lock.unlock();
+      condition.notify_all();
+    }
+  }
+};
+
+void write_error(char* error, std::size_t capacity, const std::string& message) {
+  if (error == nullptr || capacity == 0) {
+    return;
+  }
+  const auto length = std::min(capacity - 1, message.size());
+  std::memcpy(error, message.data(), length);
+  error[length] = '\0';
+}
+
+Options make_thread_options(int device, int table_rows, int table_width, int experts,
+                            int routes_per_buffer, int num_input_buffers, int output_dim,
+                            int tile_m, int tile_n, int cluster_m, int max_swizzle_size,
+                            int entries_per_flush, int interval_us,
+                            std::size_t dma_kick_bytes, int balanced, int round_robin,
+                            int flag_mode) {
+  Options options;
+  options.device = device;
+  options.table_rows = table_rows;
+  options.table_width = table_width;
+  options.experts = experts;
+  options.routes_per_buffer = routes_per_buffer;
+  options.num_input_buffers = num_input_buffers;
+  options.output_dim = output_dim;
+  options.tile_m = tile_m;
+  options.tile_n = tile_n;
+  options.cluster_m = cluster_m;
+  options.max_swizzle_size = max_swizzle_size;
+  options.entries_per_flush = entries_per_flush;
+  options.interval_us = interval_us;
+  options.dma_kick_bytes = dma_kick_bytes;
+  options.balanced = balanced != 0;
+  options.round_robin = round_robin != 0;
+  if (flag_mode == 0) {
+    options.flag_mode = "memcpy";
+  } else if (flag_mode == 1) {
+    options.flag_mode = "stream-write";
+  } else {
+    throw std::runtime_error("thread proxy flag mode must be 0 or 1");
+  }
+  validate_options(options);
+  return options;
 }
 
 }  // namespace
 
+#ifdef QUACK_STREAM_GATHER_PROXY_LIBRARY
+extern "C" void* stream_gather_thread_proxy_create(
+    int device, std::uintptr_t device_table, std::uintptr_t device_ready, int table_rows,
+    int table_width, int experts, int routes_per_buffer, int num_input_buffers, int output_dim,
+    int tile_m, int tile_n, int cluster_m, int max_swizzle_size, int entries_per_flush,
+    int interval_us, std::size_t dma_kick_bytes, int balanced, int round_robin, int flag_mode,
+    char* error, std::size_t error_capacity) {
+  try {
+    if (device_table == 0 || device_ready == 0) {
+      throw std::runtime_error("thread proxy device pointers must be non-null");
+    }
+    auto options = make_thread_options(
+        device, table_rows, table_width, experts, routes_per_buffer, num_input_buffers,
+        output_dim, tile_m, tile_n, cluster_m, max_swizzle_size, entries_per_flush, interval_us,
+        dma_kick_bytes, balanced, round_robin, flag_mode);
+    initialize_cuda(device);
+    auto proxy = std::make_unique<FlushProxy>(
+        options, reinterpret_cast<std::int32_t*>(device_table),
+        reinterpret_cast<std::int32_t*>(device_ready));
+    proxy->initialize();
+    auto state = std::make_unique<ThreadProxyState>(device, std::move(proxy));
+    return state.release();
+  } catch (const std::exception& exception) {
+    write_error(error, error_capacity, exception.what());
+    return nullptr;
+  }
+}
+
+extern "C" int stream_gather_thread_proxy_start(void* handle, char* error,
+                                                  std::size_t error_capacity) {
+  try {
+    if (handle == nullptr) {
+      throw std::runtime_error("thread proxy handle is null");
+    }
+    auto* state = static_cast<ThreadProxyState*>(handle);
+    state->start();
+    return 0;
+  } catch (const std::exception& exception) {
+    write_error(error, error_capacity, exception.what());
+    return 1;
+  }
+}
+
+extern "C" int stream_gather_thread_proxy_wait(void* handle, char* error,
+                                                 std::size_t error_capacity) {
+  try {
+    if (handle == nullptr) {
+      throw std::runtime_error("thread proxy handle is null");
+    }
+    auto* state = static_cast<ThreadProxyState*>(handle);
+    state->wait();
+    return 0;
+  } catch (const std::exception& exception) {
+    write_error(error, error_capacity, exception.what());
+    return 1;
+  }
+}
+
+extern "C" void stream_gather_thread_proxy_destroy(void* handle) {
+  delete static_cast<ThreadProxyState*>(handle);
+}
+#else
 int main(int argc, char** argv) {
   try {
     run(parse_options(argc, argv));
@@ -487,3 +729,4 @@ int main(int argc, char** argv) {
     return 1;
   }
 }
+#endif
