@@ -102,6 +102,15 @@ construction are excluded; table transfer, configured inter-batch delays,
 scheduler polling, and GEMM are included. CUDA graphs are not used for this
 external-producer protocol.
 
+The proxy is a separate CUDA process. On systems without CUDA MPS, sufficiently
+small HtoD copies can take CUDA's front-end inline path and wait behind the
+persistent kernel's CUDA context. Run the benchmark under MPS for true
+cross-process kernel/memcpy overlap. As a diagnostic or fallback when MPS is
+unavailable, pass `--dma-kick-bytes 65536`; the proxy then issues one 64 KiB
+scratch HtoD transfer before each flush sequence so the following small copies
+are not the first work from its context. The scratch copy is timed but does not
+alter the ready-row prefix.
+
 ## Requirements
 
 - An NVIDIA Hopper GPU with compute capability 9.x (for example, H100)
@@ -208,8 +217,8 @@ expert count.
 
 The streaming runner accepts the table runner's parameters and additionally
 accepts `--flush-entries` (default `1`), `--flush-interval-us` (default `10`),
-`--flag-update-mode {memcpy,stream-write}`, and `--proxy-binary`. It requires
-`--multi-buffer-gather`.
+`--flag-update-mode {memcpy,stream-write}`, `--dma-kick-bytes` (default `0`),
+and `--proxy-binary`. It requires `--multi-buffer-gather`.
 
 Routing is uniform: every expert receives `R / E` assignments. Without
 `--routing-with-replacement`, `R / E` cannot exceed `T`. A token is still

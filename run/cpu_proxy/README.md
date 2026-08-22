@@ -15,6 +15,14 @@ private nonblocking CUDA stream and publishes the ready-row prefix after each
 batch with either `cudaMemcpyAsync` or `cuStreamWriteValue32` on that same
 stream. `QUIT` releases the imported allocation and pinned buffers.
 
+Small HtoD copies may use CUDA's front-end inline path instead of a copy
+engine. When the proxy and persistent kernel occupy separate CUDA contexts,
+that path can wait for a context scheduling boundary. Prefer running both
+processes under CUDA MPS. If MPS is unavailable, the streaming runner's
+`--dma-kick-bytes 65536` option puts one copy-engine-sized scratch transfer
+before each flush sequence; it does not publish table rows or change readiness
+granularity, but its cost is included in the end-to-end measurement.
+
 The Python runner keeps the exported tensor storage alive and releases
 PyTorch's IPC reference counter after `QUIT`. Both legacy 64-byte CUDA IPC
 handles and PyTorch's versioned 66-byte `cudaMalloc` handles are supported.

@@ -73,6 +73,16 @@ def parse_args() -> argparse.Namespace:
         help="Publish ready rows with cudaMemcpyAsync or cuStreamWriteValue32",
     )
     parser.add_argument(
+        "--dma-kick-bytes",
+        type=int,
+        default=0,
+        help=(
+            "Issue an HtoD copy of this many bytes before each flush sequence. This is an "
+            "opt-in workaround for CUDA selecting a delayed inline path for small copies from "
+            "a separate context; try 65536 when MPS is unavailable"
+        ),
+    )
+    parser.add_argument(
         "--proxy-binary",
         type=Path,
         default=DEFAULT_PROXY,
@@ -91,6 +101,8 @@ def validate_stream_args(args: argparse.Namespace) -> None:
         raise ValueError(
             f"flush-interval-us must be nonnegative, got {args.flush_interval_us}"
         )
+    if args.dma_kick_bytes < 0:
+        raise ValueError(f"dma-kick-bytes must be nonnegative, got {args.dma_kick_bytes}")
     if not args.proxy_binary.is_file():
         raise FileNotFoundError(
             f"CPU proxy not found at {args.proxy_binary}. Build it with:\n"
@@ -376,6 +388,8 @@ def proxy_command(
         str(args.flush_entries),
         "--interval-us",
         str(args.flush_interval_us),
+        "--dma-kick-bytes",
+        str(args.dma_kick_bytes),
         "--balanced",
         str(int(args.balanced_multi_buffer_gather)),
         "--round-robin",
@@ -488,7 +502,7 @@ def main() -> None:
     )
     print(
         f"Streaming: {args.flush_entries} rows/batch, {args.flush_interval_us} us interval, "
-        f"flag={args.flag_update_mode}; balanced-buffers="
+        f"flag={args.flag_update_mode}, DMA-kick={args.dma_kick_bytes} bytes; balanced-buffers="
         f"{args.balanced_multi_buffer_gather}, round-robin-m-clusters="
         f"{args.round_robin_m_clusters}"
     )

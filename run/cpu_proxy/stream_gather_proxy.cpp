@@ -49,6 +49,7 @@ struct Options {
   int max_swizzle_size = 0;
   int entries_per_flush = 0;
   int interval_us = 0;
+  std::size_t dma_kick_bytes = 0;
   bool balanced = false;
   bool round_robin = false;
   std::string flag_mode;
@@ -113,6 +114,7 @@ Options parse_options(int argc, char** argv) {
   options.max_swizzle_size = integer_option<int>(values, "max-swizzle-size");
   options.entries_per_flush = integer_option<int>(values, "entries-per-flush");
   options.interval_us = integer_option<int>(values, "interval-us");
+  options.dma_kick_bytes = integer_option<std::size_t>(values, "dma-kick-bytes");
   options.balanced = integer_option<int>(values, "balanced") != 0;
   options.round_robin = integer_option<int>(values, "round-robin") != 0;
   options.flag_mode = required(values, "flag-mode");
@@ -400,7 +402,19 @@ void run(const Options& options) {
     }
   }
 
-  std::cout << "READY rows=" << table.rows << " width=" << table.width << std::endl;
+  unsigned char* kick_host = nullptr;
+  unsigned char* kick_device = nullptr;
+  if (options.dma_kick_bytes != 0) {
+    check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&kick_host), options.dma_kick_bytes,
+                             cudaHostAllocDefault),
+               "cudaHostAlloc(DMA kick source)");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&kick_device), options.dma_kick_bytes),
+               "cudaMalloc(DMA kick destination)");
+    std::fill_n(kick_host, options.dma_kick_bytes, 0);
+  }
+
+  std::cout << "READY rows=" << table.rows << " width=" << table.width
+            << " dma-kick-bytes=" << options.dma_kick_bytes << std::endl;
   std::string command;
   while (std::getline(std::cin, command)) {
     if (command == "QUIT") {
@@ -411,6 +425,15 @@ void run(const Options& options) {
     }
 
     auto deadline = std::chrono::steady_clock::now();
+    if (options.dma_kick_bytes != 0) {
+      // CUDA uses a front-end inline path for sufficiently small HtoD copies.
+      // In a separate CUDA context that path can wait milliseconds behind a
+      // resident persistent kernel. A preceding copy-engine-sized transfer
+      // activates this stream without publishing table rows early.
+      check_cuda(cudaMemcpyAsync(kick_device, kick_host, options.dma_kick_bytes,
+                                 cudaMemcpyHostToDevice, stream),
+                 "cudaMemcpyAsync(DMA kick)");
+    }
     for (int batch = 0; batch < batches; ++batch) {
       if (batch != 0 && options.interval_us != 0) {
         deadline += std::chrono::microseconds(options.interval_us);
@@ -441,6 +464,12 @@ void run(const Options& options) {
 
   if (ready_values != nullptr) {
     check_cuda(cudaFreeHost(ready_values), "cudaFreeHost(readiness values)");
+  }
+  if (kick_device != nullptr) {
+    check_cuda(cudaFree(kick_device), "cudaFree(DMA kick destination)");
+  }
+  if (kick_host != nullptr) {
+    check_cuda(cudaFreeHost(kick_host), "cudaFreeHost(DMA kick source)");
   }
   check_cuda(cudaFreeHost(table.data), "cudaFreeHost(table)");
   check_cuda(cudaStreamDestroy(stream), "cudaStreamDestroy");
