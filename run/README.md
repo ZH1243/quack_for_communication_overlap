@@ -1,6 +1,6 @@
 # Hopper gather GEMM runners
 
-This directory contains three standalone benchmark runners for QuACK's grouped
+This directory contains four standalone benchmark runners for QuACK's grouped
 GEMM on NVIDIA Hopper GPUs (SM90). The original pair uses uniform
 Mixture-of-Experts (MoE) routing; the table-scheduled runner also supports
 uneven expert lengths.
@@ -62,6 +62,46 @@ M-cluster rather than bundle ordering.
 All runners exclude kernel compilation, warmup, CUDA graph capture, and the
 correctness check from the reported kernel time.
 
+### `hopper_stream_gather_table_gemm.py`
+
+Runs the multi-buffer table kernel while `run/cpu_proxy/stream_gather_proxy`
+streams the gather table from CUDA-pinned CPU memory into a poisoned HBM table
+allocation. The proxy publishes the number of ready table rows after
+every copy batch. Before reading row `i`, lane 0 of the scheduler warp waits for
+`ready_rows[0] >= i + 1`; it then broadcasts the row through the existing
+scheduler path. All GEMM, gather, and epilogue behavior is otherwise unchanged.
+
+Build the C++ proxy first:
+
+```bash
+cmake -S run/cpu_proxy -B run/cpu_proxy/build
+cmake --build run/cpu_proxy/build -j
+```
+
+Then run, for example:
+
+```bash
+python run/hopper_stream_gather_table_gemm.py --multi-buffer-gather \
+    --num-input-buffers 3 --tokens-per-buffer 4096 \
+    --routes-per-buffer 8195 --hidden 4096 --output-dim 4096 --experts 8 \
+    --flush-entries 2 --flush-interval-us 10 --flag-update-mode memcpy
+```
+
+Use `--flag-update-mode stream-write` to publish the flag with
+`cuStreamWriteValue32` instead. The default `memcpy` mode uses
+`cudaMemcpyAsync`. In both modes, row copies and flag writes share the proxy's
+nonblocking CUDA stream, so observing a prefix also orders the corresponding
+table data before the scheduler's system-scope acquire load.
+
+The proxy prepares its pinned table once and stays alive across warmup and
+timed launches. Before each launch, Python poisons the old HBM rows, resets the
+ready count, and launches the persistent kernel while the proxy is idle. Timing
+starts immediately before `GO` (when the proxy is about to issue its first
+batch) and ends when the GroupedGEMM finishes. Proxy startup and table
+construction are excluded; table transfer, configured inter-batch delays,
+scheduler polling, and GEMM are included. CUDA graphs are not used for this
+external-producer protocol.
+
 ## Requirements
 
 - An NVIDIA Hopper GPU with compute capability 9.x (for example, H100)
@@ -95,6 +135,7 @@ Run the table-scheduled fused gather benchmark:
 
 ```bash
 python run/hopper_gather_table_gemm.py
+python run/hopper_stream_gather_table_gemm.py --multi-buffer-gather
 ```
 
 An explicit example suitable for comparing their reported GEMM times is:
@@ -126,6 +167,7 @@ Use `--help` to see the command-line interface directly:
 python run/hopper_gather_gemm.py --help
 python run/hopper_pregather_gemm.py --help
 python run/hopper_gather_table_gemm.py --help
+python run/hopper_stream_gather_table_gemm.py --help
 ```
 
 ## Runtime parameters
@@ -163,6 +205,11 @@ expert count.
 | `--skip-check` | off | Skip comparison against the float32 PyTorch reference. |
 | `--atol` | `0.03` | Absolute tolerance for the correctness check. |
 | `--rtol` | `0.001` | Relative tolerance for the correctness check. |
+
+The streaming runner accepts the table runner's parameters and additionally
+accepts `--flush-entries` (default `1`), `--flush-interval-us` (default `10`),
+`--flag-update-mode {memcpy,stream-write}`, and `--proxy-binary`. It requires
+`--multi-buffer-gather`.
 
 Routing is uniform: every expert receives `R / E` assignments. Without
 `--routing-with-replacement`, `R / E` cannot exceed `T`. A token is still

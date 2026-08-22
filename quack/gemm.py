@@ -72,6 +72,7 @@ def _compile_gemm(
     varlen_k,
     gather_A,
     gather_table,
+    has_gather_table_ready,
     gather_table_num_buffers,
     use_tma_gather,
     has_batch_idx_permute,
@@ -203,6 +204,7 @@ def _compile_gemm(
         l,
         has_ag=has_ag,
         has_gather_table=gather_table,
+        has_gather_table_ready=has_gather_table_ready,
         gather_table_num_buffers=gather_table_num_buffers,
         multi_buffer_gather=multi_buffer_gather,
     )
@@ -478,6 +480,9 @@ def gemm(
     # end_b-1), and D has sum_j len(A_idx_j) rows. The ordinary single-buffer
     # path and its [Q, 4] table remain unchanged when this flag is false.
     multi_buffer_gather: bool = False,
+    # Optional int32[1] count of the prefix of gather_work_table currently
+    # resident in HBM. The scheduler warp waits before loading an unavailable row.
+    gather_work_table_ready: Optional[Tensor] = None,
 ) -> _GemmPlan:
     multi_buffer_gather_args = None
     if multi_buffer_gather:
@@ -526,6 +531,7 @@ def gemm(
         tensor_key(cu_seqlens_m),
         tensor_key(cu_seqlens_k),
         tensor_key(gather_work_table),
+        tensor_key(gather_work_table_ready),
         tuple(tensor_key(t) for t in A_buffers),
         tuple(tensor_key(t) for t in A_idx_buffers),
         multi_buffer_gather,
@@ -585,6 +591,7 @@ def gemm(
             cu_seqlens_k=cu_seqlens_k,
             A_idx=A_idx,
             gather_work_table=gather_work_table,
+            gather_work_table_ready=gather_work_table_ready,
             multi_buffer_gather_args=multi_buffer_gather_args,
             batch_idx_permute=batch_idx_permute,
             add_to_output=add_to_output,
@@ -624,6 +631,7 @@ def gemm(
         cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
         gather_work_table=gather_work_table,
+        gather_work_table_ready=gather_work_table_ready,
         multi_buffer_gather_args=multi_buffer_gather_args,
         batch_idx_permute=batch_idx_permute,
         SFA=SFA,
@@ -653,6 +661,7 @@ def run_gemm_plan(
     cu_seqlens_k: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,
     gather_work_table: Optional[Tensor] = None,
+    gather_work_table_ready: Optional[Tensor] = None,
     multi_buffer_gather_args: Optional[MultiBufferGatherArguments] = None,
     batch_idx_permute: Optional[Tensor] = None,
     SFA: Optional[Tensor] = None,
@@ -722,6 +731,7 @@ def run_gemm_plan(
         ag_args,
         A=A,
         gather_table=gather_work_table,
+        gather_table_ready=gather_work_table_ready,
         multi_buffer_gather=multi_buffer_gather_args,
     )
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
@@ -765,6 +775,7 @@ def _build_gemm_plan(
     cu_seqlens_k,
     A_idx,
     gather_work_table,
+    gather_work_table_ready,
     multi_buffer_gather_args,
     batch_idx_permute,
     add_to_output,
@@ -807,6 +818,8 @@ def _build_gemm_plan(
         assert cluster_N == 1, "gather_A requires cluster_N=1"
     if multi_buffer_gather_args is not None and not gather_table:
         raise ValueError("multi_buffer_gather requires gather_work_table")
+    if gather_work_table_ready is not None and not gather_table:
+        raise ValueError("gather_work_table_ready requires gather_work_table")
     if gather_table:
         if get_device_capacity(A.device)[0] != 9:
             raise ValueError("gather_work_table is currently supported only on Hopper (SM90)")
@@ -847,6 +860,17 @@ def _build_gemm_plan(
             raise ValueError("gather_work_table must be a contiguous int32 tensor")
         if gather_work_table.device != A.device or A_idx.device != A.device:
             raise ValueError("gather_work_table, A_idx, and GEMM operands must share a device")
+        if gather_work_table_ready is not None:
+            if (
+                gather_work_table_ready.shape != (1,)
+                or gather_work_table_ready.dtype != torch.int32
+                or not gather_work_table_ready.is_contiguous()
+                or gather_work_table_ready.device != A.device
+            ):
+                raise ValueError(
+                    "gather_work_table_ready must be a contiguous int32 tensor of shape [1] "
+                    "on the GEMM device"
+                )
         if A_idx.dtype != torch.int32:
             raise ValueError("gather_work_table gather requires int32 A_idx")
         total_routes = A_idx.shape[0]
@@ -1114,6 +1138,7 @@ def _build_gemm_plan(
         varlen_k,
         gather_A,
         gather_table,
+        gather_work_table_ready is not None,
         gather_table_num_buffers,
         use_tma_gather,
         batch_idx_permute is not None,

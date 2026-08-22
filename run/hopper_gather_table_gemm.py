@@ -77,9 +77,11 @@ class TableGatherInputs:
     work_group_size: int
 
 
-def parse_args() -> argparse.Namespace:
+def make_arg_parser(
+    description: str = "Benchmark QuACK's SM90 table-scheduled grouped GEMM with gather-A.",
+) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Benchmark QuACK's SM90 table-scheduled grouped GEMM with gather-A."
+        description=description
     )
     parser.add_argument("--tokens", "-T", type=int, default=4096)
     parser.add_argument("--hidden", "-K", type=int, default=4096)
@@ -130,7 +132,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-check", action="store_true")
     parser.add_argument("--atol", type=float, default=3e-2)
     parser.add_argument("--rtol", type=float, default=1e-3)
-    return parser.parse_args()
+    return parser
+
+
+def parse_args() -> argparse.Namespace:
+    return make_arg_parser().parse_args()
 
 
 def route_counts(total_routes: int, experts: int) -> list[int]:

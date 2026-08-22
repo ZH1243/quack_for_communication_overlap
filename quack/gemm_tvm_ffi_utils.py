@@ -257,6 +257,7 @@ def make_scheduler_args(
     batch_idx_permute=None,
     ag_args=None,  # quack.gemm.AllGatherArguments or None
     gather_table=None,
+    gather_table_ready=None,
     multi_buffer_gather=None,
 ):
     return TileSchedulerOptions(
@@ -279,6 +280,7 @@ def make_scheduler_args(
         ),
         batch_idx_permute=batch_idx_permute,
         gather_table=gather_table,
+        gather_table_ready=gather_table_ready,
         multi_buffer_gather=multi_buffer_gather,
     )
 
@@ -289,6 +291,7 @@ def make_fake_scheduler_args(
     l_sym,
     has_ag=False,
     has_gather_table=False,
+    has_gather_table_ready=False,
     gather_table_num_buffers=1,
     multi_buffer_gather=None,
 ):
@@ -331,6 +334,11 @@ def make_fake_scheduler_args(
                 divisibility=4 if gather_table_num_buffers % 2 else 2,
             )
             if has_gather_table
+            else None
+        ),
+        gather_table_ready=(
+            fake_tensor(Int32, (1,), leading_dim=0, divisibility=1)
+            if has_gather_table_ready
             else None
         ),
         multi_buffer_gather=multi_buffer_gather,
@@ -508,6 +516,7 @@ def plan_scheduler_args(
     ag_args=None,
     A=None,
     gather_table=None,
+    gather_table_ready=None,
     multi_buffer_gather=None,
 ):
     """Per-call TileSchedulerOptions for a cached plan.
@@ -533,6 +542,7 @@ def plan_scheduler_args(
         batch_idx_permute,
         ag_args=ag_args,
         gather_table=gather_table,
+        gather_table_ready=gather_table_ready,
         multi_buffer_gather=multi_buffer_gather,
     )
 

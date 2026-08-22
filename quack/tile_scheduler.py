@@ -177,6 +177,22 @@ def ag_wait_m_tile(
     return gate
 
 
+@cute.jit
+def wait_for_gather_table_row(ready_rows: cute.Tensor, table_idx: Int32) -> None:
+    """Wait until the CPU proxy has copied ``table_idx`` into HBM.
+
+    Unlike the AllGather gate above, the protected bytes are consumed by
+    generic scheduler loads and may otherwise be stale in L1. Use a system-scope
+    acquire load so observing the stream-ordered flag also orders and exposes
+    the preceding copy-engine writes to the table row.
+    """
+    ready = cute.arch.load(ready_rows.iterator.llvm_ptr, Int32, sem="acquire", scope="sys")
+    while ready < table_idx + 1:
+        ready = cute.arch.load(
+            ready_rows.iterator.llvm_ptr, Int32, sem="acquire", scope="sys"
+        )
+
+
 @mlir_namedtuple
 class AgSchedulerArguments(NamedTuple):
     """AllGather+GEMM scheduler arguments — the kernel-side twin of
@@ -234,6 +250,9 @@ class TileSchedulerOptions(NamedTuple):
     # (expert_id, route_start, route_end, cid_n_base), int32 and contiguous;
     # multi-buffer rows are (expert_id, cid_n_base, start_0, end_0, ...).
     gather_table: Optional[cute.Tensor] = None
+    # Optional monotonically increasing count of gather-table rows resident in
+    # HBM. The scheduler warp waits for row ``i`` until ``ready[0] >= i + 1``.
+    gather_table_ready: Optional[cute.Tensor] = None
     # Opt-in multi-buffer gather operands. The first X/A_idx pair continues to
     # travel through the ordinary GEMM/VarlenArguments slots; these tuples hold
     # buffers 1..b-1. Keeping them in one nested JIT argument makes b a static
@@ -1084,6 +1103,7 @@ class GatherTableTileSchedulerArguments:
     cluster_shape_mnk: cutlass.Constexpr[cute.Shape]
     persistence_mode: cutlass.Constexpr[PersistenceMode] = PersistenceMode.STATIC
     multi_buffer_gather: Optional[MultiBufferGatherArguments] = None
+    ready_rows: Optional[cute.Tensor] = None
 
 
 class GatherTableTileScheduler(TileScheduler):
@@ -1109,6 +1129,7 @@ class GatherTableTileScheduler(TileScheduler):
         cluster_shape_mnk: cutlass.Constexpr[cute.Shape]
         persistence_mode: cutlass.Constexpr[PersistenceMode]
         multi_buffer_gather: Optional[MultiBufferGatherArguments] = None
+        ready_rows: Optional[cute.Tensor] = None
         num_split_k: cutlass.Constexpr[int] = 1
         ag: Optional[AgParams] = None
 
@@ -1130,6 +1151,7 @@ class GatherTableTileScheduler(TileScheduler):
                 args.cluster_shape_mnk,
                 args.persistence_mode,
                 args.multi_buffer_gather,
+                args.ready_rows,
             )
 
     @staticmethod
@@ -1181,6 +1203,8 @@ class GatherTableTileScheduler(TileScheduler):
                 # Only lane 0 touches HBM. The scheduler warp then broadcasts the
                 # descriptor before its lanes perform the per-CTA remote stores.
                 if cute.arch.lane_idx() == 0:
+                    if const_expr(params.ready_rows is not None):
+                        wait_for_gather_table_row(params.ready_rows, table_idx)
                     expert_id = params.work_table[table_idx, 0]
                     route_start = params.work_table[table_idx, 1]
                     route_end = params.work_table[table_idx, 2]
@@ -1204,6 +1228,8 @@ class GatherTableTileScheduler(TileScheduler):
             table_idx, n_in_group = divmod(work_idx, params.group_size_fdd)
             # Multi-buffer rows are (expert_id, cid_n_base, start_0, end_0, ...).
             if cute.arch.lane_idx() == 0:
+                if const_expr(params.ready_rows is not None):
+                    wait_for_gather_table_row(params.ready_rows, table_idx)
                 expert_id = params.work_table[table_idx, 0]
                 pid_n = params.work_table[table_idx, 1] + n_in_group
                 for i in cutlass.range_constexpr(2 * num_buffers):

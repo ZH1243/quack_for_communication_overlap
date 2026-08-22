@@ -5,7 +5,9 @@ import torch
 from run.hopper_gather_table_gemm import (
     balanced_buffer_allocations,
     build_multi_buffer_work_table,
+    multi_buffer_route_counts,
 )
+from run.hopper_stream_gather_table_gemm import build_stream_metadata
 
 
 def test_balanced_buffer_allocations_redistributes_exhausted_buffer():
@@ -151,3 +153,30 @@ def test_round_robin_order_is_independent_of_balanced_buffer_allocation():
         [1, 0],
         [1, 2],
     ]
+
+
+def test_stream_metadata_matches_full_table_without_constructing_rows():
+    counts = multi_buffer_route_counts(routes_per_buffer=19, experts=5, num_buffers=8)
+    kwargs = dict(
+        output_dim=2048,
+        tile_m=3,
+        tile_n=128,
+        cluster_m=2,
+        max_swizzle_size=4,
+        balance_buffers=True,
+    )
+    offsets, output_segments, group_size, table_rows = build_stream_metadata(
+        counts, **kwargs
+    )
+    table, expected_offsets, expected_segments, expected_group_size = (
+        build_multi_buffer_work_table(
+            counts,
+            device=torch.device("cpu"),
+            **kwargs,
+        )
+    )
+
+    assert offsets == expected_offsets
+    assert output_segments == expected_segments
+    assert group_size == expected_group_size
+    assert table_rows == table.shape[0]

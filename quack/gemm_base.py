@@ -807,6 +807,7 @@ class GemmBase:
                 cluster_shape_mnk=self.cluster_shape_mnk,
                 persistence_mode=persistence_mode,
                 multi_buffer_gather=scheduler_args.multi_buffer_gather,
+                ready_rows=scheduler_args.gather_table_ready,
             )
         elif const_expr(varlen_args.mCuSeqlensM is None):
             num_problems = (

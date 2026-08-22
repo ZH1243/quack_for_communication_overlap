@@ -1,6 +1,7 @@
 """SM90 gather-table GEMM tests."""
 
 import math
+import time
 
 import pytest
 import torch
@@ -87,6 +88,62 @@ def test_multi_buffer_gather_selects_one_source_row(tile_m, num_buffers):
             @ weights[expert].float().mT
             for expert, (start, end) in enumerate(zip(expert_offsets[:-1], expert_offsets[1:]))
             for buffer_idx in range(num_buffers)
+        ]
+    ).to(output.dtype)
+    torch.testing.assert_close(output, reference, atol=3e-2, rtol=1e-3)
+
+
+@torch.inference_mode()
+def test_multi_buffer_gather_waits_for_table_ready_prefix():
+    """A copy-engine flag publication releases a scheduler initially polling HBM."""
+    torch.manual_seed(0)
+    tokens, routes, k, n = 32, 17, 64, 128
+    x_buffers = tuple(
+        torch.randn(tokens, k, dtype=torch.bfloat16, device="cuda") for _ in range(2)
+    )
+    a_idx_buffers = tuple(
+        torch.randperm(tokens, dtype=torch.int32, device="cuda")[:routes] for _ in range(2)
+    )
+    weights = torch.randn(1, n, k, dtype=torch.bfloat16, device="cuda") / math.sqrt(k)
+    work_table = torch.tensor(
+        [[0, 0, 0, routes, 0, routes]], dtype=torch.int32, device="cuda"
+    )
+    ready_rows = torch.zeros(1, dtype=torch.int32, device="cuda")
+    host_ready = torch.tensor([1], dtype=torch.int32, pin_memory=True)
+    output = torch.empty(2 * routes, n, dtype=torch.bfloat16, device="cuda")
+    torch.cuda.synchronize()
+
+    quack_gemm(
+        x_buffers,
+        weights,
+        output,
+        C=None,
+        tile_count_semaphore=None,
+        tile_M=64,
+        tile_N=128,
+        cluster_M=2,
+        cluster_N=1,
+        cluster_K=1,
+        pingpong=False,
+        persistent=True,
+        is_dynamic_persistent=False,
+        cu_seqlens_m=None,
+        A_idx=a_idx_buffers,
+        gather_work_table=work_table,
+        gather_work_table_ready=ready_rows,
+        multi_buffer_gather=True,
+        use_tma_gather=False,
+    )
+    time.sleep(0.01)
+    copy_stream = torch.cuda.Stream()
+    with torch.cuda.stream(copy_stream):
+        ready_rows.copy_(host_ready, non_blocking=True)
+    torch.cuda.synchronize()
+
+    reference = torch.cat(
+        [
+            x[a_idx.long()].float() @ weights[0].float().mT
+            for x, a_idx in zip(x_buffers, a_idx_buffers)
         ]
     ).to(output.dtype)
     torch.testing.assert_close(output, reference, atol=3e-2, rtol=1e-3)
