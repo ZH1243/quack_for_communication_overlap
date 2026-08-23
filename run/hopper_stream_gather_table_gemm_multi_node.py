@@ -816,6 +816,7 @@ def check_correctness(inputs: PreparedInputs, *, atol: float, rtol: float) -> fl
     return max_abs_error
 
 
+@torch.inference_mode()
 def run_one(
     iteration: int,
     *,
