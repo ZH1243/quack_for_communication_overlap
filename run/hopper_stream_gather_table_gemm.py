@@ -794,8 +794,9 @@ def main() -> None:
     # the already-launched up kernel spins waiting for table row zero.
     if precompile_down is not None:
         assert inputs.up_output is not None
-        inputs.up_output.zero_()
-        precompile_down()
+        with torch.inference_mode():
+            inputs.up_output.zero_()
+            precompile_down()
         torch.cuda.synchronize(device)
 
     proxy = None
