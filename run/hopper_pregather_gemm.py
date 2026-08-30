@@ -5,15 +5,20 @@ This is the no-gather-fusion counterpart of ``hopper_gather_gemm.py``. It first
 creates the same MoE inputs on CUDA:
 
     X:             [T, K]
-    W:             [E, K, N] (or [E, K, 2N] for a gated activation)
+    W_up:          [E, K, N] (or [E, K, 2N] for a gated activation)
+    W_down:        [E, N, K] (only with --down-projection)
     A_idx:         [R]
     cu_seqlens_m:  [E + 1]
+    up_output:     [R, N]
+    output:        [R, N], or [R, K] with --down-projection
 
 It then materializes ``A = X[A_idx]`` as a contiguous ``[R, K]`` CUDA tensor
-before invoking QuACK. The timed grouped GEMM receives A and cu_seqlens_m, but
+before invoking QuACK. The timed up-projection receives A and cu_seqlens_m, but
 does not receive A_idx, so its A operand uses the ordinary contiguous TMA path.
+When ``--down-projection`` is enabled, the activated output is already
+expert-contiguous and feeds a second grouped GEMM using the same cu_seqlens_m.
 The pre-gather operation, compilation, warmup, graph capture, and correctness
-check are excluded from the reported GEMM time.
+check are excluded from the reported operation time.
 
 Example:
 
@@ -25,7 +30,7 @@ Fuse a SwiGLU up-projection (the weight uses concatenated [gate | up] columns):
 
     python run/hopper_pregather_gemm.py \
         --tokens 4096 --hidden 4096 --output-dim 14336 \
-        --experts 8 --routes 8192 --activation swiglu
+        --experts 8 --routes 8192 --activation swiglu --down-projection
 """
 
 from __future__ import annotations
@@ -54,10 +59,12 @@ GATED_ACTIVATIONS = tuple(gated_to_pytorch_fn_map)
 @dataclass
 class PregatherInputs:
     X: torch.Tensor
-    W: torch.Tensor
+    W_up: torch.Tensor
+    W_down: torch.Tensor | None
     A_idx: torch.Tensor
     cu_seqlens_m: torch.Tensor
     A: torch.Tensor
+    up_output: torch.Tensor
     output: torch.Tensor
 
 
@@ -67,7 +74,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--tokens", "-T", type=int, default=4096, help="Number of X rows (T)")
     parser.add_argument("--hidden", "-K", type=int, default=4096, help="Input dimension (K)")
-    parser.add_argument("--output-dim", "-N", type=int, default=4096, help="Output dimension (N)")
+    parser.add_argument(
+        "--output-dim",
+        "-N",
+        type=int,
+        default=4096,
+        help="Expert intermediate dimension (N)",
+    )
     parser.add_argument("--experts", "-E", type=int, default=8, help="Number of experts (E)")
     parser.add_argument("--routes", "-R", type=int, default=8192, help="Routed assignments (R)")
     parser.add_argument("--dtype", choices=DTYPES, default="bf16")
@@ -81,6 +94,11 @@ def parse_args() -> argparse.Namespace:
             "Fuse this activation into the GEMM epilogue. Gated activations such as "
             "swiglu interpret --output-dim as the final width and use a 2x-wide projection."
         ),
+    )
+    parser.add_argument(
+        "--down-projection",
+        action="store_true",
+        help="Run a grouped down projection after the fused activation (requires --activation)",
     )
 
     parser.add_argument("--tile-m", type=int, default=256)
@@ -100,12 +118,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow the same token to occur more than once for one expert",
     )
-    parser.add_argument("--warmup", type=int, default=5, help="Untimed GEMM launches")
+    parser.add_argument("--warmup", type=int, default=5, help="Untimed operation launches")
     parser.add_argument(
         "--iterations",
         type=int,
         default=100,
-        help="Grouped GEMM launches captured in each timing sample",
+        help="Operation launches captured in each timing sample",
     )
     parser.add_argument("--timing-samples", type=int, default=5)
     parser.add_argument(
@@ -139,6 +157,8 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"{name} must be positive, got {value}")
     if args.warmup < 0:
         raise ValueError(f"warmup must be nonnegative, got {args.warmup}")
+    if args.down_projection and args.activation is None:
+        raise ValueError("--down-projection requires --activation")
     if args.routes % args.experts != 0:
         raise ValueError(f"routes ({args.routes}) must be divisible by experts ({args.experts})")
     routes_per_expert = args.routes // args.experts
@@ -162,14 +182,21 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> PregatherI
         # concat_layout=("B",) acts on B's non-contiguous dimension. Materialize
         # the conventional [E, 2N, K] [gate | up] weight and expose its
         # [E, K, 2N] transpose so QuACK interleaves output columns, not K rows.
-        W = torch.randn(
+        W_up = torch.randn(
             (args.experts, gemm_output_dim, args.hidden), dtype=dtype, device=device
         ).transpose(1, 2)
     else:
-        W = torch.randn(
+        W_up = torch.randn(
             (args.experts, args.hidden, gemm_output_dim), dtype=dtype, device=device
         )
-    W.mul_(1.0 / math.sqrt(args.hidden))
+    W_up.mul_(1.0 / math.sqrt(args.hidden))
+
+    W_down = None
+    if args.down_projection:
+        W_down = torch.randn(
+            (args.experts, args.output_dim, args.hidden), dtype=dtype, device=device
+        )
+        W_down.mul_(1.0 / math.sqrt(args.output_dim))
 
     cu_seqlens_m = torch.arange(args.experts + 1, dtype=torch.int32, device=device)
     cu_seqlens_m.mul_(routes_per_expert)
@@ -194,22 +221,30 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> PregatherI
     # route order. It runs before all GEMM warmup and timing regions.
     A = X[A_idx]
     assert A.is_contiguous()
-    output = torch.empty((args.routes, args.output_dim), dtype=dtype, device=device)
+    up_output = torch.empty((args.routes, args.output_dim), dtype=dtype, device=device)
+    output = (
+        torch.empty((args.routes, args.hidden), dtype=dtype, device=device)
+        if args.down_projection
+        else up_output
+    )
     return PregatherInputs(
         X=X,
-        W=W,
+        W_up=W_up,
+        W_down=W_down,
         A_idx=A_idx,
         cu_seqlens_m=cu_seqlens_m,
         A=A,
+        up_output=up_output,
         output=output,
     )
 
 
 def make_launch(args: argparse.Namespace, inputs: PregatherInputs):
     # QuACK's plain low-level API expects B as [E, N, K]. This is a zero-copy
-    # view of the user-facing W[E, K, N] tensor. The activation API below uses
-    # the torch-convention [E, K, N] view directly.
-    B = inputs.W.transpose(1, 2)
+    # view of each user-facing [E, input, output] weight tensor. The activation
+    # API below uses the torch-convention W_up view directly.
+    B_up = inputs.W_up.transpose(1, 2)
+    B_down = inputs.W_down.transpose(1, 2) if inputs.W_down is not None else None
 
     if args.activation is not None:
         config = GemmConfig(
@@ -230,9 +265,9 @@ def make_launch(args: argparse.Namespace, inputs: PregatherInputs):
         if args.activation is not None:
             gemm_act(
                 inputs.A,
-                inputs.W,
+                inputs.W_up,
                 activation=args.activation,
-                postact_out=inputs.output,
+                postact_out=inputs.up_output,
                 cu_seqlens_m=inputs.cu_seqlens_m,
                 A_idx=None,
                 store_preact=False,
@@ -241,29 +276,53 @@ def make_launch(args: argparse.Namespace, inputs: PregatherInputs):
                 config=config,
                 concat_layout=("B",) if args.activation in GATED_ACTIVATIONS else None,
             )
-            return
-        quack_gemm(
-            inputs.A,
-            B,
-            inputs.output,
-            C=None,
-            tile_count_semaphore=None,
-            tile_M=args.tile_m,
-            tile_N=args.tile_n,
-            tile_K=args.tile_k,
-            cluster_M=args.cluster_m,
-            cluster_N=1,
-            cluster_K=1,
-            pingpong=args.pingpong,
-            persistent=True,
-            is_dynamic_persistent=False,
-            max_swizzle_size=args.max_swizzle_size,
-            cu_seqlens_m=inputs.cu_seqlens_m,
-            # A is already route-major and contiguous. Omitting A_idx selects
-            # QuACK's ordinary TMA A-load path instead of fused gather-A.
-            A_idx=None,
-            use_tma_gather=False,
-        )
+        else:
+            quack_gemm(
+                inputs.A,
+                B_up,
+                inputs.up_output,
+                C=None,
+                tile_count_semaphore=None,
+                tile_M=args.tile_m,
+                tile_N=args.tile_n,
+                tile_K=args.tile_k,
+                cluster_M=args.cluster_m,
+                cluster_N=1,
+                cluster_K=1,
+                pingpong=args.pingpong,
+                persistent=True,
+                is_dynamic_persistent=False,
+                max_swizzle_size=args.max_swizzle_size,
+                cu_seqlens_m=inputs.cu_seqlens_m,
+                # A is already route-major and contiguous. Omitting A_idx
+                # selects the ordinary TMA A-load path instead of gather-A.
+                A_idx=None,
+                use_tma_gather=False,
+            )
+
+        if args.down_projection:
+            assert B_down is not None
+            quack_gemm(
+                inputs.up_output,
+                B_down,
+                inputs.output,
+                C=None,
+                tile_count_semaphore=None,
+                tile_M=args.tile_m,
+                tile_N=args.tile_n,
+                tile_K=args.tile_k,
+                cluster_M=args.cluster_m,
+                cluster_N=1,
+                cluster_K=1,
+                pingpong=args.pingpong,
+                persistent=True,
+                is_dynamic_persistent=False,
+                max_swizzle_size=args.max_swizzle_size,
+                cu_seqlens_m=inputs.cu_seqlens_m,
+                # The activated rows are already expert-contiguous.
+                A_idx=None,
+                use_tma_gather=False,
+            )
 
     return launch
 
@@ -276,7 +335,7 @@ def benchmark(
     samples: int,
     use_cuda_graph: bool,
 ) -> list[float]:
-    """Return per-grouped-GEMM milliseconds for every timing sample."""
+    """Return per-operation milliseconds for every timing sample."""
     graph = None
     if use_cuda_graph:
         graph = torch.cuda.CUDAGraph()
@@ -309,53 +368,79 @@ def check_correctness(
     activation: str | None,
     atol: float,
     rtol: float,
-) -> tuple[float, float]:
-    """Check the grouped result against per-expert float32 PyTorch references."""
-    num_experts = inputs.W.shape[0]
+) -> tuple[float, float, float | None, float | None]:
+    """Check every enabled GEMM output against per-expert float32 references."""
+    num_experts = inputs.W_up.shape[0]
     routes_per_expert = inputs.A.shape[0] // num_experts
-    max_abs_error = 0.0
-    max_allowed_error = 0.0
+    max_up_error = 0.0
+    max_up_allowed = 0.0
+    max_down_error = 0.0 if inputs.W_down is not None else None
+    max_down_allowed = 0.0 if inputs.W_down is not None else None
     for expert in range(num_experts):
         start = expert * routes_per_expert
         end = start + routes_per_expert
         A_expert = inputs.A[start:end]
-        W_expert = inputs.W[expert]
-        reference = A_expert.float() @ W_expert.float()
+        W_up_expert = inputs.W_up[expert]
+        up_reference = A_expert.float() @ W_up_expert.float()
         if activation in GATED_ACTIVATIONS:
-            gate, up = reference.chunk(2, dim=-1)
-            reference = gated_to_pytorch_fn_map[activation](gate, up)
+            gate, up = up_reference.chunk(2, dim=-1)
+            up_reference = gated_to_pytorch_fn_map[activation](gate, up)
         elif activation is not None:
-            reference = act_to_pytorch_fn_map[activation](reference)
-        actual = inputs.output[start:end]
-        if not torch.isfinite(actual).all():
-            raise AssertionError(f"expert {expert} kernel output contains NaN or infinity")
-        abs_error = (actual.float() - reference).abs().max().item()
-        max_abs_error = max(max_abs_error, abs_error)
+            up_reference = act_to_pytorch_fn_map[activation](up_reference)
+
+        up_baseline = A_expert @ W_up_expert
+        if activation in GATED_ACTIVATIONS:
+            gate, up = up_baseline.chunk(2, dim=-1)
+            up_baseline = gated_to_pytorch_fn_map[activation](gate, up)
+        elif activation is not None:
+            up_baseline = act_to_pytorch_fn_map[activation](up_baseline)
+
+        up_actual = inputs.up_output[start:end]
+        if not torch.isfinite(up_actual).all():
+            raise AssertionError(f"expert {expert} up output contains NaN or infinity")
+        up_error = (up_actual.float() - up_reference).abs().max().item()
+        max_up_error = max(max_up_error, up_error)
 
         if activation is None:
-            reference_out = reference.to(actual.dtype)
-            torch.testing.assert_close(actual, reference_out, atol=atol, rtol=rtol)
+            reference_out = up_reference.to(up_actual.dtype)
+            torch.testing.assert_close(up_actual, reference_out, atol=atol, rtol=rtol)
             allowed_error = atol + rtol * reference_out.float().abs().max().item()
         else:
             # QuACK's activation tests bound the fused kernel against the error
             # of an equivalent same-dtype PyTorch computation.
-            baseline = A_expert @ W_expert
-            if activation in GATED_ACTIVATIONS:
-                gate, up = baseline.chunk(2, dim=-1)
-                baseline = gated_to_pytorch_fn_map[activation](gate, up)
-            else:
-                baseline = act_to_pytorch_fn_map[activation](baseline)
-            baseline_error = (baseline.float() - reference).abs().max().item()
-            fixed_error = atol + rtol * reference.abs().max().item()
+            baseline_error = (up_baseline.float() - up_reference).abs().max().item()
+            fixed_error = atol + rtol * up_reference.abs().max().item()
             allowed_error = max(fixed_error, 2 * baseline_error + 1e-5)
-            if abs_error > allowed_error:
+            if up_error > allowed_error:
                 raise AssertionError(
-                    f"expert {expert} activation output error {abs_error:.6g} exceeds "
+                    f"expert {expert} activation output error {up_error:.6g} exceeds "
                     f"the permitted bound {allowed_error:.6g} "
                     f"(same-dtype PyTorch baseline error {baseline_error:.6g})"
                 )
-        max_allowed_error = max(max_allowed_error, allowed_error)
-    return max_abs_error, max_allowed_error
+        max_up_allowed = max(max_up_allowed, allowed_error)
+
+        if inputs.W_down is not None:
+            W_down_expert = inputs.W_down[expert]
+            down_reference = up_actual.float() @ W_down_expert.float()
+            down_baseline = up_actual @ W_down_expert
+            down_actual = inputs.output[start:end]
+            if not torch.isfinite(down_actual).all():
+                raise AssertionError(f"expert {expert} down output contains NaN or infinity")
+            down_error = (down_actual.float() - down_reference).abs().max().item()
+            down_baseline_error = (down_baseline.float() - down_reference).abs().max().item()
+            down_fixed_error = atol + rtol * down_reference.abs().max().item()
+            down_allowed = max(down_fixed_error, 2 * down_baseline_error + 1e-5)
+            if down_error > down_allowed:
+                raise AssertionError(
+                    f"expert {expert} down output error {down_error:.6g} exceeds "
+                    f"the permitted bound {down_allowed:.6g} "
+                    f"(same-dtype PyTorch down-GEMM baseline error {down_baseline_error:.6g})"
+                )
+            assert max_down_error is not None and max_down_allowed is not None
+            max_down_error = max(max_down_error, down_error)
+            max_down_allowed = max(max_down_allowed, down_allowed)
+
+    return max_up_error, max_up_allowed, max_down_error, max_down_allowed
 
 
 def gib(nbytes: int) -> float:
@@ -381,21 +466,28 @@ def main() -> None:
     inputs = prepare_inputs(args, device)
     torch.cuda.synchronize(device)
 
-    tensor_bytes = sum(
-        tensor.numel() * tensor.element_size()
-        for tensor in (
-            inputs.X,
-            inputs.W,
-            inputs.A_idx,
-            inputs.cu_seqlens_m,
-            inputs.A,
-            inputs.output,
-        )
-    )
+    allocated_tensors = [
+        inputs.X,
+        inputs.W_up,
+        inputs.A_idx,
+        inputs.cu_seqlens_m,
+        inputs.A,
+        inputs.up_output,
+    ]
+    if inputs.W_down is not None:
+        allocated_tensors.extend((inputs.W_down, inputs.output))
+    tensor_bytes = sum(tensor.numel() * tensor.element_size() for tensor in allocated_tensors)
     routes_per_expert = args.routes // args.experts
     print(f"Device: {torch.cuda.get_device_name(device)} (SM{capability[0]}{capability[1]})")
-    print(f"X: {tuple(inputs.X.shape)}, W: {tuple(inputs.W.shape)}, dtype: {inputs.X.dtype}")
+    print(f"X: {tuple(inputs.X.shape)}, W_up: {tuple(inputs.W_up.shape)}, dtype: {inputs.X.dtype}")
     print(f"Pre-gathered A: {tuple(inputs.A.shape)}, contiguous={inputs.A.is_contiguous()}")
+    if inputs.W_down is not None:
+        print(
+            f"W_down: {tuple(inputs.W_down.shape)}, up output: {tuple(inputs.up_output.shape)}, "
+            f"final output: {tuple(inputs.output.shape)}"
+        )
+    else:
+        print(f"Output: {tuple(inputs.output.shape)}, down projection: disabled")
     print(
         f"Routes: {args.routes} total, {routes_per_expert} per expert, "
         f"sampling {'with' if args.routing_with_replacement else 'without'} replacement"
@@ -406,7 +498,8 @@ def main() -> None:
     )
     print(f"Fused activation: {args.activation or 'disabled'}")
     print(f"Approximate tensor storage: {gib(tensor_bytes):.3f} GiB")
-    print("Compiling and warming up the specialized QuACK kernel...")
+    compile_target = "up and down kernels" if args.down_projection else "kernel"
+    print(f"Compiling and warming up the specialized QuACK {compile_target}...")
 
     launch = make_launch(args, inputs)
     for _ in range(max(1, args.warmup)):
@@ -420,26 +513,36 @@ def main() -> None:
         use_cuda_graph=not args.no_cuda_graph,
     )
     median_ms = statistics.median(timings_ms)
-    flops = 2 * args.routes * args.hidden * inputs.W.shape[-1]
+    up_flops = 2 * args.routes * args.hidden * inputs.W_up.shape[-1]
+    down_flops = 2 * args.routes * args.output_dim * args.hidden if args.down_projection else 0
+    flops = up_flops + down_flops
     tflops = flops / (median_ms * 1e9)
     timing_kind = "CUDA graph + events" if not args.no_cuda_graph else "batched CUDA events"
     formatted_samples = ", ".join(f"{value:.4f}" for value in timings_ms)
     print(f"Timing method: {timing_kind}")
-    print(f"Per-kernel samples (ms): [{formatted_samples}]")
-    print(f"Median kernel time: {median_ms:.4f} ms")
+    operation_name = "two-GEMM MLP" if args.down_projection else "up GEMM"
+    print(f"Per-operation samples (ms): [{formatted_samples}]")
+    print(f"Median {operation_name} time: {median_ms:.4f} ms")
     print(f"Effective throughput: {tflops:.2f} TFLOP/s")
 
     if not args.skip_check:
-        max_abs_error, max_allowed_error = check_correctness(
+        max_up_error, max_up_allowed, max_down_error, max_down_allowed = check_correctness(
             inputs,
             activation=args.activation,
             atol=args.atol,
             rtol=args.rtol,
         )
-        print(
-            "Reference check: PASSED "
-            f"(max absolute error {max_abs_error:.6g}, permitted bound {max_allowed_error:.6g})"
-        )
+        if max_down_error is not None and max_down_allowed is not None:
+            print(
+                "Reference check: PASSED "
+                f"(up max error {max_up_error:.6g}, permitted {max_up_allowed:.6g}; "
+                f"down max error {max_down_error:.6g}, permitted {max_down_allowed:.6g})"
+            )
+        else:
+            print(
+                "Reference check: PASSED "
+                f"(max error {max_up_error:.6g}, permitted {max_up_allowed:.6g})"
+            )
 
 
 if __name__ == "__main__":
