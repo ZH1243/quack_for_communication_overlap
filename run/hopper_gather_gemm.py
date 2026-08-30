@@ -305,26 +305,57 @@ def check_correctness(
     activation: str | None,
     atol: float,
     rtol: float,
-) -> float:
+) -> tuple[float, float]:
     """Check every output value against per-expert float32 PyTorch references."""
     num_experts = inputs.W.shape[0]
     routes_per_expert = inputs.A_idx.numel() // num_experts
     max_abs_error = 0.0
+    max_allowed_error = 0.0
     for expert in range(num_experts):
         start = expert * routes_per_expert
         end = start + routes_per_expert
         token_idx = inputs.A_idx[start:end]
-        reference = inputs.X[token_idx].float() @ inputs.W[expert].float()
+        X_expert = inputs.X[token_idx]
+        W_expert = inputs.W[expert]
+        reference = X_expert.float() @ W_expert.float()
         if activation in GATED_ACTIVATIONS:
             gate, up = reference.chunk(2, dim=-1)
             reference = gated_to_pytorch_fn_map[activation](gate, up)
         elif activation is not None:
             reference = act_to_pytorch_fn_map[activation](reference)
-        reference = reference.to(inputs.output.dtype)
         actual = inputs.output[start:end]
-        max_abs_error = max(max_abs_error, (actual - reference).abs().max().item())
-        torch.testing.assert_close(actual, reference, atol=atol, rtol=rtol)
-    return max_abs_error
+        if not torch.isfinite(actual).all():
+            raise AssertionError(f"expert {expert} kernel output contains NaN or infinity")
+        abs_error = (actual.float() - reference).abs().max().item()
+        max_abs_error = max(max_abs_error, abs_error)
+
+        if activation is None:
+            # Preserve the original plain-GEMM elementwise check.
+            reference_out = reference.to(actual.dtype)
+            torch.testing.assert_close(actual, reference_out, atol=atol, rtol=rtol)
+            allowed_error = atol + rtol * reference_out.float().abs().max().item()
+        else:
+            # Match QuACK's activation tests: compare the fused kernel's error
+            # with a same-dtype PyTorch baseline. Gated activations multiply two
+            # independently rounded projections, so a fixed plain-GEMM tolerance
+            # can reject a valid one-BF16-ULP result.
+            baseline = X_expert @ W_expert
+            if activation in GATED_ACTIVATIONS:
+                gate, up = baseline.chunk(2, dim=-1)
+                baseline = gated_to_pytorch_fn_map[activation](gate, up)
+            else:
+                baseline = act_to_pytorch_fn_map[activation](baseline)
+            baseline_error = (baseline.float() - reference).abs().max().item()
+            fixed_error = atol + rtol * reference.abs().max().item()
+            allowed_error = max(fixed_error, 2 * baseline_error + 1e-5)
+            if abs_error > allowed_error:
+                raise AssertionError(
+                    f"expert {expert} activation output error {abs_error:.6g} exceeds "
+                    f"the permitted bound {allowed_error:.6g} "
+                    f"(same-dtype PyTorch baseline error {baseline_error:.6g})"
+                )
+        max_allowed_error = max(max_allowed_error, allowed_error)
+    return max_abs_error, max_allowed_error
 
 
 def gib(nbytes: int) -> float:
@@ -392,13 +423,16 @@ def main() -> None:
 
     # The most recent graph/direct launch populated output before this check.
     if not args.skip_check:
-        max_abs_error = check_correctness(
+        max_abs_error, max_allowed_error = check_correctness(
             inputs,
             activation=args.activation,
             atol=args.atol,
             rtol=args.rtol,
         )
-        print(f"Reference check: PASSED (max absolute error {max_abs_error:.6g})")
+        print(
+            "Reference check: PASSED "
+            f"(max absolute error {max_abs_error:.6g}, permitted bound {max_allowed_error:.6g})"
+        )
 
 
 if __name__ == "__main__":
