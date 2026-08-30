@@ -10,7 +10,8 @@ row.
 Fuse a SwiGLU up-projection while streaming the 2N-wide work table:
 
     python run/hopper_stream_gather_table_gemm.py --multi-buffer-gather \
-        --num-input-buffers 3 --output-dim 14336 --activation swiglu
+        --num-input-buffers 3 --output-dim 14336 --activation swiglu \
+        --down-projection
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ try:
         TableGatherInputs,
         balanced_buffer_allocations,
         check_correctness,
+        check_down_correctness,
         make_arg_parser,
         multi_buffer_route_counts,
         sequential_buffer_allocations,
@@ -48,6 +50,7 @@ except ModuleNotFoundError as error:
         TableGatherInputs,
         balanced_buffer_allocations,
         check_correctness,
+        check_down_correctness,
         make_arg_parser,
         multi_buffer_route_counts,
         sequential_buffer_allocations,
@@ -63,6 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser = make_arg_parser(
         "Benchmark QuACK's SM90 multi-buffer GroupedGEMM while a CPU proxy streams "
         "its gather table into HBM.",
+        include_down_projection=True,
     )
     parser.add_argument(
         "--flush-entries",
@@ -226,6 +230,12 @@ def prepare_inputs(
             (args.experts, args.hidden, gemm_output_dim), dtype=dtype, device=device
         )
     W.mul_(1.0 / math.sqrt(args.hidden))
+    W_down = None
+    if args.down_projection:
+        W_down = torch.randn(
+            (args.experts, args.output_dim, args.hidden), dtype=dtype, device=device
+        )
+        W_down.mul_(1.0 / math.sqrt(args.output_dim))
     X = tuple(
         torch.randn((tokens, args.hidden), dtype=dtype, device=device)
         for _ in range(args.num_input_buffers)
@@ -252,9 +262,23 @@ def prepare_inputs(
     work_table = ipc_backing[:table_elements].view(table_rows, table_width)
     ready_rows = ipc_backing[table_elements:]
     ready_rows.zero_()
-    output = torch.empty(
+    total_routes = args.num_input_buffers * routes
+    up_output = torch.empty(
         (args.num_input_buffers * routes, args.output_dim), dtype=dtype, device=device
     )
+    output = (
+        torch.empty((total_routes, args.hidden), dtype=dtype, device=device)
+        if args.down_projection
+        else up_output
+    )
+    cu_seqlens_m = None
+    if args.down_projection:
+        cumulative_routes = [0]
+        for expert in range(args.experts):
+            count = sum(counts[expert] for counts in counts_by_buffer)
+            cumulative_routes.append(cumulative_routes[-1] + count)
+        assert cumulative_routes[-1] == total_routes
+        cu_seqlens_m = torch.tensor(cumulative_routes, dtype=torch.int32, device=device)
     inputs = TableGatherInputs(
         X,
         W,
@@ -264,6 +288,9 @@ def prepare_inputs(
         output_segments,
         output,
         group_size,
+        W_down=W_down,
+        up_output=up_output,
+        cu_seqlens_m=cu_seqlens_m,
     )
     return inputs, ready_rows, ipc_backing
 
@@ -276,6 +303,8 @@ def make_launch(
     from quack.gemm_interface import gemm_act
 
     B = inputs.W.transpose(1, 2)
+    B_down = inputs.W_down.transpose(1, 2) if inputs.W_down is not None else None
+    up_output = inputs.up_output if inputs.up_output is not None else inputs.output
 
     if args.activation is not None:
         config = GemmConfig(
@@ -292,27 +321,11 @@ def make_launch(
             use_tma_gather=False,
         )
 
-    def launch() -> None:
-        if args.activation is not None:
-            gemm_act(
-                inputs.X,
-                inputs.W,
-                activation=args.activation,
-                postact_out=inputs.output,
-                A_idx=inputs.A_idx,
-                gather_work_table=inputs.work_table,
-                gather_work_table_ready=ready_rows,
-                multi_buffer_gather=True,
-                store_preact=False,
-                dynamic_scheduler=False,
-                tuned=False,
-                config=config,
-                concat_layout=("B",) if args.activation in GATED_ACTIVATIONS else None,
-            )
-            return
+    def launch_down() -> None:
+        assert B_down is not None and inputs.cu_seqlens_m is not None
         quack_gemm(
-            inputs.X,
-            B,
+            up_output,
+            B_down,
             inputs.output,
             C=None,
             tile_count_semaphore=None,
@@ -326,15 +339,59 @@ def make_launch(
             persistent=True,
             is_dynamic_persistent=False,
             max_swizzle_size=args.max_swizzle_size,
-            cu_seqlens_m=None,
-            A_idx=inputs.A_idx,
-            gather_work_table=inputs.work_table,
-            gather_work_table_ready=ready_rows,
-            multi_buffer_gather=True,
+            cu_seqlens_m=inputs.cu_seqlens_m,
+            A_idx=None,
             use_tma_gather=False,
         )
 
-    return launch
+    def launch() -> None:
+        if args.activation is not None:
+            gemm_act(
+                inputs.X,
+                inputs.W,
+                activation=args.activation,
+                postact_out=up_output,
+                A_idx=inputs.A_idx,
+                gather_work_table=inputs.work_table,
+                gather_work_table_ready=ready_rows,
+                multi_buffer_gather=True,
+                store_preact=False,
+                dynamic_scheduler=False,
+                tuned=False,
+                config=config,
+                concat_layout=("B",) if args.activation in GATED_ACTIVATIONS else None,
+            )
+        else:
+            quack_gemm(
+                inputs.X,
+                B,
+                up_output,
+                C=None,
+                tile_count_semaphore=None,
+                tile_M=args.tile_m,
+                tile_N=args.tile_n,
+                tile_K=args.tile_k,
+                cluster_M=args.cluster_m,
+                cluster_N=1,
+                cluster_K=1,
+                pingpong=False,
+                persistent=True,
+                is_dynamic_persistent=False,
+                max_swizzle_size=args.max_swizzle_size,
+                cu_seqlens_m=None,
+                A_idx=inputs.A_idx,
+                gather_work_table=inputs.work_table,
+                gather_work_table_ready=ready_rows,
+                multi_buffer_gather=True,
+                use_tma_gather=False,
+            )
+
+        if args.down_projection:
+            # This launch is ordered after the readiness-gated up GEMM on the
+            # same stream and consumes its expert-contiguous activated output.
+            launch_down()
+
+    return launch, launch_down if args.down_projection else None
 
 
 @dataclass
@@ -695,7 +752,7 @@ def main() -> None:
     torch.manual_seed(args.seed)
     inputs, ready_rows, ipc_backing = prepare_inputs(args, device)
     torch.cuda.synchronize(device)
-    launch = make_launch(args, inputs, ready_rows)
+    launch, precompile_down = make_launch(args, inputs, ready_rows)
 
     counts = [
         [b - a for a, b in zip(offsets[:-1], offsets[1:])]
@@ -704,8 +761,16 @@ def main() -> None:
     print(f"Device: {torch.cuda.get_device_name(device)} (SM{capability[0]}{capability[1]})")
     print(
         f"X buffers: {len(inputs.X)} x {tuple(inputs.X[0].shape)}, "
-        f"W: {tuple(inputs.W.shape)}, dtype: {inputs.X[0].dtype}"
+        f"W_up: {tuple(inputs.W.shape)}, dtype: {inputs.X[0].dtype}"
     )
+    if inputs.W_down is not None:
+        assert inputs.up_output is not None
+        print(
+            f"W_down: {tuple(inputs.W_down.shape)}, up output: {tuple(inputs.up_output.shape)}, "
+            f"final output: {tuple(inputs.output.shape)}"
+        )
+    else:
+        print(f"Output: {tuple(inputs.output.shape)}, down projection: disabled")
     print(f"Routes per expert by buffer: {counts}")
     print(
         f"Work table: {tuple(inputs.work_table.shape)}, x={inputs.work_group_size}, "
@@ -721,7 +786,17 @@ def main() -> None:
     print(f"Fused activation: {args.activation or 'disabled'}")
     if not args.no_cuda_graph:
         print("CUDA graph capture is disabled for externally produced streaming table data.")
-    print("Compiling and warming up the readiness-gated QuACK kernel...")
+    compile_target = "up and down kernels" if args.down_projection else "kernel"
+    print(f"Compiling and warming up the readiness-gated QuACK {compile_target}...")
+
+    # Compile the down kernel before any readiness-gated up kernel is queued.
+    # Otherwise its first host-side compilation would delay proxy.go() while
+    # the already-launched up kernel spins waiting for table row zero.
+    if precompile_down is not None:
+        assert inputs.up_output is not None
+        inputs.up_output.zero_()
+        precompile_down()
+        torch.cuda.synchronize(device)
 
     proxy = None
     ipc_export = None
@@ -749,20 +824,39 @@ def main() -> None:
             timings_ms.append(statistics.mean(launches_ms))
         median_ms = statistics.median(timings_ms)
         total_routes = inputs.output.shape[0]
-        tflops = 2 * total_routes * args.hidden * inputs.W.shape[-1] / (median_ms * 1e9)
+        up_flops = 2 * total_routes * args.hidden * inputs.W.shape[-1]
+        down_flops = (
+            2 * total_routes * args.output_dim * args.hidden if args.down_projection else 0
+        )
+        tflops = (up_flops + down_flops) / (median_ms * 1e9)
+        operation_name = (
+            "proxy-flush + two-GEMM MLP"
+            if args.down_projection
+            else "proxy-flush + up GEMM"
+        )
         print(f"Per-launch end-to-end samples (ms): {[round(value, 4) for value in timings_ms]}")
-        print(f"Median proxy-flush + kernel time: {median_ms:.4f} ms")
+        print(f"Median {operation_name} time: {median_ms:.4f} ms")
         print(f"Effective throughput: {tflops:.2f} TFLOP/s")
 
         if not args.skip_check:
             max_abs_error, max_allowed_error = check_correctness(
                 inputs, activation=args.activation, atol=args.atol, rtol=args.rtol
             )
-            print(
-                "Reference check: PASSED "
-                f"(max absolute error {max_abs_error:.6g}, "
-                f"permitted bound {max_allowed_error:.6g})"
-            )
+            if args.down_projection:
+                down_error, down_allowed = check_down_correctness(
+                    inputs, atol=args.atol, rtol=args.rtol
+                )
+                print(
+                    "Reference check: PASSED "
+                    f"(up max error {max_abs_error:.6g}, permitted {max_allowed_error:.6g}; "
+                    f"down max error {down_error:.6g}, permitted {down_allowed:.6g})"
+                )
+            else:
+                print(
+                    "Reference check: PASSED "
+                    f"(max absolute error {max_abs_error:.6g}, "
+                    f"permitted bound {max_allowed_error:.6g})"
+                )
     finally:
         try:
             if proxy is not None:
