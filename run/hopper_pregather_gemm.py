@@ -5,7 +5,7 @@ This is the no-gather-fusion counterpart of ``hopper_gather_gemm.py``. It first
 creates the same MoE inputs on CUDA:
 
     X:             [T, K]
-    W:             [E, K, N]
+    W:             [E, K, N] (or [E, K, 2N] for a gated activation)
     A_idx:         [R]
     cu_seqlens_m:  [E + 1]
 
@@ -20,6 +20,12 @@ Example:
     python run/hopper_pregather_gemm.py \
         --tokens 4096 --hidden 4096 --output-dim 4096 \
         --experts 8 --routes 8192 --warmup 5 --iterations 100
+
+Fuse a SwiGLU up-projection (the weight uses concatenated [gate | up] columns):
+
+    python run/hopper_pregather_gemm.py \
+        --tokens 4096 --hidden 4096 --output-dim 14336 \
+        --experts 8 --routes 8192 --activation swiglu
 """
 
 from __future__ import annotations
@@ -32,12 +38,17 @@ from dataclasses import dataclass
 import torch
 
 from quack.gemm import gemm as quack_gemm
+from quack.gemm_config import GemmConfig
+from quack.gemm_interface import act_to_pytorch_fn_map, gated_to_pytorch_fn_map, gemm_act
 
 
 DTYPES = {
     "bf16": torch.bfloat16,
     "fp16": torch.float16,
 }
+
+ACTIVATIONS = tuple(name for name in act_to_pytorch_fn_map if name is not None)
+GATED_ACTIVATIONS = tuple(gated_to_pytorch_fn_map)
 
 
 @dataclass
@@ -62,6 +73,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=DTYPES, default="bf16")
     parser.add_argument("--device", type=int, default=0, help="CUDA device index")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--activation",
+        choices=(*ACTIVATIONS, *GATED_ACTIVATIONS),
+        default=None,
+        help=(
+            "Fuse this activation into the GEMM epilogue. Gated activations such as "
+            "swiglu interpret --output-dim as the final width and use a 2x-wide projection."
+        ),
+    )
 
     parser.add_argument("--tile-m", type=int, default=256)
     parser.add_argument("--tile-n", type=int, default=256)
@@ -136,7 +156,19 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> PregatherI
     routes_per_expert = args.routes // args.experts
 
     X = torch.randn((args.tokens, args.hidden), dtype=dtype, device=device)
-    W = torch.randn((args.experts, args.hidden, args.output_dim), dtype=dtype, device=device)
+    gated = args.activation in GATED_ACTIVATIONS
+    gemm_output_dim = args.output_dim * (2 if gated else 1)
+    if gated:
+        # concat_layout=("B",) acts on B's non-contiguous dimension. Materialize
+        # the conventional [E, 2N, K] [gate | up] weight and expose its
+        # [E, K, 2N] transpose so QuACK interleaves output columns, not K rows.
+        W = torch.randn(
+            (args.experts, gemm_output_dim, args.hidden), dtype=dtype, device=device
+        ).transpose(1, 2)
+    else:
+        W = torch.randn(
+            (args.experts, args.hidden, gemm_output_dim), dtype=dtype, device=device
+        )
     W.mul_(1.0 / math.sqrt(args.hidden))
 
     cu_seqlens_m = torch.arange(args.experts + 1, dtype=torch.int32, device=device)
@@ -174,11 +206,42 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> PregatherI
 
 
 def make_launch(args: argparse.Namespace, inputs: PregatherInputs):
-    # QuACK expects B as [E, N, K]. This is a zero-copy n-major view of the
-    # user-facing W[E, K, N] allocation.
+    # QuACK's plain low-level API expects B as [E, N, K]. This is a zero-copy
+    # view of the user-facing W[E, K, N] tensor. The activation API below uses
+    # the torch-convention [E, K, N] view directly.
     B = inputs.W.transpose(1, 2)
 
+    if args.activation is not None:
+        config = GemmConfig(
+            tile_m=args.tile_m,
+            tile_n=args.tile_n,
+            tile_k=args.tile_k,
+            pingpong=args.pingpong,
+            is_dynamic_persistent=False,
+            cluster_m=args.cluster_m,
+            cluster_n=1,
+            cluster_k=1,
+            max_swizzle_size=args.max_swizzle_size,
+            device_capacity=9,
+            use_tma_gather=False,
+        )
+
     def launch() -> None:
+        if args.activation is not None:
+            gemm_act(
+                inputs.A,
+                inputs.W,
+                activation=args.activation,
+                postact_out=inputs.output,
+                cu_seqlens_m=inputs.cu_seqlens_m,
+                A_idx=None,
+                store_preact=False,
+                dynamic_scheduler=False,
+                tuned=False,
+                config=config,
+                concat_layout=("B",) if args.activation in GATED_ACTIVATIONS else None,
+            )
+            return
         quack_gemm(
             inputs.A,
             B,
@@ -243,22 +306,56 @@ def benchmark(
 def check_correctness(
     inputs: PregatherInputs,
     *,
+    activation: str | None,
     atol: float,
     rtol: float,
-) -> float:
-    """Check the grouped result against per-expert float32 PyTorch GEMMs."""
+) -> tuple[float, float]:
+    """Check the grouped result against per-expert float32 PyTorch references."""
     num_experts = inputs.W.shape[0]
     routes_per_expert = inputs.A.shape[0] // num_experts
     max_abs_error = 0.0
+    max_allowed_error = 0.0
     for expert in range(num_experts):
         start = expert * routes_per_expert
         end = start + routes_per_expert
-        reference = inputs.A[start:end].float() @ inputs.W[expert].float()
-        reference = reference.to(inputs.output.dtype)
+        A_expert = inputs.A[start:end]
+        W_expert = inputs.W[expert]
+        reference = A_expert.float() @ W_expert.float()
+        if activation in GATED_ACTIVATIONS:
+            gate, up = reference.chunk(2, dim=-1)
+            reference = gated_to_pytorch_fn_map[activation](gate, up)
+        elif activation is not None:
+            reference = act_to_pytorch_fn_map[activation](reference)
         actual = inputs.output[start:end]
-        max_abs_error = max(max_abs_error, (actual - reference).abs().max().item())
-        torch.testing.assert_close(actual, reference, atol=atol, rtol=rtol)
-    return max_abs_error
+        if not torch.isfinite(actual).all():
+            raise AssertionError(f"expert {expert} kernel output contains NaN or infinity")
+        abs_error = (actual.float() - reference).abs().max().item()
+        max_abs_error = max(max_abs_error, abs_error)
+
+        if activation is None:
+            reference_out = reference.to(actual.dtype)
+            torch.testing.assert_close(actual, reference_out, atol=atol, rtol=rtol)
+            allowed_error = atol + rtol * reference_out.float().abs().max().item()
+        else:
+            # QuACK's activation tests bound the fused kernel against the error
+            # of an equivalent same-dtype PyTorch computation.
+            baseline = A_expert @ W_expert
+            if activation in GATED_ACTIVATIONS:
+                gate, up = baseline.chunk(2, dim=-1)
+                baseline = gated_to_pytorch_fn_map[activation](gate, up)
+            else:
+                baseline = act_to_pytorch_fn_map[activation](baseline)
+            baseline_error = (baseline.float() - reference).abs().max().item()
+            fixed_error = atol + rtol * reference.abs().max().item()
+            allowed_error = max(fixed_error, 2 * baseline_error + 1e-5)
+            if abs_error > allowed_error:
+                raise AssertionError(
+                    f"expert {expert} activation output error {abs_error:.6g} exceeds "
+                    f"the permitted bound {allowed_error:.6g} "
+                    f"(same-dtype PyTorch baseline error {baseline_error:.6g})"
+                )
+        max_allowed_error = max(max_allowed_error, allowed_error)
+    return max_abs_error, max_allowed_error
 
 
 def gib(nbytes: int) -> float:
@@ -284,14 +381,16 @@ def main() -> None:
     inputs = prepare_inputs(args, device)
     torch.cuda.synchronize(device)
 
-    element_size = inputs.X.element_size()
-    tensor_bytes = (
-        args.tokens * args.hidden * element_size
-        + args.experts * args.hidden * args.output_dim * element_size
-        + args.routes * args.hidden * element_size
-        + args.routes * args.output_dim * element_size
-        + args.routes * torch.iinfo(torch.int32).bits // 8
-        + (args.experts + 1) * torch.iinfo(torch.int32).bits // 8
+    tensor_bytes = sum(
+        tensor.numel() * tensor.element_size()
+        for tensor in (
+            inputs.X,
+            inputs.W,
+            inputs.A_idx,
+            inputs.cu_seqlens_m,
+            inputs.A,
+            inputs.output,
+        )
     )
     routes_per_expert = args.routes // args.experts
     print(f"Device: {torch.cuda.get_device_name(device)} (SM{capability[0]}{capability[1]})")
@@ -305,6 +404,7 @@ def main() -> None:
         f"Kernel: tile=({args.tile_m}, {args.tile_n}, {args.tile_k or 'auto'}), "
         f"cluster=({args.cluster_m}, 1, 1), persistent=True, gather=none (TMA A load)"
     )
+    print(f"Fused activation: {args.activation or 'disabled'}")
     print(f"Approximate tensor storage: {gib(tensor_bytes):.3f} GiB")
     print("Compiling and warming up the specialized QuACK kernel...")
 
@@ -320,7 +420,7 @@ def main() -> None:
         use_cuda_graph=not args.no_cuda_graph,
     )
     median_ms = statistics.median(timings_ms)
-    flops = 2 * args.routes * args.hidden * args.output_dim
+    flops = 2 * args.routes * args.hidden * inputs.W.shape[-1]
     tflops = flops / (median_ms * 1e9)
     timing_kind = "CUDA graph + events" if not args.no_cuda_graph else "batched CUDA events"
     formatted_samples = ", ".join(f"{value:.4f}" for value in timings_ms)
@@ -330,8 +430,16 @@ def main() -> None:
     print(f"Effective throughput: {tflops:.2f} TFLOP/s")
 
     if not args.skip_check:
-        max_abs_error = check_correctness(inputs, atol=args.atol, rtol=args.rtol)
-        print(f"Reference check: PASSED (max absolute error {max_abs_error:.6g})")
+        max_abs_error, max_allowed_error = check_correctness(
+            inputs,
+            activation=args.activation,
+            atol=args.atol,
+            rtol=args.rtol,
+        )
+        print(
+            "Reference check: PASSED "
+            f"(max absolute error {max_abs_error:.6g}, permitted bound {max_allowed_error:.6g})"
+        )
 
 
 if __name__ == "__main__":
