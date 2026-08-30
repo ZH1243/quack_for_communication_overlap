@@ -159,8 +159,19 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> GatherInpu
     # torch.randn on a CUDA device initializes these tensors with CUDA kernels;
     # no full-size input is staged through host memory.
     X = torch.randn((args.tokens, args.hidden), dtype=dtype, device=device)
-    gemm_output_dim = args.output_dim * (2 if args.activation in GATED_ACTIVATIONS else 1)
-    W = torch.randn((args.experts, args.hidden, gemm_output_dim), dtype=dtype, device=device)
+    gated = args.activation in GATED_ACTIVATIONS
+    gemm_output_dim = args.output_dim * (2 if gated else 1)
+    if gated:
+        # concat_layout=("B",) acts on B's non-contiguous dimension. Materialize
+        # the conventional [E, 2N, K] [gate | up] weight and expose its
+        # [E, K, 2N] transpose so QuACK interleaves output columns, not K rows.
+        W = torch.randn(
+            (args.experts, gemm_output_dim, args.hidden), dtype=dtype, device=device
+        ).transpose(1, 2)
+    else:
+        W = torch.randn(
+            (args.experts, args.hidden, gemm_output_dim), dtype=dtype, device=device
+        )
     W.mul_(1.0 / math.sqrt(args.hidden))
 
     cu_seqlens_m = torch.arange(args.experts + 1, dtype=torch.int32, device=device)
