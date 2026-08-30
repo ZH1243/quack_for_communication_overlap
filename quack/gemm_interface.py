@@ -41,6 +41,7 @@ from quack.gemm_tvm_ffi_utils import tensor_key, scalar_mode
 from quack.gemm_symmetric import gemm_symmetric as gemm_symmetric_dispatch, run_gemm_symmetric_plan
 from quack.rms_final_reduce import rms_final_reduce
 from quack.rounding import RoundingMode
+from quack.tile_scheduler import MultiBufferGatherArguments
 
 
 def _empty_k_matmul_into(
@@ -815,6 +816,9 @@ def _gemm_act_call(
     activation,
     cu_seqlens_m: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,
+    gather_work_table: Optional[Tensor] = None,
+    gather_work_table_ready: Optional[Tensor] = None,
+    multi_buffer_gather_args: Optional[MultiBufferGatherArguments] = None,
     SFA: Optional[Tensor] = None,  # decoded (real-dtype) scale factors
     SFB: Optional[Tensor] = None,
     bs_format_a: Optional[str] = None,  # BlockScaledFormat names (see quack.gemm.gemm)
@@ -852,6 +856,34 @@ def _gemm_act_call(
         operands["mRowVecBroadcast"] = bias
     if has_alpha:
         operands["alpha"] = alpha
+    if gather_work_table is not None:
+        if config is None:
+            config = default_config(A.device)
+        if dynamic_scheduler or config.is_dynamic_persistent:
+            raise ValueError("gather_work_table requires static persistent scheduling")
+        mod.gemm(
+            A,
+            B.mT,
+            preact_out,
+            C,
+            epi_args={**operands, "mAuxOut": postact_out},
+            tile_M=config.tile_m,
+            tile_N=config.tile_n,
+            tile_K=config.tile_k,
+            cluster_M=config.cluster_m,
+            cluster_N=config.cluster_n,
+            pingpong=config.pingpong,
+            persistent=True,
+            is_dynamic_persistent=False,
+            max_swizzle_size=config.max_swizzle_size,
+            A_idx=A_idx,
+            gather_work_table=gather_work_table,
+            gather_work_table_ready=gather_work_table_ready,
+            multi_buffer_gather=multi_buffer_gather_args,
+            use_tma_gather=config.use_tma_gather,
+            concat_layout=concat_layout,
+        )
+        return
     mod(
         A,
         B,
@@ -2135,6 +2167,9 @@ def gemm_act(
     postact_dtype: Optional[torch.dtype] = None,
     cu_seqlens_m: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
+    gather_work_table: Optional[Tensor] = None,
+    gather_work_table_ready: Optional[Tensor] = None,
+    multi_buffer_gather: bool = False,
     store_preact: bool = True,
     dynamic_scheduler: bool = False,
     tuned: bool = True,
@@ -2148,10 +2183,29 @@ def gemm_act(
     ``alpha`` scales the accumulator before the activation
     (``postact = act(alpha * A @ B + C + bias)``). It is applied in fp32 and
     may be a float or a 1-element CUDA tensor; 1.0 keeps the alpha-free epilogue.
+
+    On Hopper, ``gather_work_table`` selects the table-scheduled gather-A path.
+    Pass tensor sequences for ``A`` and ``A_idx`` together with
+    ``multi_buffer_gather=True`` to gather from multiple independent buffers.
     """
     _reserve_blockscaled_out(out_dtype)
     _reserve_blockscaled_out(postact_dtype)
     _check_split_k_unsupported("gemm_act", split_k)
+    multi_buffer_gather_args = None
+    if multi_buffer_gather:
+        if not isinstance(A, (tuple, list)) or not isinstance(A_idx, (tuple, list)):
+            raise ValueError("multi_buffer_gather requires A and A_idx tensor sequences")
+        A_buffers, A_idx_buffers = tuple(A), tuple(A_idx)
+        if len(A_buffers) < 2 or len(A_buffers) != len(A_idx_buffers):
+            raise ValueError(
+                "multi_buffer_gather requires matching A and A_idx sequences of length >= 2"
+            )
+        A, A_idx = A_buffers[0], A_idx_buffers[0]
+        multi_buffer_gather_args = MultiBufferGatherArguments(
+            x_buffers=A_buffers[1:], a_idx_buffers=A_idx_buffers[1:]
+        )
+    elif isinstance(A, (tuple, list)) or isinstance(A_idx, (tuple, list)):
+        raise ValueError("tensor sequences require multi_buffer_gather=True")
     opA, opB = _unpack_operand(A), _unpack_operand(B)
     A, B = opA.data, opB.data
     SFA, SFB, bs_format_a, bs_format_b = _prep_blockscaled(opA, opB)
@@ -2162,10 +2216,15 @@ def gemm_act(
     default_dtype = torch.bfloat16 if SFA is not None else A.dtype
     out_dtype = default_dtype if out_dtype is None else out_dtype
     postact_dtype = default_dtype if postact_dtype is None else postact_dtype
-    varlen_m = cu_seqlens_m is not None
+    gather_table = gather_work_table is not None
+    if multi_buffer_gather_args is not None and not gather_table:
+        raise ValueError("multi_buffer_gather requires gather_work_table")
+    varlen_m = cu_seqlens_m is not None or gather_table
     # Determine output shape based on gather_A
     if varlen_m:
         total_m = A_idx.shape[0] if A_idx is not None else A.shape[0]
+        if multi_buffer_gather_args is not None:
+            total_m += sum(idx.shape[0] for idx in multi_buffer_gather_args.a_idx_buffers)
         out_shape = (total_m, B.shape[-1])
     elif A.ndim == 2:
         out_shape = (A.shape[0], B.shape[-1])
@@ -2185,6 +2244,8 @@ def gemm_act(
         _empty_k_matmul_into(postact_out)
         return preact_out, postact_out
     if torch.compiler.is_compiling():
+        if gather_table:
+            raise NotImplementedError("gemm_act gather_work_table under torch.compile")
         if config is not None:
             raise NotImplementedError("gemm_act: explicit config under torch.compile")
         if SFA is not None:
@@ -2223,6 +2284,9 @@ def gemm_act(
         activation=activation,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
+        gather_work_table=gather_work_table,
+        gather_work_table_ready=gather_work_table_ready,
+        multi_buffer_gather_args=multi_buffer_gather_args,
         SFA=_sf_decode(SFA, bs_format_a),
         SFB=_sf_decode(SFB, bs_format_b),
         bs_format_a=bs_format_a,

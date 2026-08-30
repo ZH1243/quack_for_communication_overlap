@@ -28,8 +28,8 @@ from cutlass import Float32, Int32
 from quack.cache import jit_cache
 from quack.compile_utils import make_fake_tensor
 from quack.cute_dsl_utils import get_max_active_clusters, torch2cute_dtype_map
-from quack.gemm_config import SplitKMode, cta_tile_shape_m
 from quack.epilogue.ops import EpiOp
+from quack.gemm_config import SplitKMode, cta_tile_shape_m
 from quack.gemm_runtime.identity import (
     resolve_gemm_class,
     resolve_transform_a,
@@ -47,6 +47,7 @@ from quack.gemm_tvm_ffi_utils import (
     make_varlen_args,
     plan_scheduler_args,
 )
+from quack.tile_scheduler import MultiBufferGatherArguments
 
 
 class FakeArgCtx(NamedTuple):
@@ -100,6 +101,9 @@ def _compile_gemm_epi(
     is_dynamic_persistent,
     varlen_m,
     gather_A,
+    gather_table,
+    has_gather_table_ready,
+    gather_table_num_buffers,
     batched,
     b_kn,
     epi_keys,  # ((op_name, op.host_arg_key(value)), ...) — name-sorted
@@ -210,15 +214,34 @@ def _compile_gemm_epi(
         )
     epi_args = GemmCls.EpilogueArguments(**fields)
 
-    scheduler_args = make_fake_scheduler_args(
-        (is_dynamic_persistent and device_capacity[0] == 9), False, l, has_ag=has_ag
-    )
+    aidx_len = cute.sym_int() if gather_table_num_buffers > 1 else (m if varlen_m else None)
     varlen_args = make_fake_varlen_args(
         varlen_m,
         False,
         gather_A,
-        m if varlen_m else None,
+        aidx_len,
         has_cu_tiles_m=varlen_m and _has_m_fold_sink(ops, epi_keys),
+        gather_table=gather_table,
+    )
+    multi_buffer_gather = (
+        MultiBufferGatherArguments(
+            x_buffers=tuple(mA for _ in range(gather_table_num_buffers - 1)),
+            a_idx_buffers=tuple(
+                varlen_args.mAIdx for _ in range(gather_table_num_buffers - 1)
+            ),
+        )
+        if gather_table_num_buffers > 1
+        else None
+    )
+    scheduler_args = make_fake_scheduler_args(
+        (is_dynamic_persistent and device_capacity[0] == 9),
+        False,
+        l,
+        has_ag=has_ag,
+        has_gather_table=gather_table,
+        has_gather_table_ready=has_gather_table_ready,
+        gather_table_num_buffers=gather_table_num_buffers,
+        multi_buffer_gather=multi_buffer_gather,
     )
     mSFA = make_fake_sf_tensor(sf_dtype, l if sf_batched else None) if sf_dtype else None
     mSFB = make_fake_sf_tensor(sf_dtype, l if sf_batched else None) if sf_dtype else None
@@ -261,6 +284,8 @@ def _compile_gemm_epi(
         cd_packed=packed_cd,
         split_k=split_k,
         split_k_mode=split_k_mode,
+        gather_table=gather_table,
+        gather_table_num_buffers=gather_table_num_buffers,
     )
 
 
@@ -332,6 +357,9 @@ def build_gemm_epi_plan(
     max_swizzle_size=8,
     varlen_m=False,
     gather_A=False,
+    gather_table=False,
+    has_gather_table_ready=False,
+    gather_table_num_buffers=1,
     b_kn=False,
     swap_ab=False,  # swap-at-trace: slot tensors in, caller-oriented D/C
     use_tma_gather=False,
@@ -438,6 +466,9 @@ def build_gemm_epi_plan(
         is_dynamic_persistent,
         varlen_m,
         gather_A,
+        gather_table,
+        has_gather_table_ready,
+        gather_table_num_buffers,
         batched,
         b_kn,
         epi_keys,
@@ -466,7 +497,7 @@ def build_gemm_epi_plan(
     # iteration), never the prebuilt static tuple.
     scheduler_static = (
         make_scheduler_args(max_active_clusters, max_swizzle_size, None)
-        if not scheduler_uses_semaphore and not has_ag
+        if not scheduler_uses_semaphore and not has_ag and not gather_table
         else None
     )
     plan_ops = _ops_by_name(GemmCls)
@@ -519,6 +550,9 @@ def run_gemm_epi_plan(
     cu_seqlens_m=None,
     cu_seqlens_k=None,
     A_idx=None,
+    gather_table=None,
+    gather_table_ready=None,
+    multi_buffer_gather=None,
     SFA=None,
     SFB=None,
     split_k_buffers=None,  # (sem, ws) raw from _split_k_buffers: reuse across
@@ -559,7 +593,15 @@ def run_gemm_epi_plan(
         fields["split_k_semaphore"] = sem.permute(1, 2, 0)
         fields["split_k_workspace"] = ws.permute(3, 1, 2, 0)
     epi_args = plan.gemm_cls.EpilogueArguments._make(fields.values())
-    scheduler_args = plan_scheduler_args(plan, tile_count_semaphore, ag_args=ag_args, A=A)
+    scheduler_args = plan_scheduler_args(
+        plan,
+        tile_count_semaphore,
+        ag_args=ag_args,
+        A=A,
+        gather_table=gather_table,
+        gather_table_ready=gather_table_ready,
+        multi_buffer_gather=multi_buffer_gather,
+    )
     cu_tiles_m = (
         compute_cu_tiles_m(cu_seqlens_m, plan.cu_tiles_tile_m)
         if cu_seqlens_m is not None and plan.cu_tiles_tile_m is not None

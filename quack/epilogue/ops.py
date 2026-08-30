@@ -1062,13 +1062,26 @@ class TileStore(EpiOp):
             tile_shape_mn = (gemm.cta_tile_shape_mnk[0], gemm.cta_tile_shape_mnk[1] // 2)
         else:
             tile_shape_mn = gemm.cta_tile_shape_mnk[:2]
+        if const_expr(gemm.gather_table):
+            route_start, route_end = tile_coord_mnkl[0], tile_coord_mnkl[2]
+            out_tensor = copy_utils.offset_ragged_tensor(
+                getattr(params, self.name),
+                route_start,
+                cutlass.max(route_end - route_start, Int32(0)),
+                ragged_dim=0,
+                ptr_shift=True,
+            )
+            out_tile_coord = (Int32(0), tile_coord_mnkl[1], None, batch_idx)
+        else:
+            out_tensor = varlen_manager.offset_batch_epi(getattr(params, self.name), batch_idx)
+            out_tile_coord = tile_coord_mnkl
         copy_aux, _, _ = gemm.epilog_gmem_copy_and_partition(
             getattr(params, self._tma_atom_key()),
-            varlen_manager.offset_batch_epi(getattr(params, self.name), batch_idx),
+            out_tensor,
             tile_shape_mn,
             getattr(params, self._epi_tile_key()),
             smem_tensor,
-            tile_coord_mnkl,
+            out_tile_coord,
         )
         pred = self.store_pred_fn(gemm, tile_coord_mnkl) if self.store_pred_fn else None
         return (tiled_copy_aux_r2s, tRS_sAux, copy_aux, pred)

@@ -8,6 +8,8 @@ import torch
 
 from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm import gemm as quack_gemm
+from quack.gemm_config import GemmConfig
+from quack.gemm_interface import gated_to_pytorch_fn_map, gemm_act
 
 
 pytestmark = pytest.mark.skipif(
@@ -15,6 +17,98 @@ pytestmark = pytest.mark.skipif(
     or get_device_capacity(torch.device("cuda"))[0] != 9,
     reason="gather_work_table is SM90 only",
 )
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize(("activation", "num_buffers"), [("relu", 1), ("swiglu", 3)])
+def test_gather_table_activation_epilogue(activation, num_buffers):
+    """Activation TileStore follows table route offsets for single and multi-buffer gather."""
+    torch.manual_seed(0)
+    experts, tokens, routes, k, out_n = 2, 32, 17, 64, 128
+    counts = (9, 8)
+    gated = activation in gated_to_pytorch_fn_map
+    gemm_n = out_n * (2 if gated else 1)
+    x_buffers = tuple(
+        torch.randn(tokens, k, dtype=torch.bfloat16, device="cuda")
+        for _ in range(num_buffers)
+    )
+    idx_buffers = []
+    for _ in range(num_buffers):
+        idx_buffers.append(
+            torch.cat(
+                [
+                    torch.randperm(tokens, dtype=torch.int32, device="cuda")[:count]
+                    for count in counts
+                ]
+            )
+        )
+    idx_buffers = tuple(idx_buffers)
+    weights = torch.randn(
+        experts, gemm_n, k, dtype=torch.bfloat16, device="cuda"
+    ).transpose(1, 2)
+    weights.mul_(1 / math.sqrt(k))
+
+    offsets = (0, counts[0], routes)
+    if num_buffers == 1:
+        rows = [(expert, offsets[expert], offsets[expert + 1], 0) for expert in range(experts)]
+    else:
+        rows = [
+            (
+                expert,
+                0,
+                *(
+                    endpoint
+                    for _ in x_buffers
+                    for endpoint in (offsets[expert], offsets[expert + 1])
+                ),
+            )
+            for expert in range(experts)
+        ]
+    work_table = torch.tensor(rows, dtype=torch.int32, device="cuda")
+    ready_rows = (
+        torch.tensor([len(rows)], dtype=torch.int32, device="cuda")
+        if num_buffers > 1
+        else None
+    )
+    output = torch.empty(num_buffers * routes, out_n, dtype=torch.bfloat16, device="cuda")
+    config = GemmConfig(
+        tile_m=64,
+        tile_n=128,
+        cluster_m=2,
+        cluster_n=1,
+        cluster_k=1,
+        max_swizzle_size=8,
+        device_capacity=9,
+        use_tma_gather=False,
+    )
+
+    gemm_act(
+        x_buffers if num_buffers > 1 else x_buffers[0],
+        weights,
+        activation=activation,
+        postact_out=output,
+        A_idx=idx_buffers if num_buffers > 1 else idx_buffers[0],
+        gather_work_table=work_table,
+        gather_work_table_ready=ready_rows,
+        multi_buffer_gather=num_buffers > 1,
+        store_preact=False,
+        tuned=False,
+        config=config,
+        concat_layout=("B",) if gated else None,
+    )
+
+    reference_parts = []
+    for expert, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
+        for X, A_idx in zip(x_buffers, idx_buffers):
+            preact = X[A_idx[start:end].long()].float() @ weights[expert].float()
+            if gated:
+                gate, up = preact.chunk(2, dim=-1)
+                preact = gated_to_pytorch_fn_map[activation](gate, up)
+            else:
+                preact = torch.relu(preact)
+            reference_parts.append(preact)
+    reference = torch.cat(reference_parts).to(output.dtype)
+    torch.testing.assert_close(output, reference, atol=6e-2, rtol=2e-3)
 
 
 @torch.inference_mode()

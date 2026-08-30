@@ -582,6 +582,9 @@ class EpiMod:
         tile_count_semaphore=None,
         cu_seqlens_m=None,
         A_idx=None,
+        gather_work_table=None,
+        gather_work_table_ready=None,
+        multi_buffer_gather=None,
         rounding_mode: int = RoundingMode.RN,
         epi_key_overrides=None,  # {op_name: key} when the caller owns the key rule (scalar modes)
         b_kn: bool = False,  # B passed (k, n) / (l, k, n), relabeled at trace time (dense SM90+)
@@ -618,8 +621,16 @@ class EpiMod:
         #                        split-k self-resets); None = fresh per call
         _launch=True,  # False: resolve/compile only (EpiMod.plan) — no kernel launch
     ) -> GemmEpiPlan:
-        varlen_m = cu_seqlens_m is not None
+        gather_table = gather_work_table is not None
+        varlen_m = cu_seqlens_m is not None or gather_table
         gather_A = A_idx is not None
+        gather_table_num_buffers = (
+            len(multi_buffer_gather.x_buffers) + 1 if multi_buffer_gather is not None else 1
+        )
+        if multi_buffer_gather is not None and not gather_table:
+            raise ValueError("multi_buffer_gather requires gather_work_table")
+        if gather_work_table_ready is not None and not gather_table:
+            raise ValueError("gather_work_table_ready requires gather_work_table")
         blockscaled = SFA is not None
         concat_key = tuple(sorted(concat_layout)) if concat_layout else ()
         owned_fmt = None
@@ -719,6 +730,10 @@ class EpiMod:
             A.device,
             tensor_key(cu_seqlens_m),
             gather_A,
+            tensor_key(gather_work_table),
+            tensor_key(gather_work_table_ready),
+            tuple(tensor_key(t) for t in getattr(multi_buffer_gather, "x_buffers", ())),
+            tuple(tensor_key(t) for t in getattr(multi_buffer_gather, "a_idx_buffers", ())),
             rounding_mode,
             b_kn,
             use_tma_gather,
@@ -768,6 +783,9 @@ class EpiMod:
                     tile_count_semaphore=tile_count_semaphore,
                     cu_seqlens_m=cu_seqlens_m,
                     A_idx=A_idx,
+                    gather_table=gather_work_table,
+                    gather_table_ready=gather_work_table_ready,
+                    multi_buffer_gather=multi_buffer_gather,
                     SFA=SFA,
                     SFB=SFB,
                     split_k_buffers=split_k_buffers,
@@ -780,7 +798,85 @@ class EpiMod:
                 raise ValueError("blockscaled GEMM does not support concat_layout")
             if tile_K is not None:
                 raise ValueError("blockscaled GEMM derives tile_K from the MMA instruction")
-        if varlen_m:
+        if gather_table:
+            import torch
+
+            if get_device_capacity(A.device)[0] != 9:
+                raise ValueError("gather_work_table is currently supported only on Hopper (SM90)")
+            if cu_seqlens_m is not None:
+                raise ValueError("cu_seqlens_m and gather_work_table are mutually exclusive")
+            if not gather_A:
+                raise ValueError("gather_work_table requires A_idx")
+            if not persistent or is_dynamic_persistent:
+                raise ValueError("gather_work_table requires static persistent scheduling")
+            if pingpong:
+                raise ValueError("gather_work_table does not support pingpong")
+            if cluster_N != 1:
+                raise ValueError("gather_work_table requires cluster_N=1")
+            if C is not None or self.sinks or self.prepass is not None:
+                raise ValueError("gather_work_table supports elementwise epilogues without C")
+            if add_to_output or rounding_mode != RoundingMode.RN:
+                raise ValueError(
+                    "gather_work_table does not support reduce-add or stochastic rounding"
+                )
+            if blockscaled or swap_ab or ag_args is not None or split_k != 1:
+                raise ValueError(
+                    "gather_work_table does not support block scaling, swap_ab, "
+                    "AllGather, or split_k"
+                )
+            if A.ndim != 2 or B.ndim != 3 or A_idx.ndim != 1:
+                raise ValueError("gather_work_table expects A[T,K], B[E,N,K], and A_idx[R]")
+            expected_width = (
+                4 if gather_table_num_buffers == 1 else 2 + 2 * gather_table_num_buffers
+            )
+            if (
+                gather_work_table.ndim != 2
+                or gather_work_table.shape[1] != expected_width
+                or gather_work_table.dtype != torch.int32
+                or not gather_work_table.is_contiguous()
+            ):
+                raise ValueError(
+                    "gather_work_table must be a contiguous int32 tensor with shape "
+                    f"[Q, {expected_width}]"
+                )
+            if gather_work_table.device != A.device or A_idx.device != A.device:
+                raise ValueError("gather_work_table, A_idx, and GEMM operands must share a device")
+            if A_idx.dtype != torch.int32:
+                raise ValueError("gather_work_table requires int32 A_idx")
+            if gather_work_table_ready is not None and (
+                gather_work_table_ready.shape != (1,)
+                or gather_work_table_ready.dtype != torch.int32
+                or not gather_work_table_ready.is_contiguous()
+                or gather_work_table_ready.device != A.device
+            ):
+                raise ValueError(
+                    "gather_work_table_ready must be contiguous int32[1] on the GEMM device"
+                )
+            if multi_buffer_gather is not None:
+                if not multi_buffer_gather.x_buffers or len(
+                    multi_buffer_gather.x_buffers
+                ) != len(multi_buffer_gather.a_idx_buffers):
+                    raise ValueError("multi-buffer gather requires matching X and A_idx buffers")
+                for A_extra, idx_extra in zip(
+                    multi_buffer_gather.x_buffers, multi_buffer_gather.a_idx_buffers
+                ):
+                    if (
+                        A_extra.shape != A.shape
+                        or A_extra.stride() != A.stride()
+                        or A_extra.dtype != A.dtype
+                        or A_extra.device != A.device
+                    ):
+                        raise ValueError("all multi-buffer X tensors must match buffer 0")
+                    if (
+                        idx_extra.shape != A_idx.shape
+                        or idx_extra.stride() != A_idx.stride()
+                        or idx_extra.dtype != torch.int32
+                        or idx_extra.device != A.device
+                    ):
+                        raise ValueError("all multi-buffer A_idx tensors must match buffer 0")
+            if gather_work_table.shape[0] == 0:
+                raise ValueError("gather_work_table must contain at least one row")
+        elif varlen_m:
             if not persistent:
                 raise ValueError("varlen_m requires persistent=True")
             num_seqs = cu_seqlens_m.shape[0] - 1
@@ -802,6 +898,13 @@ class EpiMod:
             if cluster_N != 1:
                 raise ValueError("gather_A requires cluster_N=1")
         n_gemm = n_over if n_over is not None else (B.shape[-1] if b_kn else B.shape[-2])
+        if gather_table:
+            clusters_n = (n_gemm + tile_N - 1) // tile_N
+            x = min(max_swizzle_size, clusters_n)
+            if x <= 0 or clusters_n % x:
+                raise ValueError(
+                    f"gather_work_table requires clusters_n % x == 0, got {clusters_n} % {x}"
+                )
         # Kernel coords under swap-at-trace (and layout-owning transforms):
         # kernel m = caller n, kernel n = caller m. Shape checks on
         # D/C/outputs stay caller-oriented (the tensors cross natively; the
@@ -839,6 +942,15 @@ class EpiMod:
             if ref_t is None:
                 raise ValueError("varlen_m needs D or an aux output")
             m = ref_t.shape[0]
+            if gather_table:
+                total_routes = A_idx.shape[0] + sum(
+                    idx.shape[0]
+                    for idx in getattr(multi_buffer_gather, "a_idx_buffers", ())
+                )
+                if m != total_routes:
+                    raise ValueError(
+                        f"gather_work_table outputs require {total_routes} rows, got {m}"
+                    )
         else:
             m = A.shape[-2]
         # Inference/vec-check dims in kernel coords; base_shape (D/C/outputs)
@@ -1102,6 +1214,9 @@ class EpiMod:
             max_swizzle_size=max_swizzle_size,
             varlen_m=varlen_m,
             gather_A=gather_A,
+            gather_table=gather_table,
+            has_gather_table_ready=gather_work_table_ready is not None,
+            gather_table_num_buffers=gather_table_num_buffers,
             # slot-A relabels via a_transposed (swap_ab); owned transforms
             # pass B (= caller A activations) natively (n, k)
             b_kn=b_kn and not swap_ab and owned_fmt is None,
@@ -1134,6 +1249,9 @@ class EpiMod:
                 tile_count_semaphore=tile_count_semaphore,
                 cu_seqlens_m=cu_seqlens_m,
                 A_idx=A_idx,
+                gather_table=gather_work_table,
+                gather_table_ready=gather_work_table_ready,
+                multi_buffer_gather=multi_buffer_gather,
                 SFA=SFA,
                 SFB=SFB,
                 split_k_buffers=split_k_buffers,

@@ -55,7 +55,8 @@ DEFAULT_THREAD_PROXY = DEFAULT_PROXY.with_name("libstream_gather_proxy_thread.so
 def parse_args() -> argparse.Namespace:
     parser = make_arg_parser(
         "Benchmark QuACK's SM90 multi-buffer GroupedGEMM while a CPU proxy streams "
-        "its gather table into HBM."
+        "its gather table into HBM.",
+        include_activation=False,
     )
     parser.add_argument(
         "--flush-entries",
@@ -704,8 +705,14 @@ def main() -> None:
         print(f"Effective throughput: {tflops:.2f} TFLOP/s")
 
         if not args.skip_check:
-            max_abs_error = check_correctness(inputs, atol=args.atol, rtol=args.rtol)
-            print(f"Reference check: PASSED (max absolute error {max_abs_error:.6g})")
+            max_abs_error, max_allowed_error = check_correctness(
+                inputs, atol=args.atol, rtol=args.rtol
+            )
+            print(
+                "Reference check: PASSED "
+                f"(max absolute error {max_abs_error:.6g}, "
+                f"permitted bound {max_allowed_error:.6g})"
+            )
     finally:
         try:
             if proxy is not None:
