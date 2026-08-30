@@ -1,5 +1,8 @@
 """CPU tests for the Hopper gather-table runner's table construction."""
 
+from pathlib import Path
+from types import SimpleNamespace
+
 import torch
 
 from run.hopper_gather_table_gemm import (
@@ -9,6 +12,7 @@ from run.hopper_gather_table_gemm import (
 )
 from run.hopper_stream_gather_table_gemm import (
     build_stream_metadata,
+    proxy_command,
     raw_cuda_ipc_handle,
 )
 
@@ -183,6 +187,37 @@ def test_stream_metadata_matches_full_table_without_constructing_rows():
     assert output_segments == expected_segments
     assert group_size == expected_group_size
     assert table_rows == table.shape[0]
+
+
+def test_stream_proxy_uses_gated_gemm_width_instead_of_postactivation_width():
+    args = SimpleNamespace(
+        proxy_binary=Path("stream_gather_proxy"),
+        device=0,
+        routes_per_buffer=None,
+        routes=19,
+        experts=5,
+        num_input_buffers=3,
+        output_dim=128,
+        tile_m=64,
+        tile_n=128,
+        cluster_m=2,
+        max_swizzle_size=4,
+        flush_entries=1,
+        flush_interval_us=10,
+        dma_kick_bytes=0,
+        balanced_multi_buffer_gather=True,
+        round_robin_m_clusters=False,
+        flag_update_mode="memcpy",
+    )
+    inputs = SimpleNamespace(
+        work_table=torch.empty((7, 8), dtype=torch.int32),
+        W=torch.empty((args.experts, 64, 2 * args.output_dim)),
+    )
+
+    command = proxy_command(args, inputs, "00" * 64, 0)
+
+    output_dim_arg = command.index("--output-dim")
+    assert command[output_dim_arg + 1] == "256"
 
 
 def test_cuda_ipc_handle_decode_accepts_legacy_and_versioned_cuda_malloc():

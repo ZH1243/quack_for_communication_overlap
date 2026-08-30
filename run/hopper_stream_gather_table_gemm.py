@@ -6,6 +6,11 @@ batches, and publishes a ready-row prefix after every batch. It can run either
 as a separate CUDA-IPC process or as a worker thread sharing PyTorch's CUDA
 context. The persistent scheduler warp waits for the prefix before reading a
 row.
+
+Fuse a SwiGLU up-projection while streaming the 2N-wide work table:
+
+    python run/hopper_stream_gather_table_gemm.py --multi-buffer-gather \
+        --num-input-buffers 3 --output-dim 14336 --activation swiglu
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ import torch
 try:
     from run.hopper_gather_table_gemm import (
         DTYPES,
+        GATED_ACTIVATIONS,
         TableGatherInputs,
         balanced_buffer_allocations,
         check_correctness,
@@ -38,6 +44,7 @@ except ModuleNotFoundError as error:
         raise
     from hopper_gather_table_gemm import (  # type: ignore[no-redef]
         DTYPES,
+        GATED_ACTIVATIONS,
         TableGatherInputs,
         balanced_buffer_allocations,
         check_correctness,
@@ -56,7 +63,6 @@ def parse_args() -> argparse.Namespace:
     parser = make_arg_parser(
         "Benchmark QuACK's SM90 multi-buffer GroupedGEMM while a CPU proxy streams "
         "its gather table into HBM.",
-        include_activation=False,
     )
     parser.add_argument(
         "--flush-entries",
@@ -199,9 +205,11 @@ def prepare_inputs(
     counts_by_buffer = multi_buffer_route_counts(
         routes, args.experts, args.num_input_buffers
     )
+    gated = args.activation in GATED_ACTIVATIONS
+    gemm_output_dim = args.output_dim * (2 if gated else 1)
     route_offsets, output_segments, group_size, table_rows = build_stream_metadata(
         counts_by_buffer,
-        output_dim=args.output_dim,
+        output_dim=gemm_output_dim,
         tile_m=args.tile_m,
         tile_n=args.tile_n,
         cluster_m=args.cluster_m,
@@ -209,7 +217,14 @@ def prepare_inputs(
         balance_buffers=args.balanced_multi_buffer_gather,
     )
 
-    W = torch.randn((args.experts, args.hidden, args.output_dim), dtype=dtype, device=device)
+    if gated:
+        W = torch.randn(
+            (args.experts, gemm_output_dim, args.hidden), dtype=dtype, device=device
+        ).transpose(1, 2)
+    else:
+        W = torch.randn(
+            (args.experts, args.hidden, gemm_output_dim), dtype=dtype, device=device
+        )
     W.mul_(1.0 / math.sqrt(args.hidden))
     X = tuple(
         torch.randn((tokens, args.hidden), dtype=dtype, device=device)
@@ -257,10 +272,44 @@ def make_launch(
     args: argparse.Namespace, inputs: TableGatherInputs, ready_rows: torch.Tensor
 ):
     from quack.gemm import gemm as quack_gemm
+    from quack.gemm_config import GemmConfig
+    from quack.gemm_interface import gemm_act
 
     B = inputs.W.transpose(1, 2)
 
+    if args.activation is not None:
+        config = GemmConfig(
+            tile_m=args.tile_m,
+            tile_n=args.tile_n,
+            tile_k=args.tile_k,
+            pingpong=False,
+            is_dynamic_persistent=False,
+            cluster_m=args.cluster_m,
+            cluster_n=1,
+            cluster_k=1,
+            max_swizzle_size=args.max_swizzle_size,
+            device_capacity=9,
+            use_tma_gather=False,
+        )
+
     def launch() -> None:
+        if args.activation is not None:
+            gemm_act(
+                inputs.X,
+                inputs.W,
+                activation=args.activation,
+                postact_out=inputs.output,
+                A_idx=inputs.A_idx,
+                gather_work_table=inputs.work_table,
+                gather_work_table_ready=ready_rows,
+                multi_buffer_gather=True,
+                store_preact=False,
+                dynamic_scheduler=False,
+                tuned=False,
+                config=config,
+                concat_layout=("B",) if args.activation in GATED_ACTIVATIONS else None,
+            )
+            return
         quack_gemm(
             inputs.X,
             B,
@@ -393,7 +442,7 @@ def proxy_command(
         "--num-input-buffers",
         str(args.num_input_buffers),
         "--output-dim",
-        str(args.output_dim),
+        str(inputs.W.shape[-1]),
         "--tile-m",
         str(args.tile_m),
         "--tile-n",
@@ -582,7 +631,7 @@ class ThreadProxy:
             args.experts,
             routes,
             args.num_input_buffers,
-            args.output_dim,
+            inputs.W.shape[-1],
             args.tile_m,
             args.tile_n,
             args.cluster_m,
@@ -669,6 +718,7 @@ def main() -> None:
         f"{args.balanced_multi_buffer_gather}, round-robin-m-clusters="
         f"{args.round_robin_m_clusters}"
     )
+    print(f"Fused activation: {args.activation or 'disabled'}")
     if not args.no_cuda_graph:
         print("CUDA graph capture is disabled for externally produced streaming table data.")
     print("Compiling and warming up the readiness-gated QuACK kernel...")
@@ -699,14 +749,14 @@ def main() -> None:
             timings_ms.append(statistics.mean(launches_ms))
         median_ms = statistics.median(timings_ms)
         total_routes = inputs.output.shape[0]
-        tflops = 2 * total_routes * args.hidden * args.output_dim / (median_ms * 1e9)
+        tflops = 2 * total_routes * args.hidden * inputs.W.shape[-1] / (median_ms * 1e9)
         print(f"Per-launch end-to-end samples (ms): {[round(value, 4) for value in timings_ms]}")
         print(f"Median proxy-flush + kernel time: {median_ms:.4f} ms")
         print(f"Effective throughput: {tflops:.2f} TFLOP/s")
 
         if not args.skip_check:
             max_abs_error, max_allowed_error = check_correctness(
-                inputs, atol=args.atol, rtol=args.rtol
+                inputs, activation=args.activation, atol=args.atol, rtol=args.rtol
             )
             print(
                 "Reference check: PASSED "
