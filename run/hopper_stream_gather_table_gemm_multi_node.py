@@ -140,6 +140,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tile-k", type=int, default=None)
     parser.add_argument("--cluster-m", type=int, default=2)
     parser.add_argument("--max-swizzle-size", type=int, default=8)
+    parser.add_argument("--pingpong", action="store_true")
     parser.add_argument("--flag-update-mode", choices=("memcpy", "stream-write"), default="memcpy")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iterations", type=int, default=5)
@@ -189,6 +190,15 @@ def validate_args(args: argparse.Namespace, world_size: int) -> None:
         raise ValueError("--gpus-per-node must be in [2, 8]")
     if args.forwarding_batch_tokens % args.tokens_per_chunk:
         raise ValueError("--forwarding-batch-tokens must be a multiple of --tokens-per-chunk")
+    if args.pingpong:
+        if args.tile_m not in (64, 128, 192):
+            raise ValueError("--pingpong requires --tile-m to be 64, 128, or 192")
+        tile_n_max = 256 if args.tile_m == 64 else (208 if args.tile_m == 128 else 128)
+        if args.tile_n % 16 or args.tile_n > tile_n_max:
+            raise ValueError(
+                f"--pingpong with --tile-m={args.tile_m} requires --tile-n divisible by 16 "
+                f"and no larger than {tile_n_max}"
+            )
     clusters_n = math.ceil(args.output_dim / args.tile_n)
     group_size = min(args.max_swizzle_size, clusters_n)
     if clusters_n % group_size:
@@ -779,7 +789,7 @@ def make_launch(args: argparse.Namespace, inputs: PreparedInputs):
             cluster_M=args.cluster_m,
             cluster_N=1,
             cluster_K=1,
-            pingpong=False,
+            pingpong=args.pingpong,
             persistent=True,
             is_dynamic_persistent=False,
             max_swizzle_size=args.max_swizzle_size,

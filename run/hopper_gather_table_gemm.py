@@ -159,6 +159,7 @@ def make_arg_parser(
     parser.add_argument("--tile-k", type=int, default=None)
     parser.add_argument("--cluster-m", type=int, default=2)
     parser.add_argument("--max-swizzle-size", type=int, default=8)
+    parser.add_argument("--pingpong", action="store_true")
     parser.add_argument("--routing-with-replacement", action="store_true")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=100)
@@ -210,6 +211,15 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"{name} must be positive, got {value}")
     if args.warmup < 0:
         raise ValueError(f"warmup must be nonnegative, got {args.warmup}")
+    if args.pingpong:
+        if args.tile_m not in (64, 128, 192):
+            raise ValueError("pingpong requires tile-m to be 64, 128, or 192")
+        tile_n_max = 256 if args.tile_m == 64 else (208 if args.tile_m == 128 else 128)
+        if args.tile_n % 16 or args.tile_n > tile_n_max:
+            raise ValueError(
+                f"pingpong with tile-m={args.tile_m} requires tile-n divisible by 16 "
+                f"and no larger than {tile_n_max}"
+            )
     if getattr(args, "down_projection", False) and getattr(args, "activation", None) is None:
         raise ValueError("--down-projection requires --activation")
     tokens = args.tokens_per_buffer if args.multi_buffer_gather else args.tokens
@@ -554,7 +564,7 @@ def make_launch(args: argparse.Namespace, inputs: TableGatherInputs):
             tile_m=args.tile_m,
             tile_n=args.tile_n,
             tile_k=args.tile_k,
-            pingpong=False,
+            pingpong=args.pingpong,
             is_dynamic_persistent=False,
             cluster_m=args.cluster_m,
             cluster_n=1,
@@ -593,7 +603,7 @@ def make_launch(args: argparse.Namespace, inputs: TableGatherInputs):
                 cluster_M=args.cluster_m,
                 cluster_N=1,
                 cluster_K=1,
-                pingpong=False,
+                pingpong=args.pingpong,
                 persistent=True,
                 is_dynamic_persistent=False,
                 max_swizzle_size=args.max_swizzle_size,
@@ -620,7 +630,7 @@ def make_launch(args: argparse.Namespace, inputs: TableGatherInputs):
                 cluster_M=args.cluster_m,
                 cluster_N=1,
                 cluster_K=1,
-                pingpong=False,
+                pingpong=args.pingpong,
                 persistent=True,
                 is_dynamic_persistent=False,
                 max_swizzle_size=args.max_swizzle_size,

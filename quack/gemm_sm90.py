@@ -1309,6 +1309,13 @@ class GemmSm90(GemmTmaBase):
                 pipeline.PipelineUserType.Producer, self.epi_c_stage
             )
             tile_scheduler = TileSchedulerCls()
+            if const_expr(self.gather_table and self.pingpong):
+                if warp_group_idx == 1:
+                    # Every gather-table descriptor, including tile 0, is
+                    # published through the scheduler ring. WG1 starts at tile
+                    # 1, so move its private cursor to stage 1 without reading
+                    # or releasing WG0's stage-0 descriptor.
+                    tile_scheduler.skip_published_work()
             work_tile = (
                 tile_scheduler.get_current_work()
                 if const_expr(self.gather_table)
@@ -1343,9 +1350,13 @@ class GemmSm90(GemmTmaBase):
                                 c_cnt = Int32(0)
                         epi_read_state.advance_iters(c_cnt)
                         epi_producer_state.advance_iters(c_cnt)
-                    # TODO: do we need to check if work_tile is valid?
-                    tile_scheduler.advance_to_next_work()
-                    work_tile = tile_scheduler.get_current_work()
+                    if const_expr(not self.gather_table):
+                        # The ordinary scheduler's initial tile is delinearized
+                        # outside the scheduler ring. Skip it before WG1 reads
+                        # the first published descriptor. Gather-table WG1 was
+                        # positioned at stage 1 before its initial read above.
+                        tile_scheduler.advance_to_next_work()
+                        work_tile = tile_scheduler.get_current_work()
             while work_tile.is_valid_tile:
                 # (pid_m, pid_n, split_idx | None, batch_idx), decoded by the scheduler
                 tile_coord_mnkl = work_tile.tile_idx

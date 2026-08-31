@@ -827,8 +827,6 @@ def _build_gemm_plan(
             raise ValueError("gather_work_table requires A_idx")
         if not persistent or is_dynamic_persistent:
             raise ValueError("gather_work_table requires static persistent scheduling")
-        if pingpong:
-            raise ValueError("gather_work_table does not support pingpong yet")
         if cluster_N != 1 or cluster_K != 1:
             raise ValueError("gather_work_table requires cluster_N=cluster_K=1")
         if C is not None or rowvec_bias is not None or colvec_bias is not None:

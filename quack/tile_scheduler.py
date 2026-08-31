@@ -1038,6 +1038,19 @@ class TileScheduler:
                     self._throttle_barrier.arrive_and_wait()
                 self._issue_clc_query_multicast(loc=loc, ip=ip)
 
+    @cute.jit
+    def skip_published_work(self, *, advance_count: int = 1, loc=None, ip=None):
+        """Skip scheduler-ring records without consuming or releasing their slots.
+
+        Ordinary pingpong starts from a tile delinearized outside the scheduler ring,
+        so ``advance_to_next_work`` skips that tile and leaves the ring cursor at its
+        first record. Gather-table descriptors, including the initial one, all live in
+        the ring. Its second math warpgroup must therefore advance past the first
+        published record without participating in that record's consumer barrier.
+        """
+        self.num_tiles_executed += Int32(advance_count)
+        self._pipeline_state.advance_iters(advance_count)
+
     def producer_tail(self):
         if const_expr(self._scheduler_pipeline is not None):
             self._scheduler_pipeline.producer_tail(self._producer_state())

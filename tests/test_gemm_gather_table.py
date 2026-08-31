@@ -20,8 +20,11 @@ pytestmark = pytest.mark.skipif(
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize(("activation", "num_buffers"), [("relu", 1), ("swiglu", 3)])
-def test_gather_table_activation_epilogue(activation, num_buffers):
+@pytest.mark.parametrize(
+    ("activation", "num_buffers", "pingpong"),
+    [("relu", 1, False), ("relu", 1, True), ("swiglu", 3, True)],
+)
+def test_gather_table_activation_epilogue(activation, num_buffers, pingpong):
     """Activation TileStore follows table route offsets for single and multi-buffer gather."""
     torch.manual_seed(0)
     experts, tokens, routes, k, out_n = 2, 32, 17, 64, 128
@@ -74,6 +77,7 @@ def test_gather_table_activation_epilogue(activation, num_buffers):
     config = GemmConfig(
         tile_m=64,
         tile_n=128,
+        pingpong=pingpong,
         cluster_m=2,
         cluster_n=1,
         cluster_k=1,
@@ -112,8 +116,55 @@ def test_gather_table_activation_epilogue(activation, num_buffers):
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize(("tile_m", "num_buffers"), [(64, 5), (128, 32), (192, 16)])
-def test_multi_buffer_gather_selects_one_source_row(tile_m, num_buffers):
+def test_gather_table_pingpong_runs_work_on_both_math_warpgroups():
+    """More work than resident clusters makes WG1 execute real table descriptors."""
+    torch.manual_seed(0)
+    tokens, routes, k, n = 512, 512, 64, 1024
+    tile_m, tile_n, rows_per_table_entry = 64, 128, 16
+    X = torch.randn(tokens, k, dtype=torch.bfloat16, device="cuda")
+    A_idx = torch.randperm(tokens, dtype=torch.int32, device="cuda")[:routes]
+    weights = torch.randn(1, n, k, dtype=torch.bfloat16, device="cuda") / math.sqrt(k)
+    work_table = torch.tensor(
+        [
+            (0, start, min(start + rows_per_table_entry, routes), 0)
+            for start in range(0, routes, rows_per_table_entry)
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    output = torch.empty(routes, n, dtype=torch.bfloat16, device="cuda")
+
+    quack_gemm(
+        X,
+        weights,
+        output,
+        C=None,
+        tile_count_semaphore=None,
+        tile_M=tile_m,
+        tile_N=tile_n,
+        cluster_M=1,
+        cluster_N=1,
+        cluster_K=1,
+        pingpong=True,
+        persistent=True,
+        is_dynamic_persistent=False,
+        max_swizzle_size=8,
+        cu_seqlens_m=None,
+        A_idx=A_idx,
+        gather_work_table=work_table,
+        use_tma_gather=False,
+    )
+
+    reference = X[A_idx.long()].float() @ weights[0].float().mT
+    torch.testing.assert_close(output, reference.to(output.dtype), atol=3e-2, rtol=1e-3)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize(
+    ("tile_m", "num_buffers", "pingpong"),
+    [(64, 5, True), (128, 32, False), (192, 16, True)],
+)
+def test_multi_buffer_gather_selects_one_source_row(tile_m, num_buffers, pingpong):
     """Loader threads cooperatively prepare one address for each packed row."""
     torch.manual_seed(0)
     num_experts = 2
@@ -164,7 +215,7 @@ def test_multi_buffer_gather_selects_one_source_row(tile_m, num_buffers):
         cluster_M=2,
         cluster_N=1,
         cluster_K=1,
-        pingpong=False,
+        pingpong=pingpong,
         persistent=True,
         is_dynamic_persistent=False,
         cu_seqlens_m=None,
@@ -218,7 +269,7 @@ def test_multi_buffer_gather_waits_for_table_ready_prefix():
         cluster_M=2,
         cluster_N=1,
         cluster_K=1,
-        pingpong=False,
+        pingpong=True,
         persistent=True,
         is_dynamic_persistent=False,
         cu_seqlens_m=None,

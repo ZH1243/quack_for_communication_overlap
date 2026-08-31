@@ -157,6 +157,7 @@ Run the table-scheduled fused gather benchmark:
 
 ```bash
 python run/hopper_gather_table_gemm.py
+python run/hopper_gather_table_gemm.py --pingpong --tile-m 64 --tile-n 256
 python run/hopper_stream_gather_table_gemm.py --multi-buffer-gather
 ```
 
@@ -195,9 +196,10 @@ python run/hopper_stream_gather_table_gemm.py --help
 ## Runtime parameters
 
 The original fused and pre-gathered scripts accept the same parameters. The
-table runner accepts the applicable subset (it is static-persistent and does
-not expose `--pingpong`) and permits `--routes` values not divisible by the
-expert count.
+table runner accepts the applicable static-persistent subset and permits
+`--routes` values not divisible by the expert count. Its ping-pong mode uses
+the SM90 ping-pong tile limits: tile M must be 64, 128, or 192, and the maximum
+tile N is respectively 256, 208, or 128.
 
 | Parameter | Default | Description |
 | --- | ---: | --- |
