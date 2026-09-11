@@ -61,14 +61,14 @@ struct Options {
 
 void validate_options(const Options& options) {
   if (options.table_rows <= 0 || options.table_width <= 0 || options.experts <= 0 ||
-      options.routes_per_buffer <= 0 || options.num_input_buffers < 2 ||
+      options.routes_per_buffer <= 0 || options.num_input_buffers < 1 ||
       options.output_dim <= 0 || options.tile_m <= 0 || options.tile_n <= 0 ||
       options.cluster_m <= 0 || options.max_swizzle_size <= 0 ||
       options.entries_per_flush <= 0 || options.interval_us < 0) {
     throw std::runtime_error("table and flush dimensions must be positive (interval may be zero)");
   }
   if (options.table_width != 2 + 2 * options.num_input_buffers) {
-    throw std::runtime_error("table width does not match the multi-buffer row format");
+    throw std::runtime_error("table width does not match the gather row format");
   }
   if (options.flag_mode != "memcpy" && options.flag_mode != "stream-write") {
     throw std::runtime_error("--flag-mode must be memcpy or stream-write");
@@ -335,10 +335,17 @@ PinnedTable build_table(const Options& options) {
   auto emit = [&](int expert, int n_group, const Ranges& ranges) {
     auto* row = table.data + cursor * table.width;
     row[0] = expert;
-    row[1] = n_group * group_size;
-    for (int buffer = 0; buffer < options.num_input_buffers; ++buffer) {
-      row[2 + 2 * buffer] = ranges[buffer].first;
-      row[3 + 2 * buffer] = ranges[buffer].second;
+    if (options.num_input_buffers == 1) {
+      // Single-buffer scheduler: [expert, route_start, route_end, cid_n_base].
+      row[1] = ranges[0].first;
+      row[2] = ranges[0].second;
+      row[3] = n_group * group_size;
+    } else {
+      row[1] = n_group * group_size;
+      for (int buffer = 0; buffer < options.num_input_buffers; ++buffer) {
+        row[2 + 2 * buffer] = ranges[buffer].first;
+        row[3 + 2 * buffer] = ranges[buffer].second;
+      }
     }
     ++cursor;
   };

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run Hopper multi-buffer GroupedGEMM while its gather table streams to HBM.
+"""Run Hopper single- or multi-buffer GroupedGEMM while its gather table streams to HBM.
 
 The C++ proxy constructs the table in pinned host memory, copies table rows in
 batches, and publishes a ready-row prefix after every batch. It can run either
@@ -64,7 +64,7 @@ DEFAULT_THREAD_PROXY = DEFAULT_PROXY.with_name("libstream_gather_proxy_thread.so
 
 def parse_args() -> argparse.Namespace:
     parser = make_arg_parser(
-        "Benchmark QuACK's SM90 multi-buffer GroupedGEMM while a CPU proxy streams "
+        "Benchmark QuACK's SM90 single- or multi-buffer GroupedGEMM while a CPU proxy streams "
         "its gather table into HBM.",
         include_down_projection=True,
     )
@@ -119,8 +119,6 @@ def parse_args() -> argparse.Namespace:
 
 def validate_stream_args(args: argparse.Namespace) -> None:
     validate_args(args)
-    if not args.multi_buffer_gather:
-        raise ValueError("hopper_stream_gather_table_gemm.py requires --multi-buffer-gather")
     if args.flush_entries <= 0:
         raise ValueError(f"flush-entries must be positive, got {args.flush_entries}")
     if args.flush_interval_us < 0:
@@ -204,10 +202,11 @@ def prepare_inputs(
 ) -> tuple[TableGatherInputs, torch.Tensor, torch.Tensor]:
     """Prepare operands and empty HBM table storage; the proxy owns table contents."""
     dtype = DTYPES[args.dtype]
-    tokens = args.tokens_per_buffer or args.tokens
-    routes = args.routes_per_buffer or args.routes
+    num_buffers = args.num_input_buffers if args.multi_buffer_gather else 1
+    tokens = (args.tokens_per_buffer or args.tokens) if args.multi_buffer_gather else args.tokens
+    routes = (args.routes_per_buffer or args.routes) if args.multi_buffer_gather else args.routes
     counts_by_buffer = multi_buffer_route_counts(
-        routes, args.experts, args.num_input_buffers
+        routes, args.experts, num_buffers
     )
     gated = args.activation in GATED_ACTIVATIONS
     gemm_output_dim = args.output_dim * (2 if gated else 1)
@@ -238,7 +237,7 @@ def prepare_inputs(
         W_down.mul_(1.0 / math.sqrt(args.output_dim))
     X = tuple(
         torch.randn((tokens, args.hidden), dtype=dtype, device=device)
-        for _ in range(args.num_input_buffers)
+        for _ in range(num_buffers)
     )
     idx_buffers = []
     for counts in counts_by_buffer:
@@ -254,7 +253,7 @@ def prepare_inputs(
         idx_buffers.append(A_idx_j)
     A_idx = tuple(idx_buffers)
 
-    table_width = 2 + 2 * args.num_input_buffers
+    table_width = 2 + 2 * num_buffers
     # A single allocation avoids opening the same CUDA IPC allocation twice if
     # PyTorch suballocates the table and flag from one caching-allocator segment.
     table_elements = table_rows * table_width
@@ -262,9 +261,9 @@ def prepare_inputs(
     work_table = ipc_backing[:table_elements].view(table_rows, table_width)
     ready_rows = ipc_backing[table_elements:]
     ready_rows.zero_()
-    total_routes = args.num_input_buffers * routes
+    total_routes = num_buffers * routes
     up_output = torch.empty(
-        (args.num_input_buffers * routes, args.output_dim), dtype=dtype, device=device
+        (total_routes, args.output_dim), dtype=dtype, device=device
     )
     output = (
         torch.empty((total_routes, args.hidden), dtype=dtype, device=device)
@@ -280,9 +279,9 @@ def prepare_inputs(
         assert cumulative_routes[-1] == total_routes
         cu_seqlens_m = torch.tensor(cumulative_routes, dtype=torch.int32, device=device)
     inputs = TableGatherInputs(
-        X,
+        X if args.multi_buffer_gather else X[0],
         W,
-        A_idx,
+        A_idx if args.multi_buffer_gather else A_idx[0],
         work_table,
         route_offsets,
         output_segments,
@@ -354,7 +353,7 @@ def make_launch(
                 A_idx=inputs.A_idx,
                 gather_work_table=inputs.work_table,
                 gather_work_table_ready=ready_rows,
-                multi_buffer_gather=True,
+                multi_buffer_gather=args.multi_buffer_gather,
                 store_preact=False,
                 dynamic_scheduler=False,
                 tuned=False,
@@ -382,7 +381,7 @@ def make_launch(
                 A_idx=inputs.A_idx,
                 gather_work_table=inputs.work_table,
                 gather_work_table_ready=ready_rows,
-                multi_buffer_gather=True,
+                multi_buffer_gather=args.multi_buffer_gather,
                 use_tma_gather=False,
             )
 
@@ -477,7 +476,7 @@ def proxy_command(
     allocation_offset_bytes: int,
 ) -> list[str]:
     table_bytes = inputs.work_table.numel() * inputs.work_table.element_size()
-    routes = args.routes_per_buffer or args.routes
+    routes = inputs.route_offsets[0][-1]
     return [
         str(args.proxy_binary.resolve()),
         "--device",
@@ -497,7 +496,7 @@ def proxy_command(
         "--routes-per-buffer",
         str(routes),
         "--num-input-buffers",
-        str(args.num_input_buffers),
+        str(len(inputs.route_offsets)),
         "--output-dim",
         str(inputs.W.shape[-1]),
         "--tile-m",
@@ -677,7 +676,7 @@ class ThreadProxy:
         destroy.argtypes = [ctypes.c_void_p]
         destroy.restype = None
 
-        routes = args.routes_per_buffer or args.routes
+        routes = inputs.route_offsets[0][-1]
         error = ctypes.create_string_buffer(self.ERROR_CAPACITY)
         handle = create(
             args.device,
@@ -687,7 +686,7 @@ class ThreadProxy:
             inputs.work_table.shape[1],
             args.experts,
             routes,
-            args.num_input_buffers,
+            len(inputs.route_offsets),
             inputs.W.shape[-1],
             args.tile_m,
             args.tile_n,
@@ -759,9 +758,11 @@ def main() -> None:
         for offsets in inputs.route_offsets
     ]
     print(f"Device: {torch.cuda.get_device_name(device)} (SM{capability[0]}{capability[1]})")
+    X_buffers = inputs.X if isinstance(inputs.X, tuple) else (inputs.X,)
     print(
-        f"X buffers: {len(inputs.X)} x {tuple(inputs.X[0].shape)}, "
-        f"W_up: {tuple(inputs.W.shape)}, dtype: {inputs.X[0].dtype}"
+        f"X buffers: {len(X_buffers)} x {tuple(X_buffers[0].shape)}, "
+        f"W_up: {tuple(inputs.W.shape)}, dtype: {X_buffers[0].dtype}, "
+        f"multi-buffer={args.multi_buffer_gather}"
     )
     if inputs.W_down is not None:
         assert inputs.up_output is not None

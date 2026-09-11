@@ -17,7 +17,7 @@ The build produces two frontends over the same implementation:
   performs each flush on its persistent native C++ worker thread in the Python
   process.
 
-Both frontends construct the multi-buffer gather table directly in
+Both frontends construct single- or multi-buffer gather tables directly in
 CUDA-pinned host memory. They copy table rows on a private nonblocking CUDA
 stream and publish the ready-row prefix after each batch with either
 `cudaMemcpyAsync` or `cuStreamWriteValue32` on that same stream.
@@ -35,3 +35,8 @@ releases PyTorch's IPC reference counter after `QUIT`. Both legacy 64-byte CUDA
 IPC handles and PyTorch's versioned 66-byte `cudaMalloc` handles are supported.
 Expandable-segment handles use a different import API and must be disabled for
 process mode. Thread mode does not export or import CUDA IPC memory.
+
+A buffer count of one emits `[expert, route_start, route_end, cid_n_base]` rows.
+Larger counts emit `[expert, cid_n_base, start_0, end_0, ...]` rows. The Python
+runner selects the format from `--multi-buffer-gather` and passes the effective
+buffer count to either frontend.

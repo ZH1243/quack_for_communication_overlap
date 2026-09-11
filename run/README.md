@@ -64,7 +64,7 @@ correctness check from the reported kernel time.
 
 ### `hopper_stream_gather_table_gemm.py`
 
-Runs the multi-buffer table kernel while `run/cpu_proxy/stream_gather_proxy`
+Runs the single- or multi-buffer table kernel while `run/cpu_proxy/stream_gather_proxy`
 streams the gather table from CUDA-pinned CPU memory into a poisoned HBM table
 allocation. The proxy publishes the number of ready table rows after
 every copy batch. Before reading row `i`, lane 0 of the scheduler warp waits for
@@ -78,7 +78,20 @@ cmake -S run/cpu_proxy -B run/cpu_proxy/build
 cmake --build run/cpu_proxy/build -j
 ```
 
-Then run, for example:
+Single-buffer gather is the default and uses `--tokens` and `--routes`:
+
+```bash
+python run/hopper_stream_gather_table_gemm.py --proxy-mode thread \
+    --tokens 4096 --routes 8195 --hidden 4096 --output-dim 4096 --experts 8 \
+    --flush-entries 2 --flush-interval-us 10
+```
+
+Both proxy modes also support `--activation` and `--down-projection` in single-buffer
+mode. Rebuild both proxy artifacts after updating from a multi-buffer-only version.
+The `--num-input-buffers`, `--tokens-per-buffer`, and `--routes-per-buffer` options
+apply only with `--multi-buffer-gather`.
+
+For multiple buffers:
 
 ```bash
 python run/hopper_stream_gather_table_gemm.py --multi-buffer-gather \
