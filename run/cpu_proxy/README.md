@@ -40,3 +40,13 @@ A buffer count of one emits `[expert, route_start, route_end, cid_n_base]` rows.
 Larger counts emit `[expert, cid_n_base, start_0, end_0, ...]` rows. The Python
 runner selects the format from `--multi-buffer-gather` and passes the effective
 buffer count to either frontend.
+
+With `--indexed-gather`, single-buffer rows instead have `2 + tile_m * cluster_m`
+columns: `[expert, cid_n_base, token_0, ...]`, with unused token slots set to `-1`.
+All N groups for an M cluster are consecutive. Python appends the original
+unpadded int32 routing vector after the ready flag in the shared device allocation
+(`[table | ready flag | routing indices]`). Both frontends copy this vector to the
+host once during initialization and construct the pinned table themselves.
+This setup copy is outside the timed streaming loop. The four-column range format
+and the existing thread API remain unchanged. Rebuild both artifacts to use the
+new table format.

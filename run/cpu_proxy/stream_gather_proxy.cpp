@@ -57,6 +57,10 @@ struct Options {
   bool balanced = false;
   bool round_robin = false;
   std::string flag_mode;
+
+  // Match the kernel's format selection. Indexed rows have one slot per
+  // M-cluster token; the four-column single-buffer format holds route ranges.
+  bool indexed_gather() const { return num_input_buffers == 1 && table_width != 4; }
 };
 
 void validate_options(const Options& options) {
@@ -67,8 +71,14 @@ void validate_options(const Options& options) {
       options.entries_per_flush <= 0 || options.interval_us < 0) {
     throw std::runtime_error("table and flush dimensions must be positive (interval may be zero)");
   }
-  if (options.table_width != 2 + 2 * options.num_input_buffers) {
+  const int expected_width = options.indexed_gather()
+                                 ? 2 + options.tile_m * options.cluster_m
+                                 : 2 + 2 * options.num_input_buffers;
+  if (options.table_width != expected_width) {
     throw std::runtime_error("table width does not match the gather row format");
+  }
+  if (options.indexed_gather() && (options.balanced || options.round_robin)) {
+    throw std::runtime_error("indexed gather does not support balanced or round-robin scheduling");
   }
   if (options.flag_mode != "memcpy" && options.flag_mode != "stream-write") {
     throw std::runtime_error("--flag-mode must be memcpy or stream-write");
@@ -260,7 +270,12 @@ struct PinnedTable {
   int width = 0;
 };
 
-PinnedTable build_table(const Options& options) {
+PinnedTable build_table(const Options& options,
+                        const std::vector<std::int32_t>& token_indices = {}) {
+  if (options.indexed_gather() &&
+      token_indices.size() != static_cast<std::size_t>(options.routes_per_buffer)) {
+    throw std::runtime_error("indexed gather requires one token index per route");
+  }
   const int base = options.routes_per_buffer / options.experts;
   const int remainder = options.routes_per_buffer % options.experts;
   std::vector<std::vector<int>> counts(options.num_input_buffers,
@@ -335,7 +350,12 @@ PinnedTable build_table(const Options& options) {
   auto emit = [&](int expert, int n_group, const Ranges& ranges) {
     auto* row = table.data + cursor * table.width;
     row[0] = expert;
-    if (options.num_input_buffers == 1) {
+    if (options.indexed_gather()) {
+      row[1] = n_group * group_size;
+      std::fill_n(row + 2, cluster_rows, -1);
+      std::copy(token_indices.begin() + ranges[0].first,
+                token_indices.begin() + ranges[0].second, row + 2);
+    } else if (options.num_input_buffers == 1) {
       // Single-buffer scheduler: [expert, route_start, route_end, cid_n_base].
       row[1] = ranges[0].first;
       row[2] = ranges[0].second;
@@ -350,7 +370,17 @@ PinnedTable build_table(const Options& options) {
     ++cursor;
   };
 
-  if (options.round_robin) {
+  if (options.indexed_gather()) {
+    // The indexed scheduler derives the output tile from row / num_n_groups.
+    // Keep all N groups for each M cluster adjacent, in expert order.
+    for (int expert = 0; expert < options.experts; ++expert) {
+      for (const auto& ranges : cluster_ranges[expert]) {
+        for (int n_group = 0; n_group < num_n_groups; ++n_group) {
+          emit(expert, n_group, ranges);
+        }
+      }
+    }
+  } else if (options.round_robin) {
     std::size_t max_clusters = 0;
     for (const auto& expert_ranges : cluster_ranges) {
       max_clusters = std::max(max_clusters, expert_ranges.size());
@@ -417,7 +447,17 @@ class FlushProxy {
   }
 
   void initialize() {
-    table_ = build_table(options_);
+    std::vector<std::int32_t> token_indices;
+    if (options_.indexed_gather()) {
+      // Allocation layout supplied by Python: [table | ready flag | raw indices].
+      // This one-time setup copy is outside the measured flush/GEMM loop.
+      token_indices.resize(options_.routes_per_buffer);
+      check_cuda(cudaMemcpy(token_indices.data(), device_ready_ + 1,
+                             token_indices.size() * sizeof(std::int32_t),
+                             cudaMemcpyDeviceToHost),
+                 "cudaMemcpy(indexed gather routing)");
+    }
+    table_ = build_table(options_, token_indices);
     check_cuda(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "cudaStreamCreate");
     batches_ = (table_.rows + options_.entries_per_flush - 1) / options_.entries_per_flush;
     if (options_.flag_mode == "memcpy") {

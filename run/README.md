@@ -100,6 +100,22 @@ python run/hopper_stream_gather_table_gemm.py --multi-buffer-gather \
     --flush-entries 2 --flush-interval-us 10 --flag-update-mode memcpy
 ```
 
+For single-buffer indexed gather, add `--indexed-gather`:
+
+```bash
+python run/hopper_stream_gather_table_gemm.py --indexed-gather --proxy-mode thread \
+    --tokens 4096 --routes 8195 --hidden 4096 --output-dim 8192 \
+    --tile-m 128 --tile-n 128 --pingpong \
+    --flush-entries 50 --flush-interval-us 5
+```
+
+Indexed mode works with both proxy modes and with activation/down projection.
+It streams `[expert, n_base, token_0, ...]` rows with `tile_m * cluster_m`
+token slots and `-1` tail padding. Output is padded per expert to whole M clusters;
+padding starts at zero for the down projection. It cannot be combined with
+`--multi-buffer-gather`, balanced allocation, or round-robin scheduling.
+Rebuild the proxy executable and shared library after updating the sources.
+
 To run the C++ producer on a worker thread in the Python process, add:
 
 ```bash

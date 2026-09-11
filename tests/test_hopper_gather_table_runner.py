@@ -208,10 +208,12 @@ def test_stream_proxy_uses_gated_gemm_width_instead_of_postactivation_width():
         balanced_multi_buffer_gather=True,
         round_robin_m_clusters=False,
         flag_update_mode="memcpy",
+        indexed_gather=False,
     )
     inputs = SimpleNamespace(
         work_table=torch.empty((7, 8), dtype=torch.int32),
         W=torch.empty((args.experts, 64, 2 * args.output_dim)),
+        route_offsets=((0, 4, 8, 12, 16, 19),) * args.num_input_buffers,
     )
 
     command = proxy_command(args, inputs, "00" * 64, 0)
@@ -269,6 +271,7 @@ def test_indexed_table_numerical_mapping():
 def test_indexed_and_legacy_modes_use_identical_inputs():
     """The flag changes route encoding, preserving each tile's tokens and GEMM values."""
     from run.hopper_gather_table_gemm import make_arg_parser, prepare_inputs
+    from run.hopper_stream_gather_table_gemm import prepare_inputs as prepare_stream_inputs
 
     args = make_arg_parser(include_down_projection=True).parse_args([])
     args.tokens, args.routes, args.experts = 17, 29, 3
@@ -285,6 +288,19 @@ def test_indexed_and_legacy_modes_use_identical_inputs():
         args.indexed_gather = True
         torch.manual_seed(42)
         indexed = prepare_inputs(args, device)
+        torch.manual_seed(42)
+        streamed, ready_rows, backing = prepare_stream_inputs(args, device)
+        for name in ("X", "W", "W_down", "A_idx", "cu_seqlens_m", "up_output"):
+            torch.testing.assert_close(
+                getattr(streamed, name), getattr(indexed, name), atol=0, rtol=0
+            )
+        assert streamed.route_offsets == indexed.route_offsets
+        assert streamed.output_segments == indexed.output_segments
+        assert streamed.work_table.shape == indexed.work_table.shape
+        torch.testing.assert_close(ready_rows, torch.zeros_like(ready_rows), atol=0, rtol=0)
+        torch.testing.assert_close(
+            backing[streamed.work_table.numel() + 1 :], legacy.A_idx, atol=0, rtol=0
+        )
         torch.testing.assert_close(indexed.X, legacy.X, atol=0, rtol=0)
         torch.testing.assert_close(indexed.W, legacy.W, atol=0, rtol=0)
         torch.testing.assert_close(indexed.W_down, legacy.W_down, atol=0, rtol=0)
@@ -311,3 +327,7 @@ def test_indexed_and_legacy_modes_use_identical_inputs():
                 expert, :, n_start:n_end
             ].float()
             torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+            streamed_result = streamed.X[
+                streamed.A_idx[output_start : output_start + count].long()
+            ].float() @ streamed.W[expert, :, n_start:n_end].float()
+            torch.testing.assert_close(streamed_result, reference, atol=0, rtol=0)

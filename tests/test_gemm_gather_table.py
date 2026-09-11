@@ -338,3 +338,40 @@ def test_indexed_gather_reads_table_tokens(activation, cluster_m, pingpong, dtyp
     )
     if args.down_projection:
         check_down_correctness(inputs, atol=3e-2, rtol=1e-3)
+
+
+@pytest.mark.parametrize("proxy_mode", ["thread", "process"])
+@pytest.mark.parametrize(
+    ("routes", "extra_args"),
+    [(2, []), (773, ["--pingpong"]),
+     (773, ["--pingpong", "--activation", "swiglu", "--down-projection"])],
+)
+def test_stream_indexed_gather_proxy(proxy_mode, routes, extra_args):
+    """Exercise proxy-built indexed rows, readiness waits, and numerical references."""
+    from pathlib import Path
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parents[1]
+    artifact = root / "run/cpu_proxy/build" / (
+        "libstream_gather_proxy_thread.so" if proxy_mode == "thread" else "stream_gather_proxy"
+    )
+    if not artifact.is_file():
+        pytest.skip("build run/cpu_proxy on Hopper before running proxy integration tests")
+    result = subprocess.run(
+        [
+            sys.executable, str(root / "run/hopper_stream_gather_table_gemm.py"),
+            "--indexed-gather", "--proxy-mode", proxy_mode,
+            "--tokens", "512", "--routes", str(routes), "--experts", "3",
+            "--hidden", "64", "--output-dim", "512",
+            "--tile-m", "128", "--tile-n", "128", "--cluster-m", "2",
+            "--max-swizzle-size", "2", "--warmup", "1", "--iterations", "2",
+            "--timing-samples", "1", "--flush-entries", "1", "--flush-interval-us", "10",
+            *extra_args,
+        ],
+        cwd=root, capture_output=True, text=True, timeout=300,
+    )
+    # The runner compares GEMM values against float32 PyTorch references;
+    # the SwiGLU case additionally verifies the padded grouped down projection.
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Reference check: PASSED" in result.stdout

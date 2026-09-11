@@ -69,6 +69,11 @@ def parse_args() -> argparse.Namespace:
         include_down_projection=True,
     )
     parser.add_argument(
+        "--indexed-gather",
+        action="store_true",
+        help="Stream single-buffer rows containing direct token indices and -1 tail padding",
+    )
+    parser.add_argument(
         "--flush-entries",
         type=int,
         default=1,
@@ -253,16 +258,46 @@ def prepare_inputs(
         idx_buffers.append(A_idx_j)
     A_idx = tuple(idx_buffers)
 
-    table_width = 2 + 2 * num_buffers
+    cluster_rows = args.tile_m * args.cluster_m
+    table_width = 2 + cluster_rows if args.indexed_gather else 2 + 2 * num_buffers
     # A single allocation avoids opening the same CUDA IPC allocation twice if
     # PyTorch suballocates the table and flag from one caching-allocator segment.
     table_elements = table_rows * table_width
-    ipc_backing = torch.empty(table_elements + 1, dtype=torch.int32, device=device)
+    # Indexed mode appends the original, unpadded routing vector after the flag.
+    # Both proxies read it once during initialization, before any timed launch.
+    ipc_backing = torch.empty(
+        table_elements + 1 + (routes if args.indexed_gather else 0),
+        dtype=torch.int32, device=device,
+    )
     work_table = ipc_backing[:table_elements].view(table_rows, table_width)
-    ready_rows = ipc_backing[table_elements:]
+    ready_rows = ipc_backing[table_elements : table_elements + 1]
     ready_rows.zero_()
     total_routes = num_buffers * routes
-    up_output = torch.empty(
+    if args.indexed_gather:
+        ipc_backing[table_elements + 1 :].copy_(A_idx[0])
+        padded_offsets = [0]
+        for count in counts_by_buffer[0]:
+            padded_offsets.append(
+                padded_offsets[-1] + math.ceil(count / cluster_rows) * cluster_rows
+            )
+        padded_indices = torch.full(
+            (padded_offsets[-1],), -1, dtype=torch.int32, device=device
+        )
+        for expert, count in enumerate(counts_by_buffer[0]):
+            source_start = route_offsets[0][expert]
+            start = padded_offsets[expert]
+            padded_indices[start : start + count].copy_(
+                A_idx[0][source_start : source_start + count]
+            )
+        A_idx = (padded_indices,)
+        route_offsets = (tuple(padded_offsets),)
+        output_segments = tuple(
+            (expert, 0, padded_offsets[expert], padded_offsets[expert + 1])
+            for expert in range(args.experts)
+        )
+        total_routes = padded_offsets[-1]
+    allocate_up = torch.zeros if args.indexed_gather else torch.empty
+    up_output = allocate_up(
         (total_routes, args.output_dim), dtype=dtype, device=device
     )
     output = (
@@ -274,7 +309,7 @@ def prepare_inputs(
     if args.down_projection:
         cumulative_routes = [0]
         for expert in range(args.experts):
-            count = sum(counts[expert] for counts in counts_by_buffer)
+            count = sum(offsets[expert + 1] - offsets[expert] for offsets in route_offsets)
             cumulative_routes.append(cumulative_routes[-1] + count)
         assert cumulative_routes[-1] == total_routes
         cu_seqlens_m = torch.tensor(cumulative_routes, dtype=torch.int32, device=device)
@@ -476,7 +511,7 @@ def proxy_command(
     allocation_offset_bytes: int,
 ) -> list[str]:
     table_bytes = inputs.work_table.numel() * inputs.work_table.element_size()
-    routes = inputs.route_offsets[0][-1]
+    routes = args.routes if args.indexed_gather else inputs.route_offsets[0][-1]
     return [
         str(args.proxy_binary.resolve()),
         "--device",
@@ -676,7 +711,7 @@ class ThreadProxy:
         destroy.argtypes = [ctypes.c_void_p]
         destroy.restype = None
 
-        routes = inputs.route_offsets[0][-1]
+        routes = args.routes if args.indexed_gather else inputs.route_offsets[0][-1]
         error = ctypes.create_string_buffer(self.ERROR_CAPACITY)
         handle = create(
             args.device,
@@ -762,7 +797,7 @@ def main() -> None:
     print(
         f"X buffers: {len(X_buffers)} x {tuple(X_buffers[0].shape)}, "
         f"W_up: {tuple(inputs.W.shape)}, dtype: {X_buffers[0].dtype}, "
-        f"multi-buffer={args.multi_buffer_gather}"
+        f"multi-buffer={args.multi_buffer_gather}, indexed-gather={args.indexed_gather}"
     )
     if inputs.W_down is not None:
         assert inputs.up_output is not None
@@ -772,7 +807,7 @@ def main() -> None:
         )
     else:
         print(f"Output: {tuple(inputs.output.shape)}, down projection: disabled")
-    print(f"Routes per expert by buffer: {counts}")
+    print(f"{'Padded routes' if args.indexed_gather else 'Routes'} per expert by buffer: {counts}")
     print(
         f"Work table: {tuple(inputs.work_table.shape)}, x={inputs.work_group_size}, "
         f"expanded work IDs={inputs.work_table.shape[0] * inputs.work_group_size}"
@@ -825,10 +860,11 @@ def main() -> None:
             ]
             timings_ms.append(statistics.mean(launches_ms))
         median_ms = statistics.median(timings_ms)
-        total_routes = inputs.output.shape[0]
+        total_routes = args.routes if args.indexed_gather else inputs.output.shape[0]
         up_flops = 2 * total_routes * args.hidden * inputs.W.shape[-1]
         down_flops = (
-            2 * total_routes * args.output_dim * args.hidden if args.down_projection else 0
+            2 * inputs.output.shape[0] * args.output_dim * args.hidden
+            if args.down_projection else 0
         )
         tflops = (up_flops + down_flops) / (median_ms * 1e9)
         operation_name = (
