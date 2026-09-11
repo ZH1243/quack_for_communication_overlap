@@ -233,3 +233,81 @@ def test_cuda_ipc_handle_validation_rejects_expandable_segments():
         assert "expandable segments" in str(error)
     else:
         raise AssertionError("expandable-segment IPC handle was accepted")
+
+
+def test_indexed_table_numerical_mapping():
+    """Decode the table independently and compare GEMM values with route order."""
+    from run.hopper_gather_table_gemm import build_indexed_work_table
+
+    torch.manual_seed(42)
+    counts = [5, 0, 9]
+    indices = torch.tensor([7, 1, 7, 0, 9, 3, 8, 2, 6, 1, 0, 4, 9, 2], dtype=torch.int32)
+    X, W = torch.randn(10, 3), torch.randn(3, 3, 11)
+    table, padded, offsets, x = build_indexed_work_table(
+        counts, indices, output_dim=11, tile_m=2, tile_n=2, cluster_m=2,
+        max_swizzle_size=2, device=torch.device("cpu"),
+    )
+    actual = torch.zeros(padded.numel(), 11)
+    num_n_groups = 3
+    for q, row in enumerate(table.tolist()):
+        expert, cid_n, *tokens = row
+        output_start = q // num_n_groups * 4
+        n_start, n_end = cid_n * 2, min((cid_n + x) * 2, 11)
+        for m, token in enumerate(tokens):
+            if token >= 0:
+                actual[output_start + m, n_start:n_end] = X[token] @ W[expert, :, n_start:n_end]
+    source_start = 0
+    expected = torch.zeros_like(actual)
+    for expert, count in enumerate(counts):
+        expected[offsets[0][expert] : offsets[0][expert] + count] = (
+            X[indices[source_start : source_start + count].long()] @ W[expert]
+        )
+        source_start += count
+    torch.testing.assert_close(actual, expected)
+
+
+def test_indexed_and_legacy_modes_use_identical_inputs():
+    """The flag changes route encoding, preserving each tile's tokens and GEMM values."""
+    from run.hopper_gather_table_gemm import make_arg_parser, prepare_inputs
+
+    args = make_arg_parser(include_down_projection=True).parse_args([])
+    args.tokens, args.routes, args.experts = 17, 29, 3
+    args.hidden, args.output_dim = 8, 11
+    args.tile_m, args.cluster_m, args.tile_n = 2, 2, 2
+    args.max_swizzle_size = 2
+    args.activation, args.down_projection = "relu", True
+    device = torch.device("cpu")
+    for replacement in (False, True):
+        args.routing_with_replacement = replacement
+        args.indexed_gather = False
+        torch.manual_seed(42)
+        legacy = prepare_inputs(args, device)
+        args.indexed_gather = True
+        torch.manual_seed(42)
+        indexed = prepare_inputs(args, device)
+        torch.testing.assert_close(indexed.X, legacy.X, atol=0, rtol=0)
+        torch.testing.assert_close(indexed.W, legacy.W, atol=0, rtol=0)
+        torch.testing.assert_close(indexed.W_down, legacy.W_down, atol=0, rtol=0)
+
+        cluster_rows = args.tile_m * args.cluster_m
+        num_n_groups = 3
+        for expert, route_start, route_end, cid_n in legacy.work_table.tolist():
+            local_start = route_start - legacy.route_offsets[0][expert]
+            output_start = indexed.route_offsets[0][expert] + local_start
+            q = output_start // cluster_rows * num_n_groups + cid_n // legacy.work_group_size
+            row = indexed.work_table[q]
+            count = route_end - route_start
+            expected_indices = legacy.A_idx[route_start:route_end]
+            torch.testing.assert_close(row[2 : 2 + count], expected_indices, atol=0, rtol=0)
+            torch.testing.assert_close(
+                row[2 + count:], torch.full_like(row[2 + count:], -1), atol=0, rtol=0
+            )
+            n_start = cid_n * args.tile_n
+            n_end = min(n_start + legacy.work_group_size * args.tile_n, args.output_dim)
+            actual = indexed.X[row[2 : 2 + count].long()].float() @ indexed.W[
+                expert, :, n_start:n_end
+            ].float()
+            reference = legacy.X[expected_indices.long()].float() @ legacy.W[
+                expert, :, n_start:n_end
+            ].float()
+            torch.testing.assert_close(actual, reference, atol=0, rtol=0)

@@ -293,6 +293,7 @@ def make_fake_scheduler_args(
     has_gather_table=False,
     has_gather_table_ready=False,
     gather_table_num_buffers=1,
+    gather_table_width=4,
     multi_buffer_gather=None,
 ):
     return TileSchedulerOptions(
@@ -325,13 +326,16 @@ def make_fake_scheduler_args(
                 Int32,
                 (
                     cute.sym_int(),
-                    4 if gather_table_num_buffers == 1 else 2 + 2 * gather_table_num_buffers,
+                    gather_table_width
+                    if gather_table_num_buffers == 1
+                    else 2 + 2 * gather_table_num_buffers,
                 ),
                 leading_dim=1,
-                # Rows are 4 Int32 wide in legacy mode and 2 + 2*b wide in
-                # multi-buffer mode. Even b therefore guarantees only
-                # 2-element divisibility (for example b=32 => 66).
-                divisibility=4 if gather_table_num_buffers % 2 else 2,
+                # Indexed rows have C + 2 elements, hence only 8-byte alignment.
+                divisibility=(
+                    2 if gather_table_num_buffers == 1 and gather_table_width != 4
+                    else (4 if gather_table_num_buffers % 2 else 2)
+                ),
             )
             if has_gather_table
             else None

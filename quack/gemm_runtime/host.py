@@ -104,6 +104,7 @@ def _compile_gemm_epi(
     gather_table,
     has_gather_table_ready,
     gather_table_num_buffers,
+    gather_table_width,
     batched,
     b_kn,
     epi_keys,  # ((op_name, op.host_arg_key(value)), ...) — name-sorted
@@ -241,6 +242,7 @@ def _compile_gemm_epi(
         has_gather_table=gather_table,
         has_gather_table_ready=has_gather_table_ready,
         gather_table_num_buffers=gather_table_num_buffers,
+        gather_table_width=gather_table_width,
         multi_buffer_gather=multi_buffer_gather,
     )
     mSFA = make_fake_sf_tensor(sf_dtype, l if sf_batched else None) if sf_dtype else None
@@ -360,6 +362,7 @@ def build_gemm_epi_plan(
     gather_table=False,
     has_gather_table_ready=False,
     gather_table_num_buffers=1,
+    gather_table_width=4,
     b_kn=False,
     swap_ab=False,  # swap-at-trace: slot tensors in, caller-oriented D/C
     use_tma_gather=False,
@@ -469,6 +472,7 @@ def build_gemm_epi_plan(
         gather_table,
         has_gather_table_ready,
         gather_table_num_buffers,
+        gather_table_width,
         batched,
         b_kn,
         epi_keys,

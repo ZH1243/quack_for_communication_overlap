@@ -19,6 +19,15 @@ Tensor shapes:
     up_output:         [R, N]
     output:            [R, N], or [R, K] with --down-projection
 
+With ``--indexed-gather`` (single-buffer only), rows instead contain
+``(expert_id, cid_n_base, token_idx_0, ..., token_idx_{C-1})``, where
+``C = tile_m * cluster_m``. Indices directly address X, bypassing A_idx.
+Each M-cluster has consecutive N-group rows in increasing cid_n_base order.
+The output reserves C rows per M-cluster; partial tiles use trailing -1
+indices and leave output padding untouched. The runner initializes padding
+to zero, including for the optional down projection. A_idx remains a padded
+reference/sizing vector, and is not read by the indexed kernel.
+
 With ``--multi-buffer-gather``, the kernel reads separately allocated token
 and route-index buffers without materializing their concatenation:
 
@@ -172,7 +181,13 @@ def make_arg_parser(
 
 
 def parse_args() -> argparse.Namespace:
-    return make_arg_parser(include_down_projection=True).parse_args()
+    parser = make_arg_parser(include_down_projection=True)
+    parser.add_argument(
+        "--indexed-gather",
+        action="store_true",
+        help="Single-buffer table with direct token indices and -1 tail padding",
+    )
+    return parser.parse_args()
 
 
 def route_counts(total_routes: int, experts: int) -> list[int]:
@@ -230,6 +245,8 @@ def validate_args(args: argparse.Namespace) -> None:
         routes = args.routes
     if tokens <= 0 or routes <= 0:
         raise ValueError("tokens-per-buffer and routes-per-buffer must be positive")
+    if getattr(args, "indexed_gather", False) and args.multi_buffer_gather:
+        raise ValueError("--indexed-gather is only supported in single-buffer mode")
     if args.multi_buffer_gather and args.num_input_buffers < 2:
         raise ValueError("num-input-buffers must be at least 2 in multi-buffer mode")
     if args.balanced_multi_buffer_gather and not args.multi_buffer_gather:
@@ -292,6 +309,58 @@ def build_work_table(
 
     table = torch.tensor(rows, dtype=torch.int32, device=device)
     return table, (tuple(route_offsets),), x
+
+
+def build_indexed_work_table(
+    counts: list[int],
+    token_indices: torch.Tensor,
+    *,
+    output_dim: int,
+    tile_m: int,
+    tile_n: int,
+    cluster_m: int,
+    max_swizzle_size: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, tuple[tuple[int, ...], ...], int]:
+    """Expand the legacy A_idx route ranges into direct X indices.
+
+    Each tile copies token_indices[route_start:route_end], using exactly the
+    same route ranges as build_work_table. No tokens are sampled here. N groups
+    are reordered into consecutive M-major bundles for the indexed scheduler.
+    Output tile i occupies [i * cluster_rows, (i + 1) * cluster_rows).
+    Partial tiles have trailing -1 indices; their output padding is not written.
+    The padded index vector is retained for output sizing and reference checks
+    only. The kernel loads indices directly from the work table.
+    """
+    cluster_rows = tile_m * cluster_m
+    clusters_n = math.ceil(output_dim / tile_n)
+    x = min(max_swizzle_size, clusters_n)
+    if clusters_n % x:
+        raise ValueError("indexed gather requires clusters_n divisible by the work group size")
+    num_n_groups = clusters_n // x
+    offsets = [0]
+    for count in counts:
+        offsets.append(offsets[-1] + math.ceil(count / cluster_rows) * cluster_rows)
+    padded_indices = torch.full((offsets[-1],), -1, dtype=torch.int32, device=device)
+    table = torch.full(
+        (offsets[-1] // cluster_rows * num_n_groups, 2 + cluster_rows),
+        -1, dtype=torch.int32, device=device,
+    )
+    source_start = 0
+    for expert, count in enumerate(counts):
+        start = offsets[expert]
+        padded_indices[start : start + count] = token_indices[source_start : source_start + count]
+        for output_start in range(start, offsets[expert + 1], cluster_rows):
+            route_start = source_start + output_start - start
+            route_end = min(route_start + cluster_rows, source_start + count)
+            tile_indices = token_indices[route_start:route_end]
+            first_row = output_start // cluster_rows * num_n_groups
+            for n_group in range(num_n_groups):
+                table[first_row + n_group, 0] = expert
+                table[first_row + n_group, 1] = n_group * x
+                table[first_row + n_group, 2 : 2 + route_end - route_start] = tile_indices
+        source_start += count
+    return table, padded_indices, (tuple(offsets),), x
 
 
 def build_multi_buffer_work_table(
@@ -507,22 +576,33 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> TableGathe
                 indices = torch.randperm(args.tokens, dtype=torch.int32, device=device)[:count]
             A_idx[offset : offset + count].copy_(indices)
             offset += count
-        work_table, offsets, x = build_work_table(
-            counts,
-            output_dim=gemm_output_dim,
-            tile_m=args.tile_m,
-            tile_n=args.tile_n,
-            cluster_m=args.cluster_m,
-            max_swizzle_size=args.max_swizzle_size,
-            device=device,
-        )
+        # Both modes consume the same X, W, and sampled A_idx. Indexed mode
+        # only embeds those routes in the table and pads the output layout.
+        if getattr(args, "indexed_gather", False):
+            work_table, A_idx, offsets, x = build_indexed_work_table(
+                counts, A_idx, output_dim=gemm_output_dim,
+                tile_m=args.tile_m, tile_n=args.tile_n, cluster_m=args.cluster_m,
+                max_swizzle_size=args.max_swizzle_size, device=device,
+            )
+            counts = [end - start for start, end in zip(offsets[0][:-1], offsets[0][1:])]
+        else:
+            work_table, offsets, x = build_work_table(
+                counts,
+                output_dim=gemm_output_dim,
+                tile_m=args.tile_m,
+                tile_n=args.tile_n,
+                cluster_m=args.cluster_m,
+                max_swizzle_size=args.max_swizzle_size,
+                device=device,
+            )
         output_segments = tuple(
             (expert, 0, offsets[0][expert], offsets[0][expert + 1])
             for expert in range(args.experts)
         )
         down_counts = counts
-        total_routes = args.routes
-    up_output = torch.empty((total_routes, args.output_dim), dtype=dtype, device=device)
+        total_routes = A_idx.shape[0]
+    allocate_up = torch.zeros if getattr(args, "indexed_gather", False) else torch.empty
+    up_output = allocate_up((total_routes, args.output_dim), dtype=dtype, device=device)
     output = (
         torch.empty((total_routes, args.hidden), dtype=dtype, device=device)
         if args.down_projection
@@ -687,13 +767,18 @@ def check_correctness(
         if start == end:
             continue
         X_j, A_idx_j = X_buffers[buffer_idx], idx_buffers[buffer_idx]
-        reference = X_j[A_idx_j[start:end].long()].float() @ inputs.W[expert].float()
+        valid = A_idx_j[start:end] >= 0
+        indices = A_idx_j[start:end][valid].long()
+        if indices.numel() == 0:
+            output_offset += end - start
+            continue
+        reference = X_j[indices].float() @ inputs.W[expert].float()
         if activation in GATED_ACTIVATIONS:
             gate, up = reference.chunk(2, dim=-1)
             reference = gated_to_pytorch_fn_map[activation](gate, up)
         elif activation is not None:
             reference = act_to_pytorch_fn_map[activation](reference)
-        actual = up_output[output_offset : output_offset + end - start]
+        actual = up_output[output_offset : output_offset + end - start][valid]
         abs_error = (actual.float() - reference).abs().max().item()
         max_abs_error = max(max_abs_error, abs_error)
         if activation is None:
@@ -701,7 +786,7 @@ def check_correctness(
             torch.testing.assert_close(actual, reference_out, atol=atol, rtol=rtol)
             allowed_error = atol + rtol * reference_out.float().abs().max().item()
         else:
-            baseline = X_j[A_idx_j[start:end].long()] @ inputs.W[expert]
+            baseline = X_j[indices] @ inputs.W[expert]
             if activation in GATED_ACTIVATIONS:
                 gate, up = baseline.chunk(2, dim=-1)
                 baseline = gated_to_pytorch_fn_map[activation](gate, up)
@@ -802,7 +887,7 @@ def main() -> None:
     print(
         f"Kernel: tile=({args.tile_m}, {args.tile_n}, {args.tile_k or 'auto'}), "
         f"cluster=({args.cluster_m}, 1, 1), static persistent, table gather=cp.async, "
-        f"multi-buffer={args.multi_buffer_gather}, "
+        f"multi-buffer={args.multi_buffer_gather}, indexed-gather={args.indexed_gather}, "
         f"balanced-buffers={args.balanced_multi_buffer_gather}, "
         f"round-robin-m-clusters={args.round_robin_m_clusters}{down_description}"
     )
@@ -822,9 +907,11 @@ def main() -> None:
         use_cuda_graph=not args.no_cuda_graph,
     )
     median_ms = statistics.median(timings_ms)
-    total_routes = inputs.output.shape[0]
+    total_routes = (args.routes if args.indexed_gather else inputs.output.shape[0])
     up_flops = 2 * total_routes * args.hidden * inputs.W.shape[-1]
-    down_flops = 2 * total_routes * args.output_dim * args.hidden if args.down_projection else 0
+    down_flops = (
+        2 * inputs.output.shape[0] * args.output_dim * args.hidden if args.down_projection else 0
+    )
     tflops = (up_flops + down_flops) / (median_ms * 1e9)
     operation_name = "two-GEMM MLP" if args.down_projection else "up GEMM"
     print(f"Per-operation samples (ms): {[round(value, 4) for value in timings_ms]}")

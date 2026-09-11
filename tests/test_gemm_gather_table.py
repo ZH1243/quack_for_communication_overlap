@@ -292,3 +292,49 @@ def test_multi_buffer_gather_waits_for_table_ready_prefix():
         ]
     ).to(output.dtype)
     torch.testing.assert_close(output, reference, atol=3e-2, rtol=1e-3)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("dtype", ["bf16", "fp16"])
+@pytest.mark.parametrize(
+    ("activation", "cluster_m", "pingpong"),
+    [(None, 1, False), (None, 2, True), ("relu", 2, False), ("swiglu", 2, True)],
+)
+def test_indexed_gather_reads_table_tokens(activation, cluster_m, pingpong, dtype):
+    """Discrete/repeated tokens, N bundles, K tails, and partially empty M clusters."""
+    from run.hopper_gather_table_gemm import (
+        check_correctness,
+        check_down_correctness,
+        make_arg_parser,
+        make_launch,
+        prepare_inputs,
+        validate_args,
+    )
+
+    args = make_arg_parser(include_down_projection=True).parse_args([])
+    args.indexed_gather = True
+    args.tokens, args.routes, args.experts = 97, 421, 3
+    args.hidden, args.output_dim = 80, 768
+    args.tile_m, args.tile_n, args.cluster_m = 64, 128, cluster_m
+    args.max_swizzle_size = 2  # Multiple N groups per M cluster.
+    args.pingpong, args.activation, args.dtype = pingpong, activation, dtype
+    args.down_projection = activation is not None
+    args.routing_with_replacement = True
+    validate_args(args)
+    torch.manual_seed(42)
+    inputs = prepare_inputs(args, torch.device("cuda"))
+    reference_indices = inputs.A_idx.clone()
+    # A_idx must not be used for loading X in this mode. Poison it with an
+    # out-of-range value; restore the independent reference after the launch.
+    inputs.A_idx.fill_(args.tokens + 1000)
+    make_launch(args, inputs)()
+    torch.cuda.synchronize()
+    inputs.A_idx = reference_indices
+    check_correctness(inputs, activation=activation, atol=3e-2, rtol=1e-3)
+    torch.testing.assert_close(
+        inputs.up_output[reference_indices < 0],
+        torch.zeros_like(inputs.up_output[reference_indices < 0]),
+        atol=0, rtol=0,
+    )
+    if args.down_projection:
+        check_down_correctness(inputs, atol=3e-2, rtol=1e-3)

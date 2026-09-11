@@ -824,8 +824,15 @@ class EpiMod:
                 )
             if A.ndim != 2 or B.ndim != 3 or A_idx.ndim != 1:
                 raise ValueError("gather_work_table expects A[T,K], B[E,N,K], and A_idx[R]")
+            indexed_gather = (
+                gather_table_num_buffers == 1
+                and gather_work_table.ndim == 2
+                and gather_work_table.shape[1] != 4
+            )
             expected_width = (
-                4 if gather_table_num_buffers == 1 else 2 + 2 * gather_table_num_buffers
+                2 + tile_M * cluster_M
+                if indexed_gather
+                else (4 if gather_table_num_buffers == 1 else 2 + 2 * gather_table_num_buffers)
             )
             if (
                 gather_work_table.ndim != 2
@@ -903,6 +910,13 @@ class EpiMod:
                 raise ValueError(
                     f"gather_work_table requires clusters_n % x == 0, got {clusters_n} % {x}"
                 )
+            if indexed_gather:
+                num_n_groups = clusters_n // x
+                if gather_work_table.shape[0] % num_n_groups:
+                    raise ValueError("indexed gather requires complete consecutive N-group bundles")
+                padded_rows = gather_work_table.shape[0] // num_n_groups * tile_M * cluster_M
+                if A_idx.shape[0] != padded_rows:
+                    raise ValueError(f"indexed gather requires A_idx with {padded_rows} rows")
         # Kernel coords under swap-at-trace (and layout-owning transforms):
         # kernel m = caller n, kernel n = caller m. Shape checks on
         # D/C/outputs stay caller-oriented (the tensors cross natively; the
@@ -1215,6 +1229,7 @@ class EpiMod:
             gather_table=gather_table,
             has_gather_table_ready=gather_work_table_ready is not None,
             gather_table_num_buffers=gather_table_num_buffers,
+            gather_table_width=gather_work_table.shape[1] if gather_table else 4,
             # slot-A relabels via a_transposed (swap_ab); owned transforms
             # pass B (= caller A activations) natively (n, k)
             b_kn=b_kn and not swap_ab and owned_fmt is None,

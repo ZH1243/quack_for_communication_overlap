@@ -1661,7 +1661,16 @@ class GemmSm90(GemmTmaBase):
         varlen_m = varlen_manager.varlen_m
         if const_expr(self.gather_table and not self.multi_buffer_gather):
             route_start, route_end = tile_coord_mnkl[0], tile_coord_mnkl[2]
-            mAIdx_mk = cute.domain_offset((route_start,), varlen_manager.params.mAIdx)
+            if const_expr(tile_sched_params.work_table.shape[1] != 4):
+                cluster_rows = const_expr(tile_sched_params.work_table.shape[1] - 2)
+                table_idx = (
+                    route_start // cluster_rows * tile_sched_params.num_n_groups_fdd.divisor
+                    + tile_coord_mnkl[1] // tile_sched_params.group_size_fdd
+                )
+                token_indices = tile_sched_params.work_table[table_idx, None]
+                mAIdx_mk = cute.domain_offset((2 + route_start % cluster_rows,), token_indices)
+            else:
+                mAIdx_mk = cute.domain_offset((route_start,), varlen_manager.params.mAIdx)
             gAIdx = cute.local_tile(mAIdx_mk, (self.cta_tile_shape_mnk[0],), (0,))
             mA_mk = mA_mkl
         elif const_expr(not self.gather_table):

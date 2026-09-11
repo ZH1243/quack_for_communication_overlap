@@ -243,3 +243,43 @@ allowed to appear under different experts, as in top-k MoE routing.
 For more stable timing of short kernels, CUDA graphs are enabled by default.
 Use identical shapes, dtypes, kernel settings, and timing settings when
 comparing the two runners.
+
+### Direct token indices in the Hopper gather table
+
+`hopper_gather_table_gemm.py --indexed-gather` enables a single-buffer table of
+shape `int32[Q, 2 + tile_m * cluster_m]`. Each row is
+`(expert_id, cid_n_base, token_idx_0, ..., token_idx_{C-1})`, where
+`C = tile_m * cluster_m`. Token indices directly address `X[T, K]` and may be
+nonconsecutive or repeated. With the same `--seed` and other input options,
+both modes generate identical X, weights, and per-expert routing. Each indexed
+entry embeds exactly `A_idx[route_start:route_end]` from its corresponding legacy
+entry; enabling the flag does not resample tokens. Table ordering and output
+padding differ between modes. Valid indices must be in `[0, T)`; partial tiles
+have a valid prefix followed by `-1` padding.
+
+All N groups for an M-cluster must appear consecutively, in increasing
+`cid_n_base` order (`0, x, 2*x, ...`), where
+`x = min(max_swizzle_size, ceil(gemm_N / tile_n))`. These rows must carry the
+same expert and token indices. M-cluster bundle `i` writes into output rows
+`[i*C, (i+1)*C)`; padding rows are untouched. The runner initializes padding
+to zero and keeps experts consecutive for the optional down projection.
+For gated activations, `gemm_N` is the preactivation width, twice `output_dim`.
+
+The Python GEMM APIs select this format by its table width. They still require
+an `A_idx` vector with the padded output length for sizing, but the kernel does
+not read its values. The runner keeps it for reference checks.
+`--indexed-gather` cannot be combined with `--multi-buffer-gather`. Without
+this flag, the existing four-column table and packed output behavior remain.
+
+```bash
+python run/hopper_gather_table_gemm.py --indexed-gather \
+    --tokens 257 --routes 421 --experts 3 --hidden 80 --output-dim 768 \
+    --tile-m 64 --tile-n 128 --cluster-m 2 --max-swizzle-size 2 --pingpong
+
+python run/hopper_gather_table_gemm.py --indexed-gather \
+    --tokens 257 --routes 421 --experts 3 --hidden 80 --output-dim 768 \
+    --tile-m 64 --tile-n 128 --cluster-m 2 --max-swizzle-size 2 --pingpong \
+    --activation swiglu --down-projection
+
+pytest tests/test_gemm_gather_table.py -k indexed_gather -x
+```

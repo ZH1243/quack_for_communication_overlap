@@ -74,6 +74,7 @@ def _compile_gemm(
     gather_table,
     has_gather_table_ready,
     gather_table_num_buffers,
+    gather_table_width,
     use_tma_gather,
     has_batch_idx_permute,
     device_capacity,
@@ -206,6 +207,7 @@ def _compile_gemm(
         has_gather_table=gather_table,
         has_gather_table_ready=has_gather_table_ready,
         gather_table_num_buffers=gather_table_num_buffers,
+        gather_table_width=gather_table_width,
         multi_buffer_gather=multi_buffer_gather,
     )
     if sf_dtype is not None:
@@ -473,6 +475,11 @@ def gemm(
     # [Q, 4] rows containing (expert_id, route_start, route_end, cid_n_base).
     # See multi_buffer_gather below for the opt-in wider row format. Each row
     # expands to min(max_swizzle_size, ceil(N / tile_N)) AlongN work IDs.
+    # Single-buffer int32[Q, 2 + tile_M * cluster_M] selects direct X indices:
+    # (expert_id, cid_n_base, token_idx_0, ...), with trailing -1 padding.
+    # Consecutive N-group rows form one M-cluster bundle. Bundle i writes to
+    # D[i*C:(i+1)*C], C=tile_M*cluster_M; padding is untouched. A_idx is still
+    # required for output sizing (length D.shape[0]), but its values are unused.
     gather_work_table: Optional[Tensor] = None,
     # Opt-in Hopper table gather from separately allocated A/A_idx buffers.
     # When enabled, A and A_idx are tuples of equal length b >= 2. The table
@@ -847,8 +854,15 @@ def _build_gemm_plan(
             raise ValueError("gather_work_table does not support split_k")
         if A.ndim != 2 or B.ndim != 3 or D.ndim != 2 or A_idx.ndim != 1:
             raise ValueError("gather_work_table expects A[T,K], B[E,N,K], D[R,N], A_idx[R]")
+        indexed_gather = (
+            gather_table_num_buffers == 1
+            and gather_work_table.ndim == 2
+            and gather_work_table.shape[1] != 4
+        )
         expected_table_width = (
-            4 if gather_table_num_buffers == 1 else 2 + 2 * gather_table_num_buffers
+            2 + tile_M * cluster_M
+            if indexed_gather
+            else (4 if gather_table_num_buffers == 1 else 2 + 2 * gather_table_num_buffers)
         )
         if gather_work_table.ndim != 2 or gather_work_table.shape[1] != expected_table_width:
             raise ValueError(
@@ -917,6 +931,13 @@ def _build_gemm_plan(
                 f"gather_work_table requires clusters_n % x == 0, got clusters_n="
                 f"{clusters_n}, x={work_group_size}"
             )
+        if indexed_gather:
+            num_n_groups = clusters_n // work_group_size
+            if gather_work_table.shape[0] % num_n_groups:
+                raise ValueError("indexed gather requires complete consecutive N-group bundles")
+            padded_rows = gather_work_table.shape[0] // num_n_groups * tile_M * cluster_M
+            if total_routes != padded_rows:
+                raise ValueError(f"indexed gather requires A_idx and D with {padded_rows} rows")
         if gather_work_table.shape[0] == 0:
             raise ValueError("gather_work_table must contain at least one row")
     if has_ag:
@@ -1138,6 +1159,7 @@ def _build_gemm_plan(
         gather_table,
         gather_work_table_ready is not None,
         gather_table_num_buffers,
+        gather_work_table.shape[1] if gather_table else 4,
         use_tma_gather,
         batch_idx_permute is not None,
         device_capacity,

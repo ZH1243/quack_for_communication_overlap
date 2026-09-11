@@ -803,6 +803,7 @@ class GemmBase:
             tile_sched_args = GatherTableTileSchedulerArguments(
                 work_table=scheduler_args.gather_table,
                 group_size=group_size,
+                num_n_groups=num_clusters_n // group_size,
                 tile_shape_mn=self.cta_tile_shape_mnk[:2],
                 cluster_shape_mnk=self.cluster_shape_mnk,
                 persistence_mode=persistence_mode,

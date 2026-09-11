@@ -1112,6 +1112,7 @@ class GatherTableTileSchedulerArguments:
 
     work_table: cute.Tensor
     group_size: Int32
+    num_n_groups: Int32
     tile_shape_mn: cutlass.Constexpr[cute.Shape]
     cluster_shape_mnk: cutlass.Constexpr[cute.Shape]
     persistence_mode: cutlass.Constexpr[PersistenceMode] = PersistenceMode.STATIC
@@ -1136,6 +1137,7 @@ class GatherTableTileScheduler(TileScheduler):
         problem_shape_ncluster_mnl: cute.Shape
         work_table: cute.Tensor
         group_size_fdd: FastDivmod
+        num_n_groups_fdd: FastDivmod
         tile_shape_mn: cutlass.Constexpr[cute.Shape]
         tile_count_semaphore: Optional[cute.Pointer]
         batch_idx_permute: Optional[cute.Tensor]
@@ -1158,6 +1160,7 @@ class GatherTableTileScheduler(TileScheduler):
                 (None, None, 1),
                 args.work_table,
                 FastDivmod(args.group_size),
+                FastDivmod(args.num_n_groups),
                 args.tile_shape_mn,
                 None,
                 None,
@@ -1219,9 +1222,24 @@ class GatherTableTileScheduler(TileScheduler):
                     if const_expr(params.ready_rows is not None):
                         wait_for_gather_table_row(params.ready_rows, table_idx)
                     expert_id = params.work_table[table_idx, 0]
-                    route_start = params.work_table[table_idx, 1]
-                    route_end = params.work_table[table_idx, 2]
-                    pid_n = params.work_table[table_idx, 3] + n_in_group
+                    if const_expr(params.work_table.shape[1] != 4):
+                        cluster_rows = const_expr(params.work_table.shape[1] - 2)
+                        route_start = (table_idx // params.num_n_groups_fdd) * cluster_rows
+                        # Token indices form a valid prefix followed by -1 padding.
+                        # Find its length without scanning the full M-cluster row.
+                        lo, hi = Int32(0), Int32(cluster_rows)
+                        while lo < hi:
+                            mid = (lo + hi) // 2
+                            if params.work_table[table_idx, 2 + mid] >= 0:
+                                lo = mid + 1
+                            else:
+                                hi = mid
+                        route_end = route_start + lo
+                        pid_n = params.work_table[table_idx, 1] + n_in_group
+                    else:
+                        route_start = params.work_table[table_idx, 1]
+                        route_end = params.work_table[table_idx, 2]
+                        pid_n = params.work_table[table_idx, 3] + n_in_group
                 expert_id = cute.arch.shuffle_sync(expert_id, 0)
                 route_start = cute.arch.shuffle_sync(route_start, 0)
                 route_end = cute.arch.shuffle_sync(route_end, 0)
