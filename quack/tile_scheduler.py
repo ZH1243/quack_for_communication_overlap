@@ -1354,7 +1354,7 @@ class GatherTableTileScheduler(TileScheduler):
                                 peer_data[i],
                                 smem_ptr=self._sched_smem[None, pipeline_idx].iterator + i,
                                 mbar_ptr=mbar_ptr,
-                                peer_cta_rank=peer_cta_rank,
+                                peer_cta_rank_in_cluster=peer_cta_rank,
                             )
                 else:
                     # Clip the packed, buffer-ordered cluster range to this CTA's
