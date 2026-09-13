@@ -1010,7 +1010,9 @@ class GemmSm90(GemmTmaBase):
             # No drain-mailbox tail (+6 Int32, cf. gemm_sm100): this kernel never
             # calls cancel_pending_tail — add the tail if that ever changes.
             sched_fields = const_expr(
-                4 if not self.multi_buffer_gather else 4 + 2 * self.gather_table_num_buffers
+                (5 if self.gather_table and tile_sched_params.work_table.shape[1] != 4 else 4)
+                if not self.multi_buffer_gather
+                else 4 + 2 * self.gather_table_num_buffers
             )
             sched_data = smem.allocate_tensor(
                 Int32,
@@ -1662,13 +1664,10 @@ class GemmSm90(GemmTmaBase):
         if const_expr(self.gather_table and not self.multi_buffer_gather):
             route_start, route_end = tile_coord_mnkl[0], tile_coord_mnkl[2]
             if const_expr(tile_sched_params.work_table.shape[1] != 4):
-                cluster_rows = const_expr(tile_sched_params.work_table.shape[1] - 2)
-                table_idx = (
-                    route_start // cluster_rows * tile_sched_params.num_n_groups_fdd.divisor
-                    + tile_coord_mnkl[1] // tile_sched_params.group_size_fdd
-                )
+                table_idx = tile_coord_mnkl[4]
                 token_indices = tile_sched_params.work_table[table_idx, None]
-                mAIdx_mk = cute.domain_offset((2 + route_start % cluster_rows,), token_indices)
+                local_start = route_start - token_indices[2]
+                mAIdx_mk = cute.domain_offset((4 + local_start,), token_indices)
             else:
                 mAIdx_mk = cute.domain_offset((route_start,), varlen_manager.params.mAIdx)
             gAIdx = cute.local_tile(mAIdx_mk, (self.cta_tile_shape_mnk[0],), (0,))

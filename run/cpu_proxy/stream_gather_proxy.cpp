@@ -72,7 +72,7 @@ void validate_options(const Options& options) {
     throw std::runtime_error("table and flush dimensions must be positive (interval may be zero)");
   }
   const int expected_width = options.indexed_gather()
-                                 ? 2 + options.tile_m * options.cluster_m
+                                 ? 4 + options.tile_m * options.cluster_m
                                  : 2 + 2 * options.num_input_buffers;
   if (options.table_width != expected_width) {
     throw std::runtime_error("table width does not match the gather row format");
@@ -352,9 +352,11 @@ PinnedTable build_table(const Options& options,
     row[0] = expert;
     if (options.indexed_gather()) {
       row[1] = n_group * group_size;
-      std::fill_n(row + 2, cluster_rows, -1);
+      row[2] = ranges[0].first;
+      row[3] = ranges[0].second;
+      std::fill_n(row + 4, cluster_rows, -1);
       std::copy(token_indices.begin() + ranges[0].first,
-                token_indices.begin() + ranges[0].second, row + 2);
+                token_indices.begin() + ranges[0].second, row + 4);
     } else if (options.num_input_buffers == 1) {
       // Single-buffer scheduler: [expert, route_start, route_end, cid_n_base].
       row[1] = ranges[0].first;
@@ -371,7 +373,7 @@ PinnedTable build_table(const Options& options,
   };
 
   if (options.indexed_gather()) {
-    // The indexed scheduler derives the output tile from row / num_n_groups.
+    // Keep the same indexed bundle ordering as the Python table builder.
     // Keep all N groups for each M cluster adjacent, in expert order.
     for (int expert = 0; expert < options.experts; ++expert) {
       for (const auto& ranges : cluster_ranges[expert]) {

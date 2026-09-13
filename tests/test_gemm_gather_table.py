@@ -331,11 +331,8 @@ def test_indexed_gather_reads_table_tokens(activation, cluster_m, pingpong, dtyp
     torch.cuda.synchronize()
     inputs.A_idx = reference_indices
     check_correctness(inputs, activation=activation, atol=3e-2, rtol=1e-3)
-    torch.testing.assert_close(
-        inputs.up_output[reference_indices < 0],
-        torch.zeros_like(inputs.up_output[reference_indices < 0]),
-        atol=0, rtol=0,
-    )
+    assert inputs.up_output.shape == (args.routes, args.output_dim)
+    assert inputs.route_offsets[0][-1] == args.routes
     if args.down_projection:
         check_down_correctness(inputs, atol=3e-2, rtol=1e-3)
 
@@ -372,6 +369,6 @@ def test_stream_indexed_gather_proxy(proxy_mode, routes, extra_args):
         cwd=root, capture_output=True, text=True, timeout=300,
     )
     # The runner compares GEMM values against float32 PyTorch references;
-    # the SwiGLU case additionally verifies the padded grouped down projection.
+    # the SwiGLU case additionally verifies the packed grouped down projection.
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Reference check: PASSED" in result.stdout

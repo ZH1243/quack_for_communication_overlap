@@ -259,7 +259,7 @@ def prepare_inputs(
     A_idx = tuple(idx_buffers)
 
     cluster_rows = args.tile_m * args.cluster_m
-    table_width = 2 + cluster_rows if args.indexed_gather else 2 + 2 * num_buffers
+    table_width = 4 + cluster_rows if args.indexed_gather else 2 + 2 * num_buffers
     # A single allocation avoids opening the same CUDA IPC allocation twice if
     # PyTorch suballocates the table and flag from one caching-allocator segment.
     table_elements = table_rows * table_width
@@ -275,27 +275,6 @@ def prepare_inputs(
     total_routes = num_buffers * routes
     if args.indexed_gather:
         ipc_backing[table_elements + 1 :].copy_(A_idx[0])
-        padded_offsets = [0]
-        for count in counts_by_buffer[0]:
-            padded_offsets.append(
-                padded_offsets[-1] + math.ceil(count / cluster_rows) * cluster_rows
-            )
-        padded_indices = torch.full(
-            (padded_offsets[-1],), -1, dtype=torch.int32, device=device
-        )
-        for expert, count in enumerate(counts_by_buffer[0]):
-            source_start = route_offsets[0][expert]
-            start = padded_offsets[expert]
-            padded_indices[start : start + count].copy_(
-                A_idx[0][source_start : source_start + count]
-            )
-        A_idx = (padded_indices,)
-        route_offsets = (tuple(padded_offsets),)
-        output_segments = tuple(
-            (expert, 0, padded_offsets[expert], padded_offsets[expert + 1])
-            for expert in range(args.experts)
-        )
-        total_routes = padded_offsets[-1]
     allocate_up = torch.zeros if args.indexed_gather else torch.empty
     up_output = allocate_up(
         (total_routes, args.output_dim), dtype=dtype, device=device
@@ -807,7 +786,7 @@ def main() -> None:
         )
     else:
         print(f"Output: {tuple(inputs.output.shape)}, down projection: disabled")
-    print(f"{'Padded routes' if args.indexed_gather else 'Routes'} per expert by buffer: {counts}")
+    print(f"Routes per expert by buffer: {counts}")
     print(
         f"Work table: {tuple(inputs.work_table.shape)}, x={inputs.work_group_size}, "
         f"expanded work IDs={inputs.work_table.shape[0] * inputs.work_group_size}"

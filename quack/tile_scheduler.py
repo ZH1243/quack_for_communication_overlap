@@ -1128,8 +1128,10 @@ class GatherTableTileScheduler(TileScheduler):
     ``(route_start_for_cta, pid_n, route_end, expert_id)``. ``expert_id == -1``
     is the terminal record. Since gather-A does not support split-K, tile_idx's
     otherwise-static split slot can carry route_end to the loader and epilogue.
-    Multi-buffer mode appends one CTA-clipped ``(start, end)`` pair per input
-    buffer to that record; the wider shared slot is confined to this scheduler.
+    Indexed mode appends the table row ID so packed output offsets do not
+    determine the token-table address. Multi-buffer mode appends one CTA-clipped
+    ``(start, end)`` pair per input buffer to that record; the wider shared slot
+    is confined to this scheduler.
     """
 
     @dataclass
@@ -1213,6 +1215,7 @@ class GatherTableTileScheduler(TileScheduler):
         route_end = Int32(0)
         pid_n = Int32(0)
         expert_id = Int32(-1)
+        table_row = Int32(0)
         if const_expr(params.multi_buffer_gather is None):
             if is_valid:
                 table_idx, n_in_group = divmod(work_idx, params.group_size_fdd)
@@ -1223,24 +1226,15 @@ class GatherTableTileScheduler(TileScheduler):
                         wait_for_gather_table_row(params.ready_rows, table_idx)
                     expert_id = params.work_table[table_idx, 0]
                     if const_expr(params.work_table.shape[1] != 4):
-                        cluster_rows = const_expr(params.work_table.shape[1] - 2)
-                        route_start = (table_idx // params.num_n_groups_fdd) * cluster_rows
-                        # Token indices form a valid prefix followed by -1 padding.
-                        # Find its length without scanning the full M-cluster row.
-                        lo, hi = Int32(0), Int32(cluster_rows)
-                        while lo < hi:
-                            mid = (lo + hi) // 2
-                            if params.work_table[table_idx, 2 + mid] >= 0:
-                                lo = mid + 1
-                            else:
-                                hi = mid
-                        route_end = route_start + lo
+                        route_start = params.work_table[table_idx, 2]
+                        route_end = params.work_table[table_idx, 3]
                         pid_n = params.work_table[table_idx, 1] + n_in_group
                     else:
                         route_start = params.work_table[table_idx, 1]
                         route_end = params.work_table[table_idx, 2]
                         pid_n = params.work_table[table_idx, 3] + n_in_group
                 expert_id = cute.arch.shuffle_sync(expert_id, 0)
+                table_row = table_idx
                 route_start = cute.arch.shuffle_sync(route_start, 0)
                 route_end = cute.arch.shuffle_sync(route_end, 0)
                 pid_n = cute.arch.shuffle_sync(pid_n, 0)
@@ -1251,6 +1245,10 @@ class GatherTableTileScheduler(TileScheduler):
                         route_start + bidx_in_cluster[0] * params.tile_shape_mn[0], route_end
                     )
                     pid_n += bidx_in_cluster[1]
+            if const_expr(params.work_table.shape[1] != 4):
+                return WorkTileInfo(
+                    (route_start, pid_n, route_end, expert_id, table_row), Boolean(is_valid)
+                )
             return WorkTileInfo((route_start, pid_n, route_end, expert_id), Boolean(is_valid))
 
         num_buffers = const_expr(len(params.multi_buffer_gather.x_buffers) + 1)
@@ -1285,7 +1283,7 @@ class GatherTableTileScheduler(TileScheduler):
         iket.range_pop()
         iket.range_push("fetch_decode")
         num_fields = const_expr(
-            4
+            (5 if params.work_table.shape[1] != 4 else 4)
             if params.multi_buffer_gather is None
             else 4 + 2 * (len(params.multi_buffer_gather.x_buffers) + 1)
         )
@@ -1307,7 +1305,11 @@ class GatherTableTileScheduler(TileScheduler):
             if params.multi_buffer_gather is None
             else len(params.multi_buffer_gather.x_buffers) + 1
         )
-        num_fields = const_expr(4 if params.multi_buffer_gather is None else 4 + 2 * num_buffers)
+        num_fields = const_expr(
+            (5 if params.work_table.shape[1] != 4 else 4)
+            if params.multi_buffer_gather is None
+            else 4 + 2 * num_buffers
+        )
         sched_data = [work_tile_info.tile_idx[i] for i in range(num_fields)]
         lane_idx = cute.arch.lane_idx()
         if lane_idx < cute.size(params.cluster_shape_mnk):
@@ -1327,18 +1329,33 @@ class GatherTableTileScheduler(TileScheduler):
                     route_start = cutlass.min(
                         sched_data[0] + bidx_in_cluster * params.tile_shape_mn[0], sched_data[2]
                     )
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        mbar_ptr, SCHED_SLOT_BYTES, peer_cta_rank
-                    )
-                    utils.store_shared_remote_x4(
-                        route_start,
-                        sched_data[1] + bidy_in_cluster,
-                        sched_data[2],
-                        sched_data[3],
-                        smem_ptr=self._sched_smem[None, pipeline_idx].iterator,
-                        mbar_ptr=mbar_ptr,
-                        peer_cta_rank_in_cluster=peer_cta_rank,
-                    )
+                    if const_expr(params.work_table.shape[1] == 4):
+                        cute.arch.mbarrier_arrive_and_expect_tx(
+                            mbar_ptr, SCHED_SLOT_BYTES, peer_cta_rank
+                        )
+                        utils.store_shared_remote_x4(
+                            route_start,
+                            sched_data[1] + bidy_in_cluster,
+                            sched_data[2],
+                            sched_data[3],
+                            smem_ptr=self._sched_smem[None, pipeline_idx].iterator,
+                            mbar_ptr=mbar_ptr,
+                            peer_cta_rank_in_cluster=peer_cta_rank,
+                        )
+                    else:
+                        cute.arch.mbarrier_arrive_and_expect_tx(
+                            mbar_ptr, num_fields * 4, peer_cta_rank
+                        )
+                        peer_data = [sched_data[i] for i in range(num_fields)]
+                        peer_data[0] = route_start
+                        peer_data[1] = sched_data[1] + bidy_in_cluster
+                        for i in cutlass.range_constexpr(num_fields):
+                            utils.store_shared_remote(
+                                peer_data[i],
+                                smem_ptr=self._sched_smem[None, pipeline_idx].iterator + i,
+                                mbar_ptr=mbar_ptr,
+                                peer_cta_rank=peer_cta_rank,
+                            )
                 else:
                     # Clip the packed, buffer-ordered cluster range to this CTA's
                     # tile_M rows, retaining one source interval per buffer.

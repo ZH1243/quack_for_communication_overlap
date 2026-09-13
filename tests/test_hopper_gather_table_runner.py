@@ -245,15 +245,16 @@ def test_indexed_table_numerical_mapping():
     counts = [5, 0, 9]
     indices = torch.tensor([7, 1, 7, 0, 9, 3, 8, 2, 6, 1, 0, 4, 9, 2], dtype=torch.int32)
     X, W = torch.randn(10, 3), torch.randn(3, 3, 11)
-    table, padded, offsets, x = build_indexed_work_table(
+    table, packed, offsets, x = build_indexed_work_table(
         counts, indices, output_dim=11, tile_m=2, tile_n=2, cluster_m=2,
         max_swizzle_size=2, device=torch.device("cpu"),
     )
-    actual = torch.zeros(padded.numel(), 11)
-    num_n_groups = 3
-    for q, row in enumerate(table.tolist()):
-        expert, cid_n, *tokens = row
-        output_start = q // num_n_groups * 4
+    torch.testing.assert_close(packed, indices)
+    assert offsets == ((0, 5, 5, 14),)
+    actual = torch.full((sum(counts), 11), float("nan"))
+    for row in table.tolist():
+        expert, cid_n, output_start, output_end, *tokens = row
+        assert output_end - output_start == sum(token >= 0 for token in tokens)
         n_start, n_end = cid_n * 2, min((cid_n + x) * 2, 11)
         for m, token in enumerate(tokens):
             if token >= 0:
@@ -266,6 +267,39 @@ def test_indexed_table_numerical_mapping():
         )
         source_start += count
     torch.testing.assert_close(actual, expected)
+
+
+def test_indexed_packed_output_across_partial_ctas():
+    """Numerically check 300-row experts, empty experts, and per-CTA token offsets."""
+    from run.hopper_gather_table_gemm import build_indexed_work_table
+
+    torch.manual_seed(43)
+    counts = [300, 0, 129, 1]
+    indices = torch.randint(0, 37, (sum(counts),), dtype=torch.int32)
+    X, W = torch.randn(37, 13), torch.randn(4, 13, 259)
+    for cluster_m in (1, 2):
+        table, _, offsets, _ = build_indexed_work_table(
+            counts, indices, output_dim=259, tile_m=128, tile_n=128,
+            cluster_m=cluster_m, max_swizzle_size=1, device=torch.device("cpu"),
+        )
+        actual = torch.full((sum(counts), 259), float("nan"))
+        for expert, cid_n, start, end, *tokens in table.tolist():
+            n_start, n_end = cid_n * 128, min((cid_n + 1) * 128, 259)
+            for cta in range(cluster_m):
+                begin = min(start + cta * 128, end)
+                stop = min(begin + 128, end)
+                if begin == stop:
+                    continue
+                local_start = begin - start
+                token_ids = torch.tensor(
+                    tokens[local_start : local_start + stop - begin], dtype=torch.long
+                )
+                actual[begin:stop, n_start:n_end] = X[token_ids] @ W[expert, :, n_start:n_end]
+        expected = torch.cat([
+            X[indices[offsets[0][expert] : offsets[0][expert + 1]].long()] @ W[expert]
+            for expert in range(len(counts))
+        ])
+        torch.testing.assert_close(actual, expected)
 
 
 def test_indexed_and_legacy_modes_use_identical_inputs():
@@ -305,22 +339,22 @@ def test_indexed_and_legacy_modes_use_identical_inputs():
         torch.testing.assert_close(indexed.W, legacy.W, atol=0, rtol=0)
         torch.testing.assert_close(indexed.W_down, legacy.W_down, atol=0, rtol=0)
 
-        cluster_rows = args.tile_m * args.cluster_m
-        num_n_groups = 3
         for expert, route_start, route_end, cid_n in legacy.work_table.tolist():
             local_start = route_start - legacy.route_offsets[0][expert]
             output_start = indexed.route_offsets[0][expert] + local_start
-            q = output_start // cluster_rows * num_n_groups + cid_n // legacy.work_group_size
-            row = indexed.work_table[q]
+            matches = (indexed.work_table[:, 0] == expert) & (
+                indexed.work_table[:, 1] == cid_n
+            ) & (indexed.work_table[:, 2] == route_start)
+            row = indexed.work_table[matches].squeeze(0)
             count = route_end - route_start
             expected_indices = legacy.A_idx[route_start:route_end]
-            torch.testing.assert_close(row[2 : 2 + count], expected_indices, atol=0, rtol=0)
+            torch.testing.assert_close(row[4 : 4 + count], expected_indices, atol=0, rtol=0)
             torch.testing.assert_close(
-                row[2 + count:], torch.full_like(row[2 + count:], -1), atol=0, rtol=0
+                row[4 + count:], torch.full_like(row[4 + count:], -1), atol=0, rtol=0
             )
             n_start = cid_n * args.tile_n
             n_end = min(n_start + legacy.work_group_size * args.tile_n, args.output_dim)
-            actual = indexed.X[row[2 : 2 + count].long()].float() @ indexed.W[
+            actual = indexed.X[row[4 : 4 + count].long()].float() @ indexed.W[
                 expert, :, n_start:n_end
             ].float()
             reference = legacy.X[expected_indices.long()].float() @ legacy.W[

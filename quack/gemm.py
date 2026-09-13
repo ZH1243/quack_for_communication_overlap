@@ -475,10 +475,10 @@ def gemm(
     # [Q, 4] rows containing (expert_id, route_start, route_end, cid_n_base).
     # See multi_buffer_gather below for the opt-in wider row format. Each row
     # expands to min(max_swizzle_size, ceil(N / tile_N)) AlongN work IDs.
-    # Single-buffer int32[Q, 2 + tile_M * cluster_M] selects direct X indices:
-    # (expert_id, cid_n_base, token_idx_0, ...), with trailing -1 padding.
-    # Consecutive N-group rows form one M-cluster bundle. Bundle i writes to
-    # D[i*C:(i+1)*C], C=tile_M*cluster_M; padding is untouched. A_idx is still
+    # Single-buffer int32[Q, 4 + tile_M * cluster_M] selects direct X indices:
+    # (expert_id, cid_n_base, output_start, output_end, token_idx_0, ...).
+    # Consecutive N-group rows form one M-cluster bundle. Only token slots
+    # have trailing -1 padding; output ranges are packed. A_idx is still
     # required for output sizing (length D.shape[0]), but its values are unused.
     gather_work_table: Optional[Tensor] = None,
     # Opt-in Hopper table gather from separately allocated A/A_idx buffers.
@@ -860,7 +860,7 @@ def _build_gemm_plan(
             and gather_work_table.shape[1] != 4
         )
         expected_table_width = (
-            2 + tile_M * cluster_M
+            4 + tile_M * cluster_M
             if indexed_gather
             else (4 if gather_table_num_buffers == 1 else 2 + 2 * gather_table_num_buffers)
         )
@@ -935,9 +935,6 @@ def _build_gemm_plan(
             num_n_groups = clusters_n // work_group_size
             if gather_work_table.shape[0] % num_n_groups:
                 raise ValueError("indexed gather requires complete consecutive N-group bundles")
-            padded_rows = gather_work_table.shape[0] // num_n_groups * tile_M * cluster_M
-            if total_routes != padded_rows:
-                raise ValueError(f"indexed gather requires A_idx and D with {padded_rows} rows")
         if gather_work_table.shape[0] == 0:
             raise ValueError("gather_work_table must contain at least one row")
     if has_ag:

@@ -110,9 +110,9 @@ python run/hopper_stream_gather_table_gemm.py --indexed-gather --proxy-mode thre
 ```
 
 Indexed mode works with both proxy modes and with activation/down projection.
-It streams `[expert, n_base, token_0, ...]` rows with `tile_m * cluster_m`
-token slots and `-1` tail padding. Output is padded per expert to whole M clusters;
-padding starts at zero for the down projection. It cannot be combined with
+It streams `[expert, n_base, output_start, output_end, token_0, ...]` rows with
+`tile_m * cluster_m` token slots and `-1` tail padding. Output uses the explicit
+packed ranges, with no padding between experts. It cannot be combined with
 `--multi-buffer-gather`, balanced allocation, or round-robin scheduling.
 Rebuild the proxy executable and shared library after updating the sources.
 
@@ -276,26 +276,25 @@ comparing the two runners.
 ### Direct token indices in the Hopper gather table
 
 `hopper_gather_table_gemm.py --indexed-gather` enables a single-buffer table of
-shape `int32[Q, 2 + tile_m * cluster_m]`. Each row is
-`(expert_id, cid_n_base, token_idx_0, ..., token_idx_{C-1})`, where
+shape `int32[Q, 4 + tile_m * cluster_m]`. Each row is
+`(expert_id, cid_n_base, output_start, output_end, token_idx_0, ..., token_idx_{C-1})`, where
 `C = tile_m * cluster_m`. Token indices directly address `X[T, K]` and may be
 nonconsecutive or repeated. With the same `--seed` and other input options,
 both modes generate identical X, weights, and per-expert routing. Each indexed
 entry embeds exactly `A_idx[route_start:route_end]` from its corresponding legacy
-entry; enabling the flag does not resample tokens. Table ordering and output
-padding differ between modes. Valid indices must be in `[0, T)`; partial tiles
+entry; enabling the flag does not resample tokens. Table ordering differs between modes; both have packed output. Valid indices must be in `[0, T)`; partial tiles
 have a valid prefix followed by `-1` padding.
 
 All N groups for an M-cluster must appear consecutively, in increasing
 `cid_n_base` order (`0, x, 2*x, ...`), where
 `x = min(max_swizzle_size, ceil(gemm_N / tile_n))`. These rows must carry the
-same expert and token indices. M-cluster bundle `i` writes into output rows
-`[i*C, (i+1)*C)`; padding rows are untouched. The runner initializes padding
-to zero and keeps experts consecutive for the optional down projection.
+same expert, output range, and token indices. Each bundle writes only
+`[output_start, output_end)`. Experts remain consecutive with no output padding,
+including for the optional down projection.
 For gated activations, `gemm_N` is the preactivation width, twice `output_dim`.
 
 The Python GEMM APIs select this format by its table width. They still require
-an `A_idx` vector with the padded output length for sizing, but the kernel does
+an `A_idx` vector with the actual output length for sizing, but the kernel does
 not read its values. The runner keeps it for reference checks.
 `--indexed-gather` cannot be combined with `--multi-buffer-gather`. Without
 this flag, the existing four-column table and packed output behavior remain.

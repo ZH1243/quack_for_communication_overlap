@@ -2187,11 +2187,11 @@ def gemm_act(
     On Hopper, ``gather_work_table`` selects the table-scheduled gather-A path.
     Pass tensor sequences for ``A`` and ``A_idx`` together with
     ``multi_buffer_gather=True`` to gather from multiple independent buffers.
-    Single-buffer tables of width ``2 + tile_m * cluster_m`` instead contain
-    direct X token indices, with trailing -1 padding. Consecutive N-group rows
-    form each M-cluster bundle; output reserves ``tile_m * cluster_m`` rows per
-    bundle and padding is untouched. A_idx supplies the padded output length
-    but its values are unused. See ``run/hopper_gather_table_gemm.py``.
+    Single-buffer tables of width ``4 + tile_m * cluster_m`` instead contain
+    (expert_id, cid_n_base, output_start, output_end, token indices...).
+    Consecutive N-group rows form each M-cluster bundle. Token slots have
+    trailing -1 padding; output ranges are packed. A_idx supplies the actual
+    output length but its values are unused. See ``run/hopper_gather_table_gemm.py``.
     """
     _reserve_blockscaled_out(out_dtype)
     _reserve_blockscaled_out(postact_dtype)

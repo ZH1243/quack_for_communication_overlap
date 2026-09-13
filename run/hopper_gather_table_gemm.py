@@ -20,13 +20,12 @@ Tensor shapes:
     output:            [R, N], or [R, K] with --down-projection
 
 With ``--indexed-gather`` (single-buffer only), rows instead contain
-``(expert_id, cid_n_base, token_idx_0, ..., token_idx_{C-1})``, where
+``(expert_id, cid_n_base, output_start, output_end, token_idx_0, ..., token_idx_{C-1})``, where
 ``C = tile_m * cluster_m``. Indices directly address X, bypassing A_idx.
 Each M-cluster has consecutive N-group rows in increasing cid_n_base order.
-The output reserves C rows per M-cluster; partial tiles use trailing -1
-indices and leave output padding untouched. The runner initializes padding
-to zero, including for the optional down projection. A_idx remains a padded
-reference/sizing vector, and is not read by the indexed kernel.
+Output rows are packed using explicit output ranges. Partial tiles retain
+trailing -1 token slots in the table, without padding the output. A_idx remains
+the original reference/sizing vector and is not read by the indexed kernel.
 
 With ``--multi-buffer-gather``, the kernel reads separately allocated token
 and route-index buffers without materializing their concatenation:
@@ -327,10 +326,10 @@ def build_indexed_work_table(
     Each tile copies token_indices[route_start:route_end], using exactly the
     same route ranges as build_work_table. No tokens are sampled here. N groups
     are reordered into consecutive M-major bundles for the indexed scheduler.
-    Output tile i occupies [i * cluster_rows, (i + 1) * cluster_rows).
-    Partial tiles have trailing -1 indices; their output padding is not written.
-    The padded index vector is retained for output sizing and reference checks
-    only. The kernel loads indices directly from the work table.
+    Each row stores its packed output range before the direct token indices.
+    Partial tiles have trailing -1 token slots, but no output padding.
+    The original index vector is retained for sizing and reference checks only.
+    The kernel loads indices directly from the work table.
     """
     cluster_rows = tile_m * cluster_m
     clusters_n = math.ceil(output_dim / tile_n)
@@ -340,27 +339,24 @@ def build_indexed_work_table(
     num_n_groups = clusters_n // x
     offsets = [0]
     for count in counts:
-        offsets.append(offsets[-1] + math.ceil(count / cluster_rows) * cluster_rows)
-    padded_indices = torch.full((offsets[-1],), -1, dtype=torch.int32, device=device)
+        offsets.append(offsets[-1] + count)
+    num_clusters = sum(math.ceil(count / cluster_rows) for count in counts)
     table = torch.full(
-        (offsets[-1] // cluster_rows * num_n_groups, 2 + cluster_rows),
+        (num_clusters * num_n_groups, 4 + cluster_rows),
         -1, dtype=torch.int32, device=device,
     )
-    source_start = 0
+    row = 0
     for expert, count in enumerate(counts):
-        start = offsets[expert]
-        padded_indices[start : start + count] = token_indices[source_start : source_start + count]
-        for output_start in range(start, offsets[expert + 1], cluster_rows):
-            route_start = source_start + output_start - start
-            route_end = min(route_start + cluster_rows, source_start + count)
-            tile_indices = token_indices[route_start:route_end]
-            first_row = output_start // cluster_rows * num_n_groups
+        for start in range(offsets[expert], offsets[expert + 1], cluster_rows):
+            end = min(start + cluster_rows, offsets[expert + 1])
             for n_group in range(num_n_groups):
-                table[first_row + n_group, 0] = expert
-                table[first_row + n_group, 1] = n_group * x
-                table[first_row + n_group, 2 : 2 + route_end - route_start] = tile_indices
-        source_start += count
-    return table, padded_indices, (tuple(offsets),), x
+                table[row, 0] = expert
+                table[row, 1] = n_group * x
+                table[row, 2] = start
+                table[row, 3] = end
+                table[row, 4 : 4 + end - start] = token_indices[start:end]
+                row += 1
+    return table, token_indices, (tuple(offsets),), x
 
 
 def build_multi_buffer_work_table(
@@ -577,7 +573,7 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> TableGathe
             A_idx[offset : offset + count].copy_(indices)
             offset += count
         # Both modes consume the same X, W, and sampled A_idx. Indexed mode
-        # only embeds those routes in the table and pads the output layout.
+        # only embeds those routes and their packed output ranges in the table.
         if getattr(args, "indexed_gather", False):
             work_table, A_idx, offsets, x = build_indexed_work_table(
                 counts, A_idx, output_dim=gemm_output_dim,
