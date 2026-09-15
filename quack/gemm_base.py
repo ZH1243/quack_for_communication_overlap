@@ -79,6 +79,7 @@ class GemmBase:
     """Common non-mainloop pieces shared by GEMM architectures."""
 
     arch = 0
+    bulk_row_store = False
     # Epilogue mixins that need a reduction over the full accumulator tile
     # BEFORE any subtile is stored (e.g. QK-norm's per-head sum of squares)
     # set this in epi_to_underlying_arguments. The epilogue then runs a
@@ -320,6 +321,17 @@ class GemmBase:
         )
         epi_tile_num = cute.size(epi_tile_shape)
         num_prev_subtiles = tile_scheduler.num_tiles_executed * epi_tile_num
+        if const_expr(self.bulk_row_store):
+            assert has_D and len(store_ctxs) == 1, "bulk_rows supports the primary D output only"
+            # A single full-tile buffer survives across all subtiles. Only
+            # wait at tile reuse, and only for the async reads of SMEM.
+            # All issuing lanes must wait on their own per-thread groups.
+            if const_expr(not self.pingpong):
+                if is_tma_warp:
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                epilogue_barrier.arrive_and_wait()
+            # Pingpong already waited before signaling the incoming WG's epi
+            # barrier, so its handoff supplies the buffer-reuse synchronization.
 
         epi_tensors = self.epi_begin(
             params,
@@ -456,16 +468,20 @@ class GemmBase:
                         epi_idx,
                     )
                 )
-            iket.range_push("epi_store_acq")
-            if const_expr(use_tma_epi):
-                if is_tma_warp:
-                    epi_store_pipeline.producer_acquire()
+            if const_expr(not self.bulk_row_store):
+                iket.range_push("epi_store_acq")
+                if const_expr(use_tma_epi):
+                    if is_tma_warp:
+                        epi_store_pipeline.producer_acquire()
+                else:
+                    epilogue_barrier.arrive_and_wait()
+                if const_expr(use_tma_epi):
+                    epilogue_barrier.arrive_and_wait()
+                iket.range_pop()
+            if const_expr(self.bulk_row_store):
+                epi_buffer = epi_coord
             else:
-                epilogue_barrier.arrive_and_wait()
-            if const_expr(use_tma_epi):
-                epilogue_barrier.arrive_and_wait()
-            iket.range_pop()
-            epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
+                epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
             # Copy each output from registers to shared memory. All share the
             # same ``epi_buffer`` index so the s2g TMA stores below happen in
             # lockstep after the fence.
@@ -494,7 +510,7 @@ class GemmBase:
                                 copy_out(src_idx=epi_buffer, dst_idx=epi_coord)
                     epi_store_pipeline.producer_commit()
                 iket.range_pop()
-            else:
+            elif const_expr(not self.bulk_row_store):
                 epilogue_barrier.arrive_and_wait()
                 for i in cutlass.range_constexpr(len(store_ctxs)):
                     _, _, _, _, copy_out, store_pred = store_ctxs[i]
@@ -504,6 +520,15 @@ class GemmBase:
                         if store_pred:
                             copy_out(src_idx=epi_buffer, dst_idx=epi_coord)
                 epilogue_barrier.arrive_and_wait()
+
+        if const_expr(self.bulk_row_store):
+            iket.range_push("epi_store_issue")
+            cute.arch.fence_view_async_shared()
+            epilogue_barrier.arrive_and_wait()
+            if is_tma_warp:
+                copy_D()
+                cute.arch.cp_async_bulk_commit_group()
+            iket.range_pop()
 
         self.epi_end(
             params,
@@ -1161,7 +1186,11 @@ class GemmTmaBase(GemmBase):
         # store, or the reduce-add atom with add_to_output, exactly like the non-split
         # kernel); partials travel through the f32 workspace, not through D.
         tma_atom_d, tma_tensor_d = None, None
-        if const_expr(mD is not None):
+        if const_expr(self.bulk_row_store):
+            # Keep an ordinary pointer/strided tensor: linear bulk stores
+            # explicitly compute addresses and predicate bounds in the kernel.
+            tma_tensor_d = mD
+        elif const_expr(mD is not None):
             tma_atom_d, tma_tensor_d = self._make_tma_epi_atoms_and_tensors(
                 copy_utils.create_ragged_tensor_for_tma(mD, ragged_dim=0, ptr_shift=True)
                 if varlen_m
@@ -1304,6 +1333,8 @@ class GemmTmaBase(GemmBase):
         )
 
     def make_epi_store_pipeline(self):
+        if self.bulk_row_store:
+            return None  # Per-lane bulk groups are managed by the full-tile epilogue.
         num_epi_threads = self.num_epi_warps * cute.arch.WARP_SIZE
         epi_store_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, num_epi_threads)
         return pipeline.PipelineTmaStore.create(

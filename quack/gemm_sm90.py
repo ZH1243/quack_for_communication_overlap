@@ -169,6 +169,7 @@ class GemmSm90(GemmTmaBase):
         transform_a: Optional[Callable] = None,
         gather_table: bool = False,
         gather_table_num_buffers: int = 1,
+        epilogue_store: str = "tma",
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -185,6 +186,11 @@ class GemmSm90(GemmTmaBase):
         """
 
         self.acc_dtype = acc_dtype
+        if epilogue_store not in ("tma", "bulk_rows"):
+            raise ValueError("epilogue_store must be 'tma' or 'bulk_rows'")
+        self.bulk_row_store = epilogue_store == "bulk_rows"
+        if self.bulk_row_store:
+            assert self.arch == 90 and split_k == 1 and not gather_table and not concat_layout
         # The MMA compute dtype for A. Without a transform, mA must arrive
         # typed exactly this; a layout-owning transform decouples storage
         # (self.a_dtype, from the tensor) from compute and must produce
@@ -457,6 +463,10 @@ class GemmSm90(GemmTmaBase):
         - Computing A/B/C shared memory layout
         """
         self._setup_tiled_mma()
+        if self.bulk_row_store:
+            assert self.d_dtype in (cutlass.Float16, cutlass.BFloat16, cutlass.Float32)
+            assert self.d_layout.is_n_major_c(), "bulk_rows requires row-major D"
+            assert not epilogue_args.add_to_output
         self.epi_m_major = self.resolve_epi_m_major(epilogue_args)
 
         self.cluster_layout_mnk = cute.make_layout(self.cluster_shape_mnk)
@@ -504,6 +514,7 @@ class GemmSm90(GemmTmaBase):
                 + self._sf_smem_bytes_per_stage()
             ),
             fixed_user_smem_bytes=fixed_user_smem_bytes,
+            full_tile_store=self.bulk_row_store,
         )
         self.sched_stage = 2 if self.pingpong else 1
 
@@ -527,6 +538,16 @@ class GemmSm90(GemmTmaBase):
             self.c_layout,
             self.epi_c_stage,
         )
+        if self.bulk_row_store:
+            # A full row-major tile, viewed as epilogue subtiles. The last
+            # hierarchical mode selects a subtile's *position*, not a ring
+            # buffer slot; all pieces remain live until the row copies issue.
+            tile_m, tile_n = self.cta_tile_shape_mnk[:2]
+            epi_m, epi_n = self.epi_tile
+            self.epi_smem_layout_staged = cute.make_layout(
+                (epi_m, epi_n, (tile_m // epi_m, tile_n // epi_n)),
+                stride=(tile_n, 1, (epi_m * tile_n, epi_n)),
+            )
         if const_expr(self.transform_a is not None and self.transform_a.owns_a_layout):
             # the transform owns A's smem layout (its storage format, not
             # the (tile_M, tile_K) shape)
@@ -930,7 +951,7 @@ class GemmSm90(GemmTmaBase):
         b_smem_layout: cute.ComposedLayout,
         sfa_smem_layout: Optional[cute.Layout],
         sfb_smem_layout: Optional[cute.Layout],
-        epi_smem_layout: cute.ComposedLayout,
+        epi_smem_layout: Union[cute.ComposedLayout, cute.Layout],
         epi_c_smem_layout: cute.ComposedLayout,
         tma_atom_aux_a: Optional[cute.CopyAtom],
         mAuxA_mkl: Optional[cute.Tensor],
@@ -1044,7 +1065,10 @@ class GemmSm90(GemmTmaBase):
             )
         sD = None
         if const_expr(has_D):
-            sD = storage.sD.get_tensor(epi_smem_layout.outer, swizzle=epi_smem_layout.inner)
+            if const_expr(self.bulk_row_store):
+                sD = storage.sD.get_tensor(epi_smem_layout)
+            else:
+                sD = storage.sD.get_tensor(epi_smem_layout.outer, swizzle=epi_smem_layout.inner)
         sC = None
         if const_expr(has_C):
             sC = storage.sC.get_tensor(epi_c_smem_layout.outer, swizzle=epi_c_smem_layout.inner)
@@ -1435,14 +1459,24 @@ class GemmSm90(GemmTmaBase):
                     else:
                         d_tensor = varlen_manager.offset_batch_epi(mD_mnl, d_batch_idx)
                         d_tile_coord = tile_coord_mnkl
-                    copy_D, _, _ = self.epilog_gmem_copy_and_partition(
-                        tma_atom_d,
-                        d_tensor,
-                        self.cta_tile_shape_mnk[:2],
-                        self.epi_tile,
-                        sD,
-                        d_tile_coord,
-                    )
+                    if const_expr(self.bulk_row_store):
+                        copy_D = partial(
+                            self.epilog_bulk_store_rows,
+                            sD,
+                            d_tensor,
+                            d_tile_coord,
+                            varlen_manager.len_m(batch_idx),
+                            tidx,
+                        )
+                    else:
+                        copy_D, _, _ = self.epilog_gmem_copy_and_partition(
+                            tma_atom_d,
+                            d_tensor,
+                            self.cta_tile_shape_mnk[:2],
+                            self.epi_tile,
+                            sD,
+                            d_tile_coord,
+                        )
 
                 copy_C = None
                 if const_expr(has_C):
@@ -1532,7 +1566,13 @@ class GemmSm90(GemmTmaBase):
                     # so we have to make sure the smem content is done reading before signaling
                     # the next WG's epilogue.
                     if is_tma_warp:
-                        epi_store_pipeline.producer_tail()
+                        if const_expr(self.bulk_row_store):
+                            # Every lane issued its own rows and bulk group.
+                            # Drain each lane's SMEM reads before the other WG
+                            # can overwrite the shared full-tile buffer.
+                            cute.arch.cp_async_bulk_wait_group(0, read=True)
+                        else:
+                            epi_store_pipeline.producer_tail()
                     self.pingpong_barrier_arrive(1 - warp_group_idx, stage="epi")
                 iket.range_pop()
 
@@ -1580,9 +1620,35 @@ class GemmSm90(GemmTmaBase):
                 prims.griddepcontrol(prims.GridDepAction.LAUNCH_DEPENDENTS)
 
             # Wait for D store complete
-            if const_expr(not self.pingpong):
+            if const_expr(self.bulk_row_store):
+                if is_tma_warp:
+                    cute.arch.cp_async_bulk_wait_group(0, read=False)
+            elif const_expr(not self.pingpong):
                 if is_tma_warp:
                     epi_store_pipeline.producer_tail()
+
+    @cute.jit
+    def epilog_bulk_store_rows(self, sD, gD, tile_coord, len_m, tidx):
+        """Called by all 32 store-warp lanes after the full-tile R2S fence/barrier.
+
+        Linear bulk copies do not apply a tensor descriptor's swizzle or OOB
+        handling. Rows in sD are contiguous; the caller supplies a batch-offset
+        ordinary GMEM tensor, and each lane predicates its sequence-local row.
+        The host validates 16-byte alignment, including the final N tile width.
+        """
+        tile_m, tile_n = self.cta_tile_shape_mnk[:2]
+        row_start = tile_coord[0] * tile_m
+        col_start = tile_coord[1] * tile_n
+        store_bytes = cutlass.min(tile_n, gD.shape[1] - col_start) * (self.d_dtype.width // 8)
+        lane = tidx % cute.arch.WARP_SIZE
+        for row_block in cutlass.range_constexpr(cute.ceil_div(tile_m, cute.arch.WARP_SIZE)):
+            row = row_block * cute.arch.WARP_SIZE + lane
+            if row < tile_m and row_start + row < len_m and store_bytes > 0:
+                copy_utils.cpasync_bulk_s2g(
+                    sD.iterator + row * tile_n,
+                    gD.iterator + cute.crd2idx((row_start + row, col_start), gD.layout),
+                    store_bytes,
+                )
 
     def canonical_a_load(self, tiled_mma, sA, tidx, tCrA):
         """The arch's canonical A-fragment produce (the seam transforms wrap
@@ -1981,7 +2047,8 @@ class GemmSm90(GemmTmaBase):
         # setmaxnreg cap and the split's few extra registers spill to local
         # (measured ~150MB STL, a net loss; same for a mirrored LDS split).
         return (
-            self.d_dtype is not None
+            not self.bulk_row_store
+            and self.d_dtype is not None
             and self.d_dtype.width == 32
             and (self.d_layout is None or self.d_layout.is_n_major_c())
             and self.epi_tile[1] % 16 == 0
@@ -2111,6 +2178,7 @@ class GemmSm90(GemmTmaBase):
         a_bytes_per_stage_override: Optional[int] = None,
         ab_extra_bytes_per_stage: int = 0,
         fixed_user_smem_bytes: int = 0,
+        full_tile_store: bool = False,
     ) -> Tuple[int, int]:
         """Computes the number of stages for A/B/C operands based on heuristics.
 
@@ -2142,7 +2210,7 @@ class GemmSm90(GemmTmaBase):
         epi_tiles = (cta_tile_shape_mnk[0] * cta_tile_shape_mnk[1]) // cute.size(
             cute.shape(epi_tile)
         )
-        epi_stage = min(epi_tiles, 4 if epi_tile[1] <= 16 else 2)
+        epi_stage = epi_tiles if full_tile_store else min(epi_tiles, 4 if epi_tile[1] <= 16 else 2)
         epi_smem_bytes = cls.epi_smem_bytes(
             epilogue_args, cta_tile_shape_mnk, epi_tile, warp_shape_mnk
         )
@@ -2212,8 +2280,15 @@ class GemmSm90(GemmTmaBase):
             if add > 0:
                 epi_c_stage += add
                 leftover -= add * c_bytes_per_stage
-        if epi_bytes_per_stage > 0:
+        if epi_bytes_per_stage > 0 and not full_tile_store:
             epi_stage += leftover // epi_bytes_per_stage
+        if full_tile_store and ab_stage < 2:
+            # mma() waits for the next K stage before releasing the previous
+            # one. A single slot would deadlock that existing mainloop.
+            raise ValueError(
+                "bulk_rows leaves insufficient SMEM for two A/B stages; "
+                "reduce tile_M/tile_N or tile_K (try a 128x128 output tile)"
+            )
         return ab_stage, epi_stage, epi_c_stage
 
     @staticmethod

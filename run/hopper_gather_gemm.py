@@ -31,6 +31,16 @@ Fuse a SwiGLU up-projection (the weight uses concatenated [gate | up] columns):
         --tokens 4096 --hidden 4096 --output-dim 14336 \
         --experts 8 --routes 8192 --activation swiglu --down-projection
 
+Try full-tile SMEM staging with one linear bulk store per row (plain GEMM):
+
+    python run/hopper_gather_gemm.py \
+        --tile-m 128 --tile-n 128 --cluster-m 2 --epilogue-store bulk_rows
+
+Add ``--pingpong`` to alternate the compute warpgroups. Use ``--epilogue-store tma``
+for the original store path. Full-tile staging uses tile_m * tile_n * dtype_bytes
+of output SMEM (32 KiB for 128x128 BF16), reducing the space available to A/B
+stages. Both modes retain the same reference check and CUDA-graph timing.
+
 The first call may take a while because QuACK compiles the specialized kernels.
 Compilation, warmup, graph capture, and validation are not timed. With
 ``--down-projection``, the reported time covers the two-GEMM expert MLP;
@@ -118,6 +128,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cluster-m", type=int, default=2)
     parser.add_argument("--max-swizzle-size", type=int, default=8)
     parser.add_argument("--pingpong", action="store_true")
+    parser.add_argument(
+        "--epilogue-store",
+        choices=("tma", "bulk_rows"),
+        default="tma",
+        help=(
+            "Output I/O: tma uses the existing subtile tensor stores; bulk_rows stages "
+            "the full tile in SMEM and issues one linear cp.async.bulk per valid row "
+            "(plain GEMM only; supports --pingpong)."
+        ),
+    )
 
     parser.add_argument(
         "--routing-with-replacement",
@@ -165,6 +185,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(f"warmup must be nonnegative, got {args.warmup}")
     if args.down_projection and args.activation is None:
         raise ValueError("--down-projection requires --activation")
+    if args.epilogue_store == "bulk_rows" and args.activation is not None:
+        raise ValueError("--epilogue-store bulk_rows currently requires --activation to be omitted")
     if args.routes % args.experts != 0:
         raise ValueError(f"routes ({args.routes}) must be divisible by experts ({args.experts})")
     routes_per_expert = args.routes // args.experts
@@ -306,6 +328,7 @@ def make_launch(args: argparse.Namespace, inputs: GatherInputs):
                 # Hopper gather-A uses QuACK's cp.async path. TMA gather4 is an
                 # SM100/SM110-only implementation in this repository.
                 use_tma_gather=False,
+                epilogue_store=args.epilogue_store,
             )
 
         if args.down_projection:
@@ -332,6 +355,7 @@ def make_launch(args: argparse.Namespace, inputs: GatherInputs):
                 cu_seqlens_m=inputs.cu_seqlens_m,
                 A_idx=None,
                 use_tma_gather=False,
+                epilogue_store=args.epilogue_store,
             )
 
     return launch
@@ -520,6 +544,7 @@ def main() -> None:
         f"cluster=({args.cluster_m}, 1, 1), persistent=True; {kernel_description}"
     )
     print(f"Fused activation: {args.activation or 'disabled'}")
+    print(f"Epilogue store: {args.epilogue_store}, pingpong: {args.pingpong}")
     print(f"Approximate tensor storage: {gib(input_bytes):.3f} GiB")
     compile_target = "up and down kernels" if args.down_projection else "kernel"
     print(f"Compiling and warming up the specialized QuACK {compile_target}...")
