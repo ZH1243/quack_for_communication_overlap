@@ -26,6 +26,18 @@ Example:
         --tokens 4096 --hidden 4096 --output-dim 4096 \
         --experts 8 --routes 8192 --warmup 5 --iterations 100
 
+Select full-tile per-row bulk stores (also supports --pingpong):
+
+    python run/hopper_pregather_gemm.py \
+        --tile-m 128 --tile-n 128 --epilogue-store bulk_rows --pingpong
+
+The default --epilogue-store tma retains the existing subtile tensor stores.
+Both bulk_rows and bulk_rows_reduce require plain GEMM without --activation.
+Output rows must have a 16-byte-multiple width (N divisible by 8 for BF16/FP16).
+Full-tile staging uses more shared memory; use a 128x128 tile to start.
+The bulk_rows_reduce mode adds into the destination, so the runner zeros it
+before every launch, excluding zeroing from the reported GEMM time.
+
 Fuse a SwiGLU up-projection (the weight uses concatenated [gate | up] columns):
 
     python run/hopper_pregather_gemm.py \
@@ -112,6 +124,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cluster-m", type=int, default=2)
     parser.add_argument("--max-swizzle-size", type=int, default=8)
     parser.add_argument("--pingpong", action="store_true")
+    parser.add_argument(
+        "--epilogue-store",
+        choices=("tma", "bulk_rows", "bulk_rows_reduce"),
+        default="tma",
+        help=(
+            "Output I/O: tma uses the existing subtile tensor stores; bulk_rows stages "
+            "the full tile in SMEM and issues one linear cp.async.bulk per valid row "
+            "(plain GEMM only; supports --pingpong). bulk_rows_reduce uses per-row "
+            "reduce-add instead, with output zeroing excluded from timing."
+        ),
+    )
 
     parser.add_argument(
         "--routing-with-replacement",
@@ -159,6 +182,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(f"warmup must be nonnegative, got {args.warmup}")
     if args.down_projection and args.activation is None:
         raise ValueError("--down-projection requires --activation")
+    if args.epilogue_store in ("bulk_rows", "bulk_rows_reduce") and args.activation is not None:
+        raise ValueError(
+            f"--epilogue-store {args.epilogue_store} requires --activation to be omitted"
+        )
     if args.routes % args.experts != 0:
         raise ValueError(f"routes ({args.routes}) must be divisible by experts ({args.experts})")
     routes_per_expert = args.routes // args.experts
@@ -298,6 +325,7 @@ def make_launch(args: argparse.Namespace, inputs: PregatherInputs):
                 # selects the ordinary TMA A-load path instead of gather-A.
                 A_idx=None,
                 use_tma_gather=False,
+                epilogue_store=args.epilogue_store,
             )
 
         if args.down_projection:
@@ -322,6 +350,7 @@ def make_launch(args: argparse.Namespace, inputs: PregatherInputs):
                 # The activated rows are already expert-contiguous.
                 A_idx=None,
                 use_tma_gather=False,
+                epilogue_store=args.epilogue_store,
             )
 
     return launch
@@ -334,10 +363,53 @@ def benchmark(
     iterations: int,
     samples: int,
     use_cuda_graph: bool,
+    reset_output=None,
 ) -> list[float]:
-    """Return per-operation milliseconds for every timing sample."""
+    """Return per-operation milliseconds, excluding optional output resets.
+
+    Reduction timing uses one event pair per launch. External events become
+    actual record nodes in a CUDA graph, so their timestamps update on replay.
+    Zeroing precedes the start event on the same stream, outside the interval.
+    Ordinary-launch timing can still include host enqueue gaps; prefer graphs.
+    """
+    if reset_output is not None:
+        events = [
+            (
+                torch.cuda.Event(enable_timing=True, external=use_cuda_graph),
+                torch.cuda.Event(enable_timing=True, external=use_cuda_graph),
+            )
+            for _ in range(iterations)
+        ]
+
+        def measured_launches():
+            for start, end in events:
+                reset_output()
+                start.record()
+                launch()
+                end.record()
+
+        graph = None
+        if use_cuda_graph:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                measured_launches()
+            graph.replay()
+            torch.cuda.synchronize()
+
+        timings_ms = []
+        for _ in range(samples):
+            if graph is not None:
+                graph.replay()
+            else:
+                measured_launches()
+            events[-1][1].synchronize()
+            timings_ms.append(sum(start.elapsed_time(end) for start, end in events) / iterations)
+        return timings_ms
+
     graph = None
     if use_cuda_graph:
+        # One graph contains many back-to-back kernel nodes. This removes the
+        # host enqueue gaps that distort CUDA-event timings for short kernels.
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             for _ in range(iterations):
@@ -497,12 +569,16 @@ def main() -> None:
         f"cluster=({args.cluster_m}, 1, 1), persistent=True, gather=none (TMA A load)"
     )
     print(f"Fused activation: {args.activation or 'disabled'}")
+    print(f"Epilogue store: {args.epilogue_store}, pingpong: {args.pingpong}")
     print(f"Approximate tensor storage: {gib(tensor_bytes):.3f} GiB")
     compile_target = "up and down kernels" if args.down_projection else "kernel"
     print(f"Compiling and warming up the specialized QuACK {compile_target}...")
 
     launch = make_launch(args, inputs)
+    reset_output = inputs.up_output.zero_ if args.epilogue_store == "bulk_rows_reduce" else None
     for _ in range(max(1, args.warmup)):
+        if reset_output is not None:
+            reset_output()
         launch()
     torch.cuda.synchronize(device)
 
@@ -511,6 +587,7 @@ def main() -> None:
         iterations=args.iterations,
         samples=args.timing_samples,
         use_cuda_graph=not args.no_cuda_graph,
+        reset_output=reset_output,
     )
     median_ms = statistics.median(timings_ms)
     up_flops = 2 * args.routes * args.hidden * inputs.W_up.shape[-1]
@@ -518,6 +595,11 @@ def main() -> None:
     flops = up_flops + down_flops
     tflops = flops / (median_ms * 1e9)
     timing_kind = "CUDA graph + events" if not args.no_cuda_graph else "batched CUDA events"
+    if reset_output is not None:
+        timing_kind = (
+            "CUDA graph + per-GEMM events" if not args.no_cuda_graph else "per-GEMM CUDA events"
+        )
+        timing_kind += " (output zeroing excluded)"
     formatted_samples = ", ".join(f"{value:.4f}" for value in timings_ms)
     print(f"Timing method: {timing_kind}")
     operation_name = "two-GEMM MLP" if args.down_projection else "up GEMM"
