@@ -74,3 +74,53 @@ attributing a change in whole-kernel time to the stores alone.
 This mode reduces per-subtile synchronization but increases copy instruction
 count, introduces unswizzled SMEM accesses, and may reduce A/B stage depth.
 It is an experimental path; a speedup has not been established.
+
+
+## Bulk-row reduce-add
+
+Use the same full-tile staging with one elementwise reduction per valid row:
+
+```bash
+python run/hopper_gather_gemm.py --tile-m 128 --tile-n 128 --cluster-m 2 --epilogue-store bulk_rows_reduce
+python run/hopper_gather_gemm.py --tile-m 128 --tile-n 128 --cluster-m 2 --epilogue-store bulk_rows_reduce --pingpong
+```
+
+For BF16/FP16 this issues
+`cp.reduce.async.bulk.global.shared::cta.bulk_group.add.noftz.bf16` / `.f16`.
+The SMEM layout, lane-to-row assignment, boundary predicates, and bulk-group
+commit/wait protocol are shared with `bulk_rows`.
+
+At the low-level API, `gemm(..., epilogue_store="bulk_rows_reduce")` adds the
+converted epilogue result into the existing D values. It does **not** zero D.
+Callers wanting ordinary GEMM results must zero D before each invocation on the
+same stream (or establish an equivalent dependency). This mode inherits the
+bulk-row restrictions; `add_to_output=True` remains unsupported because the
+mode itself specifies accumulation. FP32 output uses `.add.f32`; on CUDA 12.9,
+subnormal inputs/results may flush to zero. FP16/BF16 use `.noftz`.
+
+The runner performs the reset automatically before **every** warmup and timed
+GEMM, including every iteration within every graph replay. It leaves the final
+result available for the reference check. For reduction timing, each iteration
+is ordered on one stream as:
+
+```text
+zero output -> start event -> GEMM -> end event
+```
+
+Each sample averages only the per-GEMM event intervals. Reported effective
+TFLOP/s therefore excludes zeroing, without subtracting a separately measured
+reset cost. CUDA graph capture uses external timing events so the event-record
+nodes run on every replay. Ordinary modes retain their existing batched timing.
+Keep CUDA graphs enabled for performance comparisons: `--no-cuda-graph` still
+excludes zeroing but can include host enqueue gaps in the per-GEMM intervals.
+Zeroing can affect cache residency even though its duration is excluded, and
+per-GEMM event instrumentation differs from the original batched timing.
+
+Numerical coverage includes accumulation into nonzero D (to detect an accidental
+plain store), zero-before-replay, ragged experts, N tails, padded strides,
+FP16/BF16/FP32 output, both pingpong modes, and runner graph/direct timing:
+
+```bash
+pytest tests/test_gemm_bulk_rows.py -x -k 'reduce_benchmark'
+pytest tests/test_gemm_bulk_rows.py -x
+```

@@ -1,4 +1,4 @@
-"""Numerical coverage for Hopper's full-tile, per-row bulk-copy epilogue.
+"""Numerical coverage for Hopper's full-tile, per-row bulk-copy/reduction epilogue.
 
 Run on Hopper: pytest tests/test_gemm_bulk_rows.py -x
 """
@@ -19,6 +19,7 @@ pytestmark = pytest.mark.skipif(
 
 @torch.inference_mode()
 @pytest.mark.parametrize("pingpong", [False, True], ids=["cooperative", "pingpong"])
+@pytest.mark.parametrize("mode", ["bulk_rows", "bulk_rows_reduce"])
 @pytest.mark.parametrize("n", [128, 136], ids=["full_n", "tail_n"])
 @pytest.mark.parametrize(
     ("dtype", "out_dtype"),
@@ -29,7 +30,7 @@ pytestmark = pytest.mark.skipif(
     ],
     ids=["bf16", "fp16", "fp32_output"],
 )
-def test_bulk_rows_gather(pingpong, n, dtype, out_dtype):
+def test_bulk_rows_gather(pingpong, mode, n, dtype, out_dtype):
     """Ragged/empty experts, N tails, padded pitches, persistent reuse and graph replay.
 
     The large final expert has more tiles than resident CTAs on H100/H200,
@@ -73,15 +74,19 @@ def test_bulk_rows_gather(pingpong, n, dtype, out_dtype):
     # Compile before capture. Calling the modes back-to-back also checks that
     # the host plan and JIT caches distinguish the store mode.
     launch("tma", tma_output)
-    launch("bulk_rows", output)
+    if mode == "bulk_rows_reduce":
+        output.zero_()
+    launch(mode, output)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        launch("bulk_rows", output)
+        if mode == "bulk_rows_reduce":
+            output.zero_()
+        launch(mode, output)
 
     for replay in range(2):
         if replay:
-            x.neg_()  # A new result must overwrite every row on the next replay.
+            x.neg_()  # Each replay must produce the new result without accumulation.
         output.fill_(float("nan"))
         graph.replay()
         launch("tma", tma_output)
@@ -108,8 +113,9 @@ def test_bulk_rows_gather(pingpong, n, dtype, out_dtype):
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("mode", ["bulk_rows", "bulk_rows_reduce"])
 @pytest.mark.parametrize("tile_m,pingpong", [(256, False), (128, True)])
-def test_bulk_rows_dense_linear_epilogue(tile_m, pingpong):
+def test_bulk_rows_dense_linear_epilogue(tile_m, pingpong, mode):
     """The full-tile store preserves C, alpha/beta, and batch addressing."""
     torch.manual_seed(7)
     dtype = torch.bfloat16
@@ -130,13 +136,28 @@ def test_bulk_rows_dense_linear_epilogue(tile_m, pingpong):
         alpha=0.5,
         beta=0.25,
     )
-    for mode, out in (("tma", tma_output), ("bulk_rows", output)):
-        gemm(a, b, out, epilogue_store=mode, **config)
+    output.zero_()
+    for store_mode, out in (("tma", tma_output), (mode, output)):
+        gemm(a, b, out, epilogue_store=store_mode, **config)
     reference = 0.5 * (a.float() @ b.float().transpose(1, 2)) + 0.25 * c.float()
     baseline = (0.5 * (a @ b.transpose(1, 2)).float() + 0.25 * c.float()).to(dtype).float()
     torch.testing.assert_close(output, tma_output, atol=0, rtol=0)
     baseline_error = (baseline - reference).abs().max().item()
     torch.testing.assert_close(output.float(), reference, atol=2 * baseline_error + 1e-3, rtol=1e-3)
+
+    if mode == "bulk_rows_reduce":
+        # A nonzero destination distinguishes a real reduction from a plain copy.
+        initial = torch.randn_like(output)
+        output.copy_(initial)
+        gemm(a, b, output, epilogue_store=mode, **config)
+        expected = (initial.float() + tma_output.float()).to(dtype)
+        torch.testing.assert_close(output, expected, atol=0, rtol=0)
+        full_reference = initial.float() + reference
+        full_baseline = (initial.float() + baseline).to(dtype).float()
+        baseline_error = (full_baseline - full_reference).abs().max().item()
+        torch.testing.assert_close(
+            output.float(), full_reference, atol=2 * baseline_error + 1e-3, rtol=1e-3
+        )
 
     # A different pointer with the same tensor metadata must still be checked
     # when it hits the warm plan cache. The successful result above also checks
@@ -144,4 +165,52 @@ def test_bulk_rows_dense_linear_epilogue(tile_m, pingpong):
     backing = torch.empty(output.numel() + 1, dtype=dtype, device="cuda")
     unaligned = backing[1:].view_as(output)
     with pytest.raises(ValueError, match="16-byte-aligned output base"):
-        gemm(a, b, unaligned, epilogue_store="bulk_rows", **config)
+        gemm(a, b, unaligned, epilogue_store=mode, **config)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("use_cuda_graph", [False, True], ids=["direct", "graph"])
+def test_bulk_rows_reduce_benchmark(use_cuda_graph):
+    """Every timed invocation/replay starts at zero and leaves a valid GEMM result."""
+    from run.hopper_gather_gemm import benchmark
+
+    torch.manual_seed(19)
+    a = torch.randn(129, 128, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(136, 128, device="cuda", dtype=torch.bfloat16) / math.sqrt(128)
+    output = torch.empty(129, 136, device="cuda", dtype=torch.bfloat16)
+
+    def launch():
+        gemm(
+            a,
+            b,
+            output,
+            C=None,
+            tile_count_semaphore=None,
+            tile_M=128,
+            tile_N=128,
+            cluster_M=2,
+            cluster_N=1,
+            epilogue_store="bulk_rows_reduce",
+        )
+
+    output.zero_()
+    launch()  # Compile outside capture/timing.
+    torch.cuda.synchronize()
+    for repeat in range(2):
+        if repeat:
+            a.neg_()
+        output.fill_(float("nan"))
+        timings = benchmark(
+            launch,
+            iterations=3,
+            samples=2,
+            use_cuda_graph=use_cuda_graph,
+            reset_output=output.zero_,
+        )
+        reference = a.float() @ b.float().T
+        baseline = (a @ b.T).float()
+        baseline_error = (baseline - reference).abs().max().item()
+        torch.testing.assert_close(
+            output.float(), reference, atol=2 * baseline_error + 1e-3, rtol=1e-3
+        )
+        assert len(timings) == 2 and all(math.isfinite(t) and t > 0 for t in timings)

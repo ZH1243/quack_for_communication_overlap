@@ -186,9 +186,10 @@ class GemmSm90(GemmTmaBase):
         """
 
         self.acc_dtype = acc_dtype
-        if epilogue_store not in ("tma", "bulk_rows"):
-            raise ValueError("epilogue_store must be 'tma' or 'bulk_rows'")
-        self.bulk_row_store = epilogue_store == "bulk_rows"
+        if epilogue_store not in ("tma", "bulk_rows", "bulk_rows_reduce"):
+            raise ValueError("epilogue_store must be 'tma', 'bulk_rows', or 'bulk_rows_reduce'")
+        self.bulk_row_reduce = epilogue_store == "bulk_rows_reduce"
+        self.bulk_row_store = epilogue_store in ("bulk_rows", "bulk_rows_reduce")
         if self.bulk_row_store:
             assert self.arch == 90 and split_k == 1 and not gather_table and not concat_layout
         # The MMA compute dtype for A. Without a transform, mA must arrive
@@ -1648,6 +1649,8 @@ class GemmSm90(GemmTmaBase):
                     sD.iterator + row * tile_n,
                     gD.iterator + cute.crd2idx((row_start + row, col_start), gD.layout),
                     store_bytes,
+                    reduction_kind="add" if const_expr(self.bulk_row_reduce) else None,
+                    dtype=self.d_dtype,
                 )
 
     def canonical_a_load(self, tiled_mma, sA, tidx, tCrA):

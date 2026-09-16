@@ -492,13 +492,15 @@ def gemm(
     # Optional int32[1] count of the prefix of gather_work_table currently
     # resident in HBM. The scheduler warp waits before loading an unavailable row.
     gather_work_table_ready: Optional[Tensor] = None,
-    # SM90: stage the full D tile and issue one linear bulk copy per valid row.
+    # SM90: stage the full D tile and issue one linear bulk copy/reduction per row.
+    # bulk_rows_reduce adds the converted epilogue result to D; callers must
+    # initialize D (zero it before every launch for ordinary GEMM semantics).
     epilogue_store: str = "tma",
 ) -> _GemmPlan:
     # Alignment is pointer-dependent, unlike the metadata cached below. Check
     # every launch so an unaligned view cannot reuse an aligned tensor's plan.
-    if epilogue_store == "bulk_rows" and D.data_ptr() % 16:
-        raise ValueError("bulk_rows requires a 16-byte-aligned output base")
+    if epilogue_store in ("bulk_rows", "bulk_rows_reduce") and D.data_ptr() % 16:
+        raise ValueError(f"{epilogue_store} requires a 16-byte-aligned output base")
     multi_buffer_gather_args = None
     if multi_buffer_gather:
         if not isinstance(A, (tuple, list)) or not isinstance(A_idx, (tuple, list)):
@@ -978,21 +980,25 @@ def _build_gemm_plan(
         assert B.stride(-2) == 1, "varlen_k requires B to be n-major"
 
     device_capacity = get_device_capacity(A.device)
-    if epilogue_store not in ("tma", "bulk_rows"):
-        raise ValueError("epilogue_store must be 'tma' or 'bulk_rows'")
-    if epilogue_store == "bulk_rows":
+    if epilogue_store not in ("tma", "bulk_rows", "bulk_rows_reduce"):
+        raise ValueError("epilogue_store must be 'tma', 'bulk_rows', or 'bulk_rows_reduce'")
+    if epilogue_store in ("bulk_rows", "bulk_rows_reduce"):
         if device_capacity[0] != 9:
-            raise ValueError("bulk_rows epilogue requires SM90")
+            raise ValueError(f"{epilogue_store} epilogue requires SM90")
         if add_to_output or split_k != 1 or gather_table or concat_layout:
-            raise ValueError("bulk_rows does not support add_to_output, split-K, tables, or concat")
+            raise ValueError(
+                f"{epilogue_store} does not support add_to_output, split-K, tables, or concat"
+            )
         if D.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-            raise ValueError("bulk_rows requires FP16, BF16, or FP32 output")
+            raise ValueError(f"{epilogue_store} requires FP16, BF16, or FP32 output")
         if SFD is not None or SFDCol is not None:
-            raise ValueError("bulk_rows does not support output scale factors")
+            raise ValueError(f"{epilogue_store} does not support output scale factors")
         if D.stride(-1) != 1 or D.shape[-1] * D.element_size() % 16:
-            raise ValueError("bulk_rows requires contiguous rows with a 16-byte-multiple width")
+            raise ValueError(
+                f"{epilogue_store} requires contiguous rows with a 16-byte-multiple width"
+            )
         if any(s * D.element_size() % 16 for s in D.stride()[:-1]):
-            raise ValueError("bulk_rows requires 16-byte-aligned output row/batch strides")
+            raise ValueError(f"{epilogue_store} requires 16-byte-aligned output row/batch strides")
     assert device_capacity[0] in [8, 9, 10, 11, 12], (
         "Only SM8x, SM90, SM100, SM110, and SM120 are supported"
     )
