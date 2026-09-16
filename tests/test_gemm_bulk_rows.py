@@ -214,3 +214,43 @@ def test_bulk_rows_reduce_benchmark(use_cuda_graph):
             output.float(), reference, atol=2 * baseline_error + 1e-3, rtol=1e-3
         )
         assert len(timings) == 2 and all(math.isfinite(t) and t > 0 for t in timings)
+
+
+@pytest.mark.parametrize("use_cuda_graph", [False, True], ids=["direct", "graph"])
+def test_bulk_rows_reduce_runner_main(monkeypatch, use_cuda_graph):
+    """Enter main outside inference mode, as the CLI does, and check its output."""
+    import sys
+
+    from run import hopper_gather_gemm as runner
+
+    argv = (
+        "hopper_gather_gemm.py --tokens 257 --hidden 128 --output-dim 136 "
+        "--experts 2 --routes 258 --tile-m 128 --tile-n 128 "
+        "--warmup 2 --iterations 2 --timing-samples 2 "
+        "--epilogue-store bulk_rows_reduce --pingpong"
+    ).split()
+    if not use_cuda_graph:
+        argv.append("--no-cuda-graph")
+    monkeypatch.setattr(sys, "argv", argv)
+    prepared = []
+    prepare_inputs = runner.prepare_inputs
+
+    def capture_inputs(args, device):
+        inputs = prepare_inputs(args, device)
+        prepared.append(inputs)
+        return inputs
+
+    monkeypatch.setattr(runner, "prepare_inputs", capture_inputs)
+    # Do not decorate this test with inference_mode: that would hide the bug.
+    with torch.inference_mode(False):
+        runner.main()
+    inputs = prepared[0]
+    for expert in range(2):
+        lo, hi = expert * 129, (expert + 1) * 129
+        gathered = inputs.X[inputs.A_idx[lo:hi].long()]
+        reference = gathered.float() @ inputs.W_up[expert].float()
+        baseline = (gathered @ inputs.W_up[expert]).float()
+        baseline_error = (baseline - reference).abs().max().item()
+        torch.testing.assert_close(
+            inputs.output[lo:hi].float(), reference, atol=2 * baseline_error + 1e-3, rtol=1e-3
+        )

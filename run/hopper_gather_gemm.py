@@ -538,6 +538,7 @@ def gib(nbytes: int) -> float:
     return nbytes / (1024**3)
 
 
+@torch.inference_mode()
 def main() -> None:
     args = parse_args()
     validate_args(args)
