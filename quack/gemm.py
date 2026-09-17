@@ -985,9 +985,9 @@ def _build_gemm_plan(
     if epilogue_store in ("bulk_rows", "bulk_rows_reduce"):
         if device_capacity[0] != 9:
             raise ValueError(f"{epilogue_store} epilogue requires SM90")
-        if add_to_output or split_k != 1 or gather_table or concat_layout:
+        if add_to_output or split_k != 1 or concat_layout:
             raise ValueError(
-                f"{epilogue_store} does not support add_to_output, split-K, tables, or concat"
+                f"{epilogue_store} does not support add_to_output, split-K, or concat"
             )
         if D.dtype not in (torch.float16, torch.bfloat16, torch.float32):
             raise ValueError(f"{epilogue_store} requires FP16, BF16, or FP32 output")

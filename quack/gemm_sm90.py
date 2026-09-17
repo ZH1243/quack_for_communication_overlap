@@ -191,7 +191,7 @@ class GemmSm90(GemmTmaBase):
         self.bulk_row_reduce = epilogue_store == "bulk_rows_reduce"
         self.bulk_row_store = epilogue_store in ("bulk_rows", "bulk_rows_reduce")
         if self.bulk_row_store:
-            assert self.arch == 90 and split_k == 1 and not gather_table and not concat_layout
+            assert self.arch == 90 and split_k == 1 and not concat_layout
         # The MMA compute dtype for A. Without a transform, mA must arrive
         # typed exactly this; a layout-owning transform decouples storage
         # (self.a_dtype, from the tensor) from compute and must produce
@@ -1466,7 +1466,11 @@ class GemmSm90(GemmTmaBase):
                             sD,
                             d_tensor,
                             d_tile_coord,
-                            varlen_manager.len_m(batch_idx),
+                            # Table D is already shifted to the CTA's route start.
+                            # Bound linear stores by that descriptor's valid rows.
+                            cutlass.max(tile_coord_mnkl[2] - tile_coord_mnkl[0], Int32(0))
+                            if const_expr(self.gather_table)
+                            else varlen_manager.len_m(batch_idx),
                             tidx,
                         )
                     else:

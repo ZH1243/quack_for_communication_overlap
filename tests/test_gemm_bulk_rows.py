@@ -18,6 +18,7 @@ pytestmark = pytest.mark.skipif(
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("routing", ["varlen", "table", "pregather_table"])
 @pytest.mark.parametrize("pingpong", [False, True], ids=["cooperative", "pingpong"])
 @pytest.mark.parametrize("mode", ["bulk_rows", "bulk_rows_reduce"])
 @pytest.mark.parametrize("n", [128, 136], ids=["full_n", "tail_n"])
@@ -30,7 +31,7 @@ pytestmark = pytest.mark.skipif(
     ],
     ids=["bf16", "fp16", "fp32_output"],
 )
-def test_bulk_rows_gather(pingpong, mode, n, dtype, out_dtype):
+def test_bulk_rows_gather(routing, pingpong, mode, n, dtype, out_dtype):
     """Ragged/empty experts, N tails, padded pitches, persistent reuse and graph replay.
 
     The large final expert has more tiles than resident CTAs on H100/H200,
@@ -67,6 +68,23 @@ def test_bulk_rows_gather(pingpong, mode, n, dtype, out_dtype):
         cu_seqlens_m=cu_seqlens,
         A_idx=indices,
     )
+    if routing != "varlen":
+        from run.hopper_gather_table_gemm import build_work_table
+
+        table, _, _ = build_work_table(
+            list(counts),
+            output_dim=n,
+            tile_m=128,
+            tile_n=128,
+            cluster_m=2,
+            max_swizzle_size=8,
+            device=x.device,
+        )
+        config.update(cu_seqlens_m=None, gather_work_table=table)
+        if routing == "pregather_table":
+            x = x[indices.long()]
+            indices = torch.arange(routes, dtype=torch.int32, device=x.device)
+            config["A_idx"] = indices
 
     def launch(mode, out):
         gemm(x, b, out, epilogue_store=mode, **config)

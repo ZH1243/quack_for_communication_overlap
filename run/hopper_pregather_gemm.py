@@ -19,7 +19,8 @@ With ``--gather-table``, it instead uses the single-buffer, non-indexed table
 kernel from ``hopper_gather_table_gemm.py`` with A as the token buffer and
 identity int32 indices. The table replaces cu_seqlens_m in the up GEMM;
 A loads still use cp.async gather. Table and identity-index construction are
-excluded from timing. This mode requires ``--epilogue-store tma``.
+excluded from timing. All three epilogue-store modes support table scheduling;
+the bulk modes require plain GEMM without a fused activation.
 When ``--down-projection`` is enabled, the activated output is already
 expert-contiguous and feeds a second grouped GEMM using the same cu_seqlens_m.
 The pre-gather operation, compilation, warmup, graph capture, and correctness
@@ -197,8 +198,6 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.warmup < 0:
         raise ValueError(f"warmup must be nonnegative, got {args.warmup}")
     if args.gather_table:
-        if args.epilogue_store != "tma":
-            raise ValueError("--gather-table requires --epilogue-store tma")
         if args.max_swizzle_size <= 0:
             raise ValueError("--gather-table requires positive --max-swizzle-size")
         gemm_output_dim = args.output_dim * (2 if args.activation in GATED_ACTIVATIONS else 1)
