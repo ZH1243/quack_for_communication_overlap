@@ -53,7 +53,10 @@ This works with or without --gather-table. Mapping construction is untimed;
 index loads and scattered stores are included in GEMM timing.
 Add --scatter-table-with-replacement with bulk_rows_reduce to sample destinations
 with replacement. Contributions to each destination are summed; unused rows stay
-zero. The correctness check accounts for output-dtype accumulation rounding.
+zero. --scatter-table-destination-rows R1 restricts sampling to [0, R1), with
+1 <= R1 <= R (default R), leaving output[R1:] zero. Smaller R1 increases the
+average number of contributions per eligible destination to R/R1.
+The correctness check accounts for output-dtype accumulation rounding.
 The bulk_rows_reduce mode adds into the destination, so the runner zeros it
 before every launch, excluding zeroing from the reported GEMM time.
 
@@ -174,6 +177,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--scatter-table-destination-rows",
+        type=int,
+        default=None,
+        metavar="R1",
+        help=(
+            "Sample scatter destinations from [0, R1), with 1 <= R1 <= routes "
+            "(default: routes; requires --scatter-table-with-replacement). "
+            "Output retains routes rows; rows R1: remain zero."
+        ),
+    )
+    parser.add_argument(
         "--epilogue-store",
         choices=("tma", "bulk_rows", "bulk_rows_reduce"),
         default="tma",
@@ -229,6 +243,13 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"{name} must be positive, got {value}")
     if args.warmup < 0:
         raise ValueError(f"warmup must be nonnegative, got {args.warmup}")
+    if args.scatter_table_destination_rows is not None:
+        if not args.scatter_table_with_replacement:
+            raise ValueError(
+                "--scatter-table-destination-rows requires --scatter-table-with-replacement"
+            )
+        if not 1 <= args.scatter_table_destination_rows <= args.routes:
+            raise ValueError("--scatter-table-destination-rows must be between 1 and routes")
     if args.scatter_table_with_replacement:
         if not args.scatter_table:
             raise ValueError("--scatter-table-with-replacement requires --scatter-table")
@@ -348,7 +369,14 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> PregatherI
     scatter_table = None
     if args.scatter_table:
         scatter_table = (
-            torch.randint(args.routes, (args.routes,), dtype=torch.int32, device=device)
+            torch.randint(
+                args.scatter_table_destination_rows
+                if args.scatter_table_destination_rows is not None
+                else args.routes,
+                (args.routes,),
+                dtype=torch.int32,
+                device=device,
+            )
             if args.scatter_table_with_replacement
             else torch.randperm(args.routes, dtype=torch.int32, device=device)
         )
@@ -768,6 +796,16 @@ def main() -> None:
             else "random permutation"
         )
         print(f"Scatter table: {scatter_description}, {args.routes} routed output rows")
+        if inputs.scatter_with_replacement:
+            destination_rows = (
+                args.scatter_table_destination_rows
+                if args.scatter_table_destination_rows is not None
+                else args.routes
+            )
+            print(
+                f"Scatter destination range: [0, {destination_rows}), "
+                f"{args.routes / destination_rows:.3f} mean contributions per eligible row"
+            )
     print(f"Approximate tensor storage: {gib(tensor_bytes):.3f} GiB")
     compile_target = "up and down kernels" if args.down_projection else "kernel"
     print(f"Compiling and warming up the specialized QuACK {compile_target}...")

@@ -288,9 +288,19 @@ def test_bulk_rows_reduce_benchmark(use_cuda_graph):
 
 @pytest.mark.parametrize("use_cuda_graph", [False, True], ids=["direct", "graph"])
 @pytest.mark.parametrize(
-    "runner_variant", ["gather", "pregather_scatter", "pregather_duplicates"]
+    ("runner_variant", "destination_rows"),
+    [
+        ("gather", None),
+        ("pregather_scatter", None),
+        ("pregather_duplicates", None),
+        ("pregather_duplicates", 1),
+        ("pregather_duplicates", 17),
+        ("pregather_duplicates", 258),
+    ],
 )
-def test_bulk_rows_reduce_runner_main(monkeypatch, use_cuda_graph, runner_variant):
+def test_bulk_rows_reduce_runner_main(
+    monkeypatch, use_cuda_graph, runner_variant, destination_rows
+):
     """Enter main outside inference mode, as the CLI does, and check its output."""
     import sys
 
@@ -309,6 +319,8 @@ def test_bulk_rows_reduce_runner_main(monkeypatch, use_cuda_graph, runner_varian
         argv.extend(("--gather-table", "--scatter-table"))
     if runner_variant == "pregather_duplicates":
         argv.append("--scatter-table-with-replacement")
+    if destination_rows is not None:
+        argv.extend(("--scatter-table-destination-rows", str(destination_rows)))
     if not use_cuda_graph:
         argv.append("--no-cuda-graph")
     monkeypatch.setattr(sys, "argv", argv)
@@ -328,6 +340,16 @@ def test_bulk_rows_reduce_runner_main(monkeypatch, use_cuda_graph, runner_varian
     if runner_variant == "pregather_duplicates":
         # Validate the CLI contract alongside a numerically checked valid run.
         args = runner.parse_args()
+        for invalid_rows in (-1, 0, args.routes + 1):
+            args.scatter_table_destination_rows = invalid_rows
+            with pytest.raises(ValueError, match="must be between 1 and routes"):
+                runner.validate_args(args)
+        args.scatter_table_destination_rows = 1
+        args.scatter_table_with_replacement = False
+        with pytest.raises(ValueError, match="requires --scatter-table-with-replacement"):
+            runner.validate_args(args)
+        args.scatter_table_with_replacement = True
+        args.scatter_table_destination_rows = destination_rows
         for store_mode in ("tma", "bulk_rows"):
             args.epilogue_store = store_mode
             with pytest.raises(ValueError, match="requires --epilogue-store bulk_rows_reduce"):
@@ -340,13 +362,19 @@ def test_bulk_rows_reduce_runner_main(monkeypatch, use_cuda_graph, runner_varian
         runner.check_correctness(inputs, activation=None, atol=3e-2, rtol=1e-3)
         counts = torch.bincount(inputs.scatter_table.long(), minlength=258)
         assert (counts > 1).any() and (counts == 0).any()
+        limit = 258 if destination_rows is None else destination_rows
+        assert ((inputs.scatter_table >= 0) & (inputs.scatter_table < limit)).all()
+        torch.testing.assert_close(
+            inputs.output[limit:], torch.zeros_like(inputs.output[limit:]), atol=0, rtol=0
+        )
         empty_row = (counts == 0).nonzero()[0, 0]
         inputs.output[empty_row, 0] = 1
         with pytest.raises(AssertionError):
             runner.check_correctness(inputs, activation=None, atol=3e-2, rtol=1e-3)
         inputs.output[empty_row, 0] = 0
         destination = inputs.scatter_table[0].long()
-        inputs.output[destination, 0] += 100
+        # Exceed even the rounding bound when all 258 contributions collide.
+        inputs.output[destination, 0] += 10000
         with pytest.raises(AssertionError, match="rounding bound"):
             runner.check_correctness(inputs, activation=None, atol=3e-2, rtol=1e-3)
         return

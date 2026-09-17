@@ -183,11 +183,23 @@ from `[0, R)` with replacement. This requires `--scatter-table` and
 `--epilogue-store bulk_rows_reduce`; the existing permutation mode is unchanged.
 Sampling allows duplicates but does not force them (for example, R=1).
 
+Use `--scatter-table-destination-rows R1` to sample from `[0, R1)` instead.
+It requires replacement mode and `1 <= R1 <= R`; omitting it defaults to R
+and preserves the previous behavior. The mapping still has R entries and the
+output still has R rows. After each zero-initialized launch, `output[R1:]` is
+exactly zero; unreferenced rows within `[0, R1)` also remain zero.
+The mean number of contributions per eligible destination is R/R1, so reducing
+R1 increases collision concentration. R1=1 sends every contribution to row 0.
+
 ```bash
 python run/hopper_pregather_gemm.py --gather-table --scatter-table \
     --scatter-table-with-replacement --tile-m 128 --tile-n 128 \
     --epilogue-store bulk_rows_reduce --pingpong
+python run/hopper_pregather_gemm.py --routes 8192 --gather-table --scatter-table \
+    --scatter-table-with-replacement --scatter-table-destination-rows 1024 \
+    --tile-m 128 --tile-n 128 --epilogue-store bulk_rows_reduce --pingpong
 pytest tests/test_gemm_bulk_rows.py -x -k 'scatter_duplicates and concentrated and cooperative and bf16'
+pytest tests/test_gemm_bulk_rows.py -x -k 'runner_main and pregather_duplicates'
 ```
 
 Every source row contributes to `output[scatter_table[i]]`, even when other rows
