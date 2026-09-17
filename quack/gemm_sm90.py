@@ -1449,13 +1449,18 @@ class GemmSm90(GemmTmaBase):
                         d_batch_idx = tile_scheduler.get_combined_batch_idx(batch_idx, split_idx)
                     if const_expr(self.gather_table):
                         route_start, route_end = tile_coord_mnkl[0], tile_coord_mnkl[2]
-                        d_tensor = copy_utils.offset_ragged_tensor(
-                            mD_mnl,
-                            route_start,
-                            cutlass.max(route_end - route_start, Int32(0)),
-                            ragged_dim=0,
-                            ptr_shift=True,
-                        )
+                        if const_expr(self.bulk_row_store):
+                            # Bulk stores receive ordinary rank-2 D, not the
+                            # extra-dimension ragged view created for TMA.
+                            d_tensor = cute.domain_offset((route_start, None), mD_mnl)
+                        else:
+                            d_tensor = copy_utils.offset_ragged_tensor(
+                                mD_mnl,
+                                route_start,
+                                cutlass.max(route_end - route_start, Int32(0)),
+                                ragged_dim=0,
+                                ptr_shift=True,
+                            )
                         d_tile_coord = (Int32(0), tile_coord_mnkl[1], None, d_batch_idx)
                     else:
                         d_tensor = varlen_manager.offset_batch_epi(mD_mnl, d_batch_idx)

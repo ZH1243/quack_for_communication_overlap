@@ -132,6 +132,52 @@ def test_bulk_rows_gather(routing, pingpong, mode, n, dtype, out_dtype):
 
 @torch.inference_mode()
 @pytest.mark.parametrize("mode", ["bulk_rows", "bulk_rows_reduce"])
+def test_table_bulk_rows_output_view(mode):
+    """Table offsets preserve plain D's N mode, row pitch, and partial-row bounds."""
+    torch.manual_seed(7)
+    routes, n, k = 3, 136, 128
+    a = torch.randn(routes, k, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(2, k, n, device="cuda", dtype=a.dtype) / math.sqrt(k)
+    indices = torch.arange(routes, device="cuda", dtype=torch.int32)
+    table = torch.tensor([[0, 0, 1, 0], [1, 1, 3, 0]], device="cuda", dtype=torch.int32)
+    sentinel = -123.0
+    storage = torch.full((routes + 2, n + 8), sentinel, device="cuda", dtype=a.dtype)
+    output = storage[1:-1, :n]
+    # Nonzero initialization checks that the reduction path adds rather than copies.
+    initial = torch.full_like(output, 0.25)
+    output.copy_(initial)
+    gemm(
+        a,
+        weights.transpose(1, 2),
+        output,
+        C=None,
+        tile_count_semaphore=None,
+        tile_M=128,
+        tile_N=128,
+        cluster_M=2,
+        cluster_N=1,
+        persistent=True,
+        is_dynamic_persistent=False,
+        A_idx=indices,
+        gather_work_table=table,
+        epilogue_store=mode,
+    )
+    reference = torch.cat(
+        (a[:1].float() @ weights[0].float(), a[1:].float() @ weights[1].float())
+    )
+    baseline = torch.cat((a[:1] @ weights[0], a[1:] @ weights[1])).float()
+    if mode == "bulk_rows_reduce":
+        reference = reference + initial.float()
+        baseline = (baseline + initial.float()).to(output.dtype).float()
+    baseline_error = (baseline - reference).abs().max().item()
+    torch.testing.assert_close(output.float(), reference, atol=2 * baseline_error + 1e-3, rtol=1e-3)
+    torch.testing.assert_close(storage[0], torch.full_like(storage[0], sentinel))
+    torch.testing.assert_close(storage[-1], torch.full_like(storage[-1], sentinel))
+    torch.testing.assert_close(storage[1:-1, n:], torch.full_like(storage[1:-1, n:], sentinel))
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("mode", ["bulk_rows", "bulk_rows_reduce"])
 @pytest.mark.parametrize("tile_m,pingpong", [(256, False), (128, True)])
 def test_bulk_rows_dense_linear_epilogue(tile_m, pingpong, mode):
     """The full-tile store preserves C, alpha/beta, and batch addressing."""
