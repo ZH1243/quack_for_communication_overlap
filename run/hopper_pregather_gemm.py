@@ -21,6 +21,8 @@ identity int32 indices. The table replaces cu_seqlens_m in the up GEMM;
 A loads still use cp.async gather. Table and identity-index construction are
 excluded from timing. All three epilogue-store modes support table scheduling;
 the bulk modes require plain GEMM without a fused activation.
+Add ``--gather-table-n-group-major`` to traverse all experts for each N group,
+reversing both expert and M-cluster order on alternate N groups.
 When ``--down-projection`` is enabled, the activated output is already
 expert-contiguous and feeds a second grouped GEMM using the same cu_seqlens_m.
 The pre-gather operation, compilation, warmup, graph capture, and correctness
@@ -142,6 +144,11 @@ def parse_args() -> argparse.Namespace:
         help="Use table-scheduled cp.async gather on pre-gathered A with identity indices",
     )
     parser.add_argument(
+        "--gather-table-n-group-major",
+        action="store_true",
+        help="Traverse all experts per N group in serpentine order (requires --gather-table)",
+    )
+    parser.add_argument(
         "--epilogue-store",
         choices=("tma", "bulk_rows", "bulk_rows_reduce"),
         default="tma",
@@ -197,6 +204,8 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"{name} must be positive, got {value}")
     if args.warmup < 0:
         raise ValueError(f"warmup must be nonnegative, got {args.warmup}")
+    if args.gather_table_n_group_major and not args.gather_table:
+        raise ValueError("--gather-table-n-group-major requires --gather-table")
     if args.gather_table:
         if args.max_swizzle_size <= 0:
             raise ValueError("--gather-table requires positive --max-swizzle-size")
@@ -292,6 +301,7 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> PregatherI
             cluster_m=args.cluster_m,
             max_swizzle_size=args.max_swizzle_size,
             device=device,
+            n_group_major=args.gather_table_n_group_major,
         )
         # Preserve the original routing indices separately from the kernel indices.
         identity_A_idx = torch.arange(args.routes, dtype=torch.int32, device=A.device)
@@ -636,6 +646,12 @@ def main() -> None:
     )
     if inputs.gather_work_table is not None:
         print(f"Gather work table: {tuple(inputs.gather_work_table.shape)}")
+        table_order = (
+            "N-group-major, global serpentine"
+            if args.gather_table_n_group_major
+            else "expert-major, per-expert serpentine"
+        )
+        print(f"Gather table order: {table_order}")
     print(f"Fused activation: {args.activation or 'disabled'}")
     print(f"Epilogue store: {args.epilogue_store}, pingpong: {args.pingpong}")
     print(f"Approximate tensor storage: {gib(tensor_bytes):.3f} GiB")

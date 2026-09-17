@@ -281,8 +281,9 @@ def build_work_table(
     cluster_m: int,
     max_swizzle_size: int,
     device: torch.device,
+    n_group_major: bool = False,
 ) -> tuple[torch.Tensor, tuple[tuple[int, ...], ...], int]:
-    """Encode the current AlongN group/serpentine order into table rows."""
+    """Encode AlongN serpentine order, optionally traversing M across all experts."""
     route_offsets = [0]
     for count in counts:
         route_offsets.append(route_offsets[-1] + count)
@@ -305,6 +306,11 @@ def build_work_table(
                 start = expert_start + cid_m * cluster_rows
                 end = min(start + cluster_rows, expert_end)
                 rows.append((expert, start, end, cid_n_base))
+
+    if n_group_major:
+        # Global route offsets order both experts and their M clusters. Reverse
+        # that complete traversal on odd N groups, keeping each descriptor intact.
+        rows.sort(key=lambda row: (row[3], -row[1] if (row[3] // x) % 2 else row[1]))
 
     table = torch.tensor(rows, dtype=torch.int32, device=device)
     return table, (tuple(route_offsets),), x

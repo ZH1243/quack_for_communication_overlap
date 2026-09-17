@@ -8,6 +8,7 @@ import torch
 from run.hopper_gather_table_gemm import (
     balanced_buffer_allocations,
     build_multi_buffer_work_table,
+    build_work_table,
     multi_buffer_route_counts,
 )
 from run.hopper_stream_gather_table_gemm import (
@@ -15,6 +16,52 @@ from run.hopper_stream_gather_table_gemm import (
     proxy_command,
     raw_cuda_ipc_handle,
 )
+
+
+def test_n_group_major_table_preserves_grouped_gemm_values():
+    """Global serpentine ordering preserves all output tiles, including tails."""
+    counts = [5, 0, 3]
+    kwargs = dict(
+        output_dim=15,
+        tile_m=2,
+        tile_n=2,
+        cluster_m=2,
+        max_swizzle_size=2,
+        device=torch.device("cpu"),
+    )
+    default, _, _ = build_work_table(counts, **kwargs)
+    table, _, group_size = build_work_table(counts, n_group_major=True, **kwargs)
+    expected_rows = []
+    forward = [(0, 0, 4), (0, 4, 5), (2, 5, 8)]
+    for group, n_base in enumerate((0, 2, 4, 6)):
+        traversal = forward if group % 2 == 0 else forward[::-1]
+        expected_rows.extend((*row, n_base) for row in traversal)
+    assert table.tolist() == [list(row) for row in expected_rows]
+    assert sorted(table.tolist()) == sorted(default.tolist())
+    assert default[:, 0].tolist() == [0] * 8 + [2] * 4
+
+    torch.manual_seed(0)
+    source = torch.randn(6, 4)
+    routes = torch.tensor([4, 0, 2, 4, 1, 5, 3, 0])
+    a = source[routes]
+    identity = torch.arange(8)
+    weights = torch.randn(3, 4, 15)
+    output = torch.full((8, 15), float("nan"))
+    writes = torch.zeros((8, 15), dtype=torch.int32)
+    # Model the cluster work-ID expansion and each CTA's clipped output slice.
+    for expert, start, end, n_base in table.tolist():
+        for n_in_group in range(group_size):
+            col = (n_base + n_in_group) * 2
+            col_end = min(col + 2, 15)
+            for cta in range(2):
+                lo, hi = min(start + cta * 2, end), min(start + (cta + 1) * 2, end)
+                output[lo:hi, col:col_end] = (
+                    a[identity[lo:hi]] @ weights[expert, :, col:col_end]
+                )
+                writes[lo:hi, col:col_end] += 1
+    reference = torch.cat((source[routes[:5]] @ weights[0], source[routes[5:]] @ weights[2]))
+    torch.testing.assert_close(output, reference)
+    torch.testing.assert_close(writes, torch.ones_like(writes))
 
 
 def test_balanced_buffer_allocations_redistributes_exhausted_buffer():
