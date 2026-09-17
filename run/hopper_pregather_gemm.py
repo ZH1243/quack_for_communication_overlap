@@ -13,8 +13,13 @@ creates the same MoE inputs on CUDA:
     output:        [R, N], or [R, K] with --down-projection
 
 It then materializes ``A = X[A_idx]`` as a contiguous ``[R, K]`` CUDA tensor
-before invoking QuACK. The timed up-projection receives A and cu_seqlens_m, but
+before invoking QuACK. By default, the timed up-projection receives A and cu_seqlens_m, but
 does not receive A_idx, so its A operand uses the ordinary contiguous TMA path.
+With ``--gather-table``, it instead uses the single-buffer, non-indexed table
+kernel from ``hopper_gather_table_gemm.py`` with A as the token buffer and
+identity int32 indices. The table replaces cu_seqlens_m in the up GEMM;
+A loads still use cp.async gather. Table and identity-index construction are
+excluded from timing. This mode requires ``--epilogue-store tma``.
 When ``--down-projection`` is enabled, the activated output is already
 expert-contiguous and feeds a second grouped GEMM using the same cu_seqlens_m.
 The pre-gather operation, compilation, warmup, graph capture, and correctness
@@ -30,6 +35,10 @@ Select full-tile per-row bulk stores (also supports --pingpong):
 
     python run/hopper_pregather_gemm.py \
         --tile-m 128 --tile-n 128 --epilogue-store bulk_rows --pingpong
+
+Use table scheduling with pre-gathered tokens:
+
+    python run/hopper_pregather_gemm.py --gather-table
 
 The default --epilogue-store tma retains the existing subtile tensor stores.
 Both bulk_rows and bulk_rows_reduce require plain GEMM without --activation.
@@ -78,6 +87,8 @@ class PregatherInputs:
     A: torch.Tensor
     up_output: torch.Tensor
     output: torch.Tensor
+    gather_work_table: torch.Tensor | None = None
+    identity_A_idx: torch.Tensor | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -124,6 +135,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cluster-m", type=int, default=2)
     parser.add_argument("--max-swizzle-size", type=int, default=8)
     parser.add_argument("--pingpong", action="store_true")
+    parser.add_argument(
+        "--gather-table",
+        action="store_true",
+        help="Use table-scheduled cp.async gather on pre-gathered A with identity indices",
+    )
     parser.add_argument(
         "--epilogue-store",
         choices=("tma", "bulk_rows", "bulk_rows_reduce"),
@@ -180,6 +196,18 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"{name} must be positive, got {value}")
     if args.warmup < 0:
         raise ValueError(f"warmup must be nonnegative, got {args.warmup}")
+    if args.gather_table:
+        if args.epilogue_store != "tma":
+            raise ValueError("--gather-table requires --epilogue-store tma")
+        if args.max_swizzle_size <= 0:
+            raise ValueError("--gather-table requires positive --max-swizzle-size")
+        gemm_output_dim = args.output_dim * (2 if args.activation in GATED_ACTIVATIONS else 1)
+        clusters_n = math.ceil(gemm_output_dim / args.tile_n)
+        x = min(args.max_swizzle_size, clusters_n)
+        if clusters_n % x:
+            raise ValueError(
+                f"table expansion requires clusters_n % x == 0, got {clusters_n} % {x}"
+            )
     if args.down_projection and args.activation is None:
         raise ValueError("--down-projection requires --activation")
     if args.epilogue_store in ("bulk_rows", "bulk_rows_reduce") and args.activation is not None:
@@ -248,6 +276,26 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> PregatherI
     # route order. It runs before all GEMM warmup and timing regions.
     A = X[A_idx]
     assert A.is_contiguous()
+    gather_work_table = None
+    identity_A_idx = None
+    if args.gather_table:
+        # Support both direct script execution and python -m run.hopper_pregather_gemm.
+        if __package__:
+            from .hopper_gather_table_gemm import build_work_table
+        else:
+            from hopper_gather_table_gemm import build_work_table
+
+        gather_work_table, _, _ = build_work_table(
+            [routes_per_expert] * args.experts,
+            output_dim=gemm_output_dim,
+            tile_m=args.tile_m,
+            tile_n=args.tile_n,
+            cluster_m=args.cluster_m,
+            max_swizzle_size=args.max_swizzle_size,
+            device=device,
+        )
+        # Preserve the original routing indices separately from the kernel indices.
+        identity_A_idx = torch.arange(args.routes, dtype=torch.int32, device=A.device)
     up_output = torch.empty((args.routes, args.output_dim), dtype=dtype, device=device)
     output = (
         torch.empty((args.routes, args.hidden), dtype=dtype, device=device)
@@ -263,6 +311,8 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> PregatherI
         A=A,
         up_output=up_output,
         output=output,
+        gather_work_table=gather_work_table,
+        identity_A_idx=identity_A_idx,
     )
 
 
@@ -272,6 +322,14 @@ def make_launch(args: argparse.Namespace, inputs: PregatherInputs):
     # API below uses the torch-convention W_up view directly.
     B_up = inputs.W_up.transpose(1, 2)
     B_down = inputs.W_down.transpose(1, 2) if inputs.W_down is not None else None
+    up_cu_seqlens_m = inputs.cu_seqlens_m
+    up_A_idx = None
+    table_kwargs = {}
+    if args.gather_table:
+        assert inputs.gather_work_table is not None and inputs.identity_A_idx is not None
+        up_cu_seqlens_m = None
+        up_A_idx = inputs.identity_A_idx
+        table_kwargs = dict(gather_work_table=inputs.gather_work_table, multi_buffer_gather=False)
 
     if args.activation is not None:
         config = GemmConfig(
@@ -295,8 +353,9 @@ def make_launch(args: argparse.Namespace, inputs: PregatherInputs):
                 inputs.W_up,
                 activation=args.activation,
                 postact_out=inputs.up_output,
-                cu_seqlens_m=inputs.cu_seqlens_m,
-                A_idx=None,
+                cu_seqlens_m=up_cu_seqlens_m,
+                A_idx=up_A_idx,
+                **table_kwargs,
                 store_preact=False,
                 dynamic_scheduler=False,
                 tuned=False,
@@ -320,10 +379,10 @@ def make_launch(args: argparse.Namespace, inputs: PregatherInputs):
                 persistent=True,
                 is_dynamic_persistent=False,
                 max_swizzle_size=args.max_swizzle_size,
-                cu_seqlens_m=inputs.cu_seqlens_m,
-                # A is already route-major and contiguous. Omitting A_idx
-                # selects the ordinary TMA A-load path instead of gather-A.
-                A_idx=None,
+                cu_seqlens_m=up_cu_seqlens_m,
+                # Default: ordinary TMA. Table mode: cp.async with identity indices.
+                A_idx=up_A_idx,
+                **table_kwargs,
                 use_tma_gather=False,
                 epilogue_store=args.epilogue_store,
             )
@@ -548,6 +607,8 @@ def main() -> None:
     ]
     if inputs.W_down is not None:
         allocated_tensors.extend((inputs.W_down, inputs.output))
+    if inputs.gather_work_table is not None:
+        allocated_tensors.extend((inputs.gather_work_table, inputs.identity_A_idx))
     tensor_bytes = sum(tensor.numel() * tensor.element_size() for tensor in allocated_tensors)
     routes_per_expert = args.routes // args.experts
     print(f"Device: {torch.cuda.get_device_name(device)} (SM{capability[0]}{capability[1]})")
@@ -564,10 +625,17 @@ def main() -> None:
         f"Routes: {args.routes} total, {routes_per_expert} per expert, "
         f"sampling {'with' if args.routing_with_replacement else 'without'} replacement"
     )
+    gather_description = (
+        "table (cp.async A load, identity indices)"
+        if args.gather_table
+        else "none (TMA A load)"
+    )
     print(
         f"Kernel: tile=({args.tile_m}, {args.tile_n}, {args.tile_k or 'auto'}), "
-        f"cluster=({args.cluster_m}, 1, 1), persistent=True, gather=none (TMA A load)"
+        f"cluster=({args.cluster_m}, 1, 1), persistent=True, gather={gather_description}"
     )
+    if inputs.gather_work_table is not None:
+        print(f"Gather work table: {tuple(inputs.gather_work_table.shape)}")
     print(f"Fused activation: {args.activation or 'disabled'}")
     print(f"Epilogue store: {args.epilogue_store}, pingpong: {args.pingpong}")
     print(f"Approximate tensor storage: {gib(tensor_bytes):.3f} GiB")
