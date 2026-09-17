@@ -47,6 +47,10 @@ The default --epilogue-store tma retains the existing subtile tensor stores.
 Both bulk_rows and bulk_rows_reduce require plain GEMM without --activation.
 Output rows must have a 16-byte-multiple width (N divisible by 8 for BF16/FP16).
 Full-tile staging uses more shared memory; use a 128x128 tile to start.
+Add --scatter-table to either bulk mode to write A[i]'s result to
+output[scatter_table[i]], using a seeded random CUDA int32 permutation of [0, R).
+This works with or without --gather-table. Mapping construction is untimed;
+index loads and scattered stores are included in GEMM timing.
 The bulk_rows_reduce mode adds into the destination, so the runner zeros it
 before every launch, excluding zeroing from the reported GEMM time.
 
@@ -92,6 +96,7 @@ class PregatherInputs:
     output: torch.Tensor
     gather_work_table: torch.Tensor | None = None
     identity_A_idx: torch.Tensor | None = None
+    scatter_table: torch.Tensor | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -149,6 +154,14 @@ def parse_args() -> argparse.Namespace:
         help="Traverse all experts per N group in serpentine order (requires --gather-table)",
     )
     parser.add_argument(
+        "--scatter-table",
+        action="store_true",
+        help=(
+            "Scatter routed output rows using a random permutation (requires "
+            "--epilogue-store bulk_rows or bulk_rows_reduce; works with either scheduler)"
+        ),
+    )
+    parser.add_argument(
         "--epilogue-store",
         choices=("tma", "bulk_rows", "bulk_rows_reduce"),
         default="tma",
@@ -204,6 +217,8 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"{name} must be positive, got {value}")
     if args.warmup < 0:
         raise ValueError(f"warmup must be nonnegative, got {args.warmup}")
+    if args.scatter_table and args.epilogue_store not in ("bulk_rows", "bulk_rows_reduce"):
+        raise ValueError("--scatter-table requires --epilogue-store bulk_rows or bulk_rows_reduce")
     if args.gather_table_n_group_major and not args.gather_table:
         raise ValueError("--gather-table-n-group-major requires --gather-table")
     if args.gather_table:
@@ -311,7 +326,13 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> PregatherI
         if args.down_projection
         else up_output
     )
+    scatter_table = (
+        torch.randperm(args.routes, dtype=torch.int32, device=device)
+        if args.scatter_table
+        else None
+    )
     return PregatherInputs(
+        scatter_table=scatter_table,
         X=X,
         W_up=W_up,
         W_down=W_down,
@@ -394,6 +415,7 @@ def make_launch(args: argparse.Namespace, inputs: PregatherInputs):
                 **table_kwargs,
                 use_tma_gather=False,
                 epilogue_store=args.epilogue_store,
+                scatter_table=inputs.scatter_table,
             )
 
         if args.down_projection:
@@ -535,7 +557,11 @@ def check_correctness(
         elif activation is not None:
             up_baseline = act_to_pytorch_fn_map[activation](up_baseline)
 
-        up_actual = inputs.up_output[start:end]
+        up_actual = (
+            inputs.up_output[start:end]
+            if inputs.scatter_table is None
+            else inputs.up_output[inputs.scatter_table[start:end].long()]
+        )
         if not torch.isfinite(up_actual).all():
             raise AssertionError(f"expert {expert} up output contains NaN or infinity")
         up_error = (up_actual.float() - up_reference).abs().max().item()
@@ -619,6 +645,8 @@ def main() -> None:
         allocated_tensors.extend((inputs.W_down, inputs.output))
     if inputs.gather_work_table is not None:
         allocated_tensors.extend((inputs.gather_work_table, inputs.identity_A_idx))
+    if inputs.scatter_table is not None:
+        allocated_tensors.append(inputs.scatter_table)
     tensor_bytes = sum(tensor.numel() * tensor.element_size() for tensor in allocated_tensors)
     routes_per_expert = args.routes // args.experts
     print(f"Device: {torch.cuda.get_device_name(device)} (SM{capability[0]}{capability[1]})")
@@ -654,6 +682,8 @@ def main() -> None:
         print(f"Gather table order: {table_order}")
     print(f"Fused activation: {args.activation or 'disabled'}")
     print(f"Epilogue store: {args.epilogue_store}, pingpong: {args.pingpong}")
+    if inputs.scatter_table is not None:
+        print(f"Scatter table: random permutation of {args.routes} routed output rows")
     print(f"Approximate tensor storage: {gib(tensor_bytes):.3f} GiB")
     compile_target = "up and down kernels" if args.down_projection else "kernel"
     print(f"Compiling and warming up the specialized QuACK {compile_target}...")

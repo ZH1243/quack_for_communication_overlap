@@ -90,6 +90,7 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
     _extra_param_fields = (
         ("split_k_semaphore", Optional[cute.Tensor], None),
         ("split_k_workspace", Optional[cute.Tensor], None),
+        ("mScatter", Optional[cute.Tensor], None),
     )
 
     @mlir_namedtuple
@@ -111,6 +112,7 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
         mSFD: Optional[cute.Tensor] = None
         sfd_norm_const: Optional[Float32 | cute.Tensor] = None
         mSFDCol: Optional[cute.Tensor] = None
+        mScatter: Optional[cute.Tensor] = None
 
     # EpilogueParams auto-generated from _epi_ops
 
@@ -122,6 +124,7 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
                 d[key] = layout_utils.concat_to_interleave(d[key], 1)
         d["split_k_semaphore"] = getattr(args, "split_k_semaphore", None)
         d["split_k_workspace"] = getattr(args, "split_k_workspace", None)
+        d["mScatter"] = getattr(args, "mScatter", None)
         return self.EpilogueParams(**d)
 
     @cute.jit

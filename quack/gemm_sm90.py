@@ -464,6 +464,7 @@ class GemmSm90(GemmTmaBase):
         - Computing A/B/C shared memory layout
         """
         self._setup_tiled_mma()
+        self.scatter_rows = getattr(epilogue_args, "mScatter", None) is not None
         if self.bulk_row_store:
             assert self.d_dtype in (cutlass.Float16, cutlass.BFloat16, cutlass.Float32)
             assert self.d_layout.is_n_major_c(), "bulk_rows requires row-major D"
@@ -1465,18 +1466,47 @@ class GemmSm90(GemmTmaBase):
                     else:
                         d_tensor = varlen_manager.offset_batch_epi(mD_mnl, d_batch_idx)
                         d_tile_coord = tile_coord_mnkl
+                    scatter_rows = None
+                    if const_expr(self.scatter_rows):
+                        # Load consecutive mapping entries across the store warp
+                        # before R2S staging. Keep only ceil(tile_m / 32) indices
+                        # per lane in registers; no extra SMEM or barrier needed.
+                        tile_m = const_expr(self.cta_tile_shape_mnk[0])
+                        rows_per_lane = const_expr(cute.ceil_div(tile_m, cute.arch.WARP_SIZE))
+                        scatter_rows = cute.make_rmem_tensor((rows_per_lane,), Int32)
+                        scatter_rows.fill(0)
+                        source_start = Int32(0)
+                        source_end = Int32(0)
+                        if const_expr(self.gather_table):
+                            source_start = tile_coord_mnkl[0]
+                            source_end = tile_coord_mnkl[2]
+                        else:
+                            source_start = (
+                                varlen_params.cu_seqlens_m[batch_idx]
+                                + tile_coord_mnkl[0] * tile_m
+                            )
+                            source_end = varlen_params.cu_seqlens_m[batch_idx + 1]
+                        if is_tma_warp:
+                            for rb in cutlass.range_constexpr(rows_per_lane):
+                                row = rb * cute.arch.WARP_SIZE + tidx % cute.arch.WARP_SIZE
+                                if row < tile_m and source_start + row < source_end:
+                                    scatter_rows[rb] = epilogue_params.mScatter[source_start + row]
+                        # Scatter indices are global routed rows, so discard the
+                        # descriptor/sequence-local output base used above.
+                        d_tensor = mD_mnl
                     if const_expr(self.bulk_row_store):
                         copy_D = partial(
                             self.epilog_bulk_store_rows,
                             sD,
                             d_tensor,
                             d_tile_coord,
-                            # Table D is already shifted to the CTA's route start.
-                            # Bound linear stores by that descriptor's valid rows.
+                            # Table row coordinates are CTA-local even when
+                            # scatter destinations address the global D base.
                             cutlass.max(tile_coord_mnkl[2] - tile_coord_mnkl[0], Int32(0))
                             if const_expr(self.gather_table)
                             else varlen_manager.len_m(batch_idx),
                             tidx,
+                            scatter_rows,
                         )
                     else:
                         copy_D, _, _ = self.epilog_gmem_copy_and_partition(
@@ -1638,12 +1668,14 @@ class GemmSm90(GemmTmaBase):
                     epi_store_pipeline.producer_tail()
 
     @cute.jit
-    def epilog_bulk_store_rows(self, sD, gD, tile_coord, len_m, tidx):
+    def epilog_bulk_store_rows(self, sD, gD, tile_coord, len_m, tidx, scatter_rows=None):
         """Called by all 32 store-warp lanes after the full-tile R2S fence/barrier.
 
         Linear bulk copies do not apply a tensor descriptor's swizzle or OOB
         handling. Rows in sD are contiguous; the caller supplies a batch-offset
         ordinary GMEM tensor, and each lane predicates its sequence-local row.
+        With scatter_rows, gD is the global output base and each lane uses its
+        prefetched destination indices, while keeping the same source bounds.
         The host validates 16-byte alignment, including the final N tile width.
         """
         tile_m, tile_n = self.cta_tile_shape_mnk[:2]
@@ -1654,9 +1686,12 @@ class GemmSm90(GemmTmaBase):
         for row_block in cutlass.range_constexpr(cute.ceil_div(tile_m, cute.arch.WARP_SIZE)):
             row = row_block * cute.arch.WARP_SIZE + lane
             if row < tile_m and row_start + row < len_m and store_bytes > 0:
+                dst_row = row_start + row
+                if const_expr(scatter_rows is not None):
+                    dst_row = scatter_rows[row_block]
                 copy_utils.cpasync_bulk_s2g(
                     sD.iterator + row * tile_n,
-                    gD.iterator + cute.crd2idx((row_start + row, col_start), gD.layout),
+                    gD.iterator + cute.crd2idx((dst_row, col_start), gD.layout),
                     store_bytes,
                     reduction_kind="add" if const_expr(self.bulk_row_reduce) else None,
                     dtype=self.d_dtype,

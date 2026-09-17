@@ -95,6 +95,7 @@ def _compile_gemm(
     b_mma_dtype=None,  # storage dtypes (packed fp6 crosses the boundary as bytes)
     has_ag=False,
     epilogue_store="tma",
+    has_scatter=False,
 ):
     sm_to_cls = {
         8: GemmDefaultSm80,
@@ -145,6 +146,9 @@ def _compile_gemm(
         mColVec = None
 
     epi_args = GemmCls.EpilogueArguments(
+        mScatter=(
+            fake_tensor(Int32, (m,), leading_dim=0, divisibility=1) if has_scatter else None
+        ),
         alpha=fake_scalar(alpha_mode),
         beta=fake_scalar(beta_mode),
         mRowVecBroadcast=mRowVec,
@@ -496,11 +500,19 @@ def gemm(
     # bulk_rows_reduce adds the converted epilogue result to D; callers must
     # initialize D (zero it before every launch for ordinary GEMM semantics).
     epilogue_store: str = "tma",
+    # Optional contiguous CUDA int32[R] permutation of logical routed output rows.
+    # D[scatter_table[i]] receives row i's result (adds for bulk_rows_reduce).
+    # Values must be a permutation of [0, R); callers validate contents outside
+    # capture/timing. Only plain SM90 grouped bulk-row GEMM is supported.
+    scatter_table: Optional[Tensor] = None,
 ) -> _GemmPlan:
     # Alignment is pointer-dependent, unlike the metadata cached below. Check
     # every launch so an unaligned view cannot reuse an aligned tensor's plan.
     if epilogue_store in ("bulk_rows", "bulk_rows_reduce") and D.data_ptr() % 16:
         raise ValueError(f"{epilogue_store} requires a 16-byte-aligned output base")
+    # Tensor metadata keys omit devices; enforce this on cache hits as well.
+    if scatter_table is not None and scatter_table.device != D.device:
+        raise ValueError("scatter_table must be on D's device")
     multi_buffer_gather_args = None
     if multi_buffer_gather:
         if not isinstance(A, (tuple, list)) or not isinstance(A_idx, (tuple, list)):
@@ -547,6 +559,7 @@ def gemm(
         tensor_key(colvec_bias),
         tensor_key(cu_seqlens_m),
         tensor_key(cu_seqlens_k),
+        tensor_key(scatter_table),
         tensor_key(gather_work_table),
         tensor_key(gather_work_table_ready),
         tuple(tensor_key(t) for t in A_buffers),
@@ -632,6 +645,7 @@ def gemm(
             sfd_norm_const=sfd_norm_const,
             SFDCol=SFDCol,
             epilogue_store=epilogue_store,
+            scatter_table=scatter_table,
         )
         _gemm_plan_cache[key] = plan
     run_gemm_plan(
@@ -649,6 +663,7 @@ def gemm(
         cu_seqlens_m=cu_seqlens_m,
         cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
+        scatter_table=scatter_table,
         gather_work_table=gather_work_table,
         gather_work_table_ready=gather_work_table_ready,
         multi_buffer_gather_args=multi_buffer_gather_args,
@@ -679,6 +694,7 @@ def run_gemm_plan(
     cu_seqlens_m: Optional[Tensor] = None,
     cu_seqlens_k: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,
+    scatter_table: Optional[Tensor] = None,
     gather_work_table: Optional[Tensor] = None,
     gather_work_table_ready: Optional[Tensor] = None,
     multi_buffer_gather_args: Optional[MultiBufferGatherArguments] = None,
@@ -726,6 +742,7 @@ def run_gemm_plan(
     epi_args = plan.epi_static
     if epi_args is None:
         epi_args = GemmDefaultEpiMixin.EpilogueArguments(
+            mScatter=scatter_table,
             alpha=scalar_arg(alpha, plan.alpha_mode),
             beta=scalar_arg(beta, plan.beta_mode),
             mRowVecBroadcast=rowvec_bias,
@@ -817,7 +834,27 @@ def _build_gemm_plan(
     sfd_norm_const=None,
     SFDCol=None,
     epilogue_store="tma",
+    scatter_table=None,
 ) -> _GemmPlan:
+    if scatter_table is not None:
+        if epilogue_store not in ("bulk_rows", "bulk_rows_reduce"):
+            raise ValueError("scatter_table requires bulk_rows or bulk_rows_reduce")
+        if D.ndim != 2 or (cu_seqlens_m is None and gather_work_table is None):
+            raise ValueError("scatter_table requires grouped GEMM with rank-2 output")
+        if multi_buffer_gather_args is not None or (
+            gather_work_table is not None and gather_work_table.shape[1] != 4
+        ):
+            raise ValueError("scatter_table requires single-buffer non-indexed gather tables")
+        if C is not None or rowvec_bias is not None or colvec_bias is not None:
+            raise ValueError("scatter_table currently requires plain GEMM without C or bias")
+        if (
+            scatter_table.dtype != torch.int32
+            or not scatter_table.is_cuda
+            or scatter_table.ndim != 1
+            or scatter_table.shape[0] != D.shape[0]
+            or scatter_table.stride(0) != 1
+        ):
+            raise ValueError("scatter_table must be contiguous CUDA int32[D.shape[0]] on D's device")
     gather_table = gather_work_table is not None
     gather_table_num_buffers = (
         len(multi_buffer_gather_args.x_buffers) + 1
@@ -1209,6 +1246,7 @@ def _build_gemm_plan(
         b_mma_dtype,
         has_ag,
         epilogue_store,
+        scatter_table is not None,
     )
 
     cluster_size = cluster_M * cluster_N * cluster_K
@@ -1231,6 +1269,7 @@ def _build_gemm_plan(
         and (split_k == 1 or staged_split_k)
         and SFD is None
         and SFDCol is None
+        and scatter_table is None
     ):
         epi_static = GemmDefaultEpiMixin.EpilogueArguments(
             alpha=None,

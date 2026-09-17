@@ -33,7 +33,7 @@ by 16 bytes. Partial N tiles satisfying those requirements are supported.
 
 This first mode supports the primary D output of the low-level `quack.gemm.gemm`
 API, including alpha/beta and C. Fused activations/auxiliary outputs, output
-quantization, add-to-output, split-K, and gather work tables are not supported;
+quantization, add-to-output, and split-K are not supported;
 the runner rejects combining this mode with `--activation`.
 
 Full output SMEM is charged to the A/B stage budget: 32 KiB for 128x128 BF16,
@@ -124,3 +124,52 @@ FP16/BF16/FP32 output, both pingpong modes, and runner graph/direct timing:
 pytest tests/test_gemm_bulk_rows.py -x -k 'reduce_benchmark'
 pytest tests/test_gemm_bulk_rows.py -x
 ```
+
+
+## Scattered output rows in the pre-gather runner
+
+`hopper_pregather_gemm.py --scatter-table` creates a seeded CUDA int32 permutation
+of the R routed rows, outside timing. Row `i` of pre-gathered A writes to
+`output[scatter_table[i]]`. The mapping spans all experts and works both with
+`--gather-table` and the default `cu_seqlens_m` scheduler. It requires
+`--epilogue-store bulk_rows` or `bulk_rows_reduce`; omitting the flag retains the
+original output order and avoids the mapping loads.
+
+```bash
+python run/hopper_pregather_gemm.py --gather-table --scatter-table \
+    --tile-m 128 --tile-n 128 --epilogue-store bulk_rows --pingpong
+python run/hopper_pregather_gemm.py --gather-table --scatter-table \
+    --tile-m 128 --tile-n 128 --epilogue-store bulk_rows_reduce --pingpong
+```
+
+The store warp reads adjacent scatter entries into registers before epilogue
+output staging (four indices per lane for tile M=128, eight for M=256), then
+issues the same number and size of bulk operations. No additional shared-memory
+buffer, barrier, or per-row wait is introduced. Stores use the original D base
+and its actual row stride; predicates still use the source descriptor/expert
+bounds. Index reads and destination-address calculation are included in timing.
+Random destinations can affect memory locality; compare the same command with
+and without `--scatter-table` on an otherwise idle Hopper before drawing
+performance conclusions.
+
+The low-level `quack.gemm.gemm(..., scatter_table=...)` argument currently supports
+plain grouped GEMM without C/bias, with rank-2 output, and either cu_seqlens_m or
+a single-buffer four-column gather table. The caller must supply a contiguous
+CUDA int32 permutation of `[0, D.shape[0])` on the output device. Its contents
+are not scanned during launches, avoiding a synchronization or validation kernel
+in the timed/captured path. Duplicate destinations are outside this contract.
+Reduction mode still requires output initialization before every launch; the
+runner excludes its zeroing from timing as before.
+
+Start with a small numerical subset, then run the full bulk-row suite:
+
+```bash
+pytest tests/test_gemm_bulk_rows.py -x -k 'scatter and table_n_group_major and cooperative and bf16'
+pytest tests/test_gemm_bulk_rows.py -x
+```
+
+Scatter coverage includes identity/random cross-expert permutations, M/N tails,
+empty experts, both scheduling orders, cluster offsets, pingpong, FP16/BF16,
+padded output views, reduction into nonzero destinations, persistent reuse,
+and mapping changes across launches and graph replays. Comparisons use float32
+PyTorch references and the original TMA output path.

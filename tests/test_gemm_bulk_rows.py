@@ -132,7 +132,8 @@ def test_bulk_rows_gather(routing, pingpong, mode, n, dtype, out_dtype):
 
 @torch.inference_mode()
 @pytest.mark.parametrize("mode", ["bulk_rows", "bulk_rows_reduce"])
-def test_table_bulk_rows_output_view(mode):
+@pytest.mark.parametrize("scatter", [False, True], ids=["ordered", "scatter"])
+def test_table_bulk_rows_output_view(mode, scatter):
     """Table offsets preserve plain D's N mode, row pitch, and partial-row bounds."""
     torch.manual_seed(7)
     routes, n, k = 3, 136, 128
@@ -144,7 +145,9 @@ def test_table_bulk_rows_output_view(mode):
     storage = torch.full((routes + 2, n + 8), sentinel, device="cuda", dtype=a.dtype)
     output = storage[1:-1, :n]
     # Nonzero initialization checks that the reduction path adds rather than copies.
-    initial = torch.full_like(output, 0.25)
+    initial = torch.arange(1, routes + 1, device="cuda", dtype=output.dtype)[:, None]
+    initial = initial.expand_as(output).contiguous() * 0.25
+    mapping = torch.tensor([2, 0, 1], device="cuda", dtype=torch.int32) if scatter else None
     output.copy_(initial)
     gemm(
         a,
@@ -161,16 +164,19 @@ def test_table_bulk_rows_output_view(mode):
         A_idx=indices,
         gather_work_table=table,
         epilogue_store=mode,
+        scatter_table=mapping,
     )
     reference = torch.cat(
         (a[:1].float() @ weights[0].float(), a[1:].float() @ weights[1].float())
     )
     baseline = torch.cat((a[:1] @ weights[0], a[1:] @ weights[1])).float()
+    actual = output if mapping is None else output[mapping.long()]
+    initial = initial if mapping is None else initial[mapping.long()]
     if mode == "bulk_rows_reduce":
         reference = reference + initial.float()
         baseline = (baseline + initial.float()).to(output.dtype).float()
     baseline_error = (baseline - reference).abs().max().item()
-    torch.testing.assert_close(output.float(), reference, atol=2 * baseline_error + 1e-3, rtol=1e-3)
+    torch.testing.assert_close(actual.float(), reference, atol=2 * baseline_error + 1e-3, rtol=1e-3)
     torch.testing.assert_close(storage[0], torch.full_like(storage[0], sentinel))
     torch.testing.assert_close(storage[-1], torch.full_like(storage[-1], sentinel))
     torch.testing.assert_close(storage[1:-1, n:], torch.full_like(storage[1:-1, n:], sentinel))
@@ -281,11 +287,15 @@ def test_bulk_rows_reduce_benchmark(use_cuda_graph):
 
 
 @pytest.mark.parametrize("use_cuda_graph", [False, True], ids=["direct", "graph"])
-def test_bulk_rows_reduce_runner_main(monkeypatch, use_cuda_graph):
+@pytest.mark.parametrize("runner_variant", ["gather", "pregather_scatter"])
+def test_bulk_rows_reduce_runner_main(monkeypatch, use_cuda_graph, runner_variant):
     """Enter main outside inference mode, as the CLI does, and check its output."""
     import sys
 
-    from run import hopper_gather_gemm as runner
+    if runner_variant == "gather":
+        from run import hopper_gather_gemm as runner
+    else:
+        from run import hopper_pregather_gemm as runner
 
     argv = (
         "hopper_gather_gemm.py --tokens 257 --hidden 128 --output-dim 136 "
@@ -293,6 +303,8 @@ def test_bulk_rows_reduce_runner_main(monkeypatch, use_cuda_graph):
         "--warmup 2 --iterations 2 --timing-samples 2 "
         "--epilogue-store bulk_rows_reduce --pingpong"
     ).split()
+    if runner_variant == "pregather_scatter":
+        argv.extend(("--gather-table", "--scatter-table"))
     if not use_cuda_graph:
         argv.append("--no-cuda-graph")
     monkeypatch.setattr(sys, "argv", argv)
@@ -315,6 +327,121 @@ def test_bulk_rows_reduce_runner_main(monkeypatch, use_cuda_graph):
         reference = gathered.float() @ inputs.W_up[expert].float()
         baseline = (gathered @ inputs.W_up[expert]).float()
         baseline_error = (baseline - reference).abs().max().item()
-        torch.testing.assert_close(
-            inputs.output[lo:hi].float(), reference, atol=2 * baseline_error + 1e-3, rtol=1e-3
+        actual = (
+            inputs.output[lo:hi]
+            if runner_variant == "gather"
+            else inputs.output[inputs.scatter_table[lo:hi].long()]
         )
+        torch.testing.assert_close(
+            actual.float(), reference, atol=2 * baseline_error + 1e-3, rtol=1e-3
+        )
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("routing", ["varlen", "table", "table_n_group_major"])
+@pytest.mark.parametrize("pingpong", [False, True], ids=["cooperative", "pingpong"])
+@pytest.mark.parametrize("mode", ["bulk_rows", "bulk_rows_reduce"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_bulk_rows_scatter(routing, pingpong, mode, dtype):
+    """Global permutations, CTA offsets, tails, persistent reuse and runtime mappings.
+
+    The second N group reverses M traversal. A padded output view catches
+    accidental use of a shifted base or a contiguous pitch. Changing mapping
+    pointers between launches and contents on graph replay catches stale plans.
+    """
+    torch.manual_seed(123)
+    counts = (0, 1, 129, 1025, 32769)
+    offsets = [0]
+    for count in counts:
+        offsets.append(offsets[-1] + count)
+    routes, k, n = offsets[-1], 128, 392
+    a = torch.randn(routes, k, device="cuda", dtype=dtype)
+    weights = torch.randn(len(counts), k, n, device="cuda", dtype=dtype) / math.sqrt(k)
+    cu_seqlens = torch.tensor(offsets, device="cuda", dtype=torch.int32)
+    config = dict(
+        C=None,
+        tile_count_semaphore=None,
+        tile_M=128,
+        tile_N=128,
+        cluster_M=2,
+        cluster_N=1,
+        pingpong=pingpong,
+        persistent=True,
+        is_dynamic_persistent=False,
+        max_swizzle_size=2,
+        cu_seqlens_m=cu_seqlens,
+    )
+    if routing != "varlen":
+        from run.hopper_gather_table_gemm import build_work_table
+
+        table, _, _ = build_work_table(
+            list(counts),
+            output_dim=n,
+            tile_m=128,
+            tile_n=128,
+            cluster_m=2,
+            max_swizzle_size=2,
+            device=a.device,
+            n_group_major=routing == "table_n_group_major",
+        )
+        config.update(
+            cu_seqlens_m=None,
+            A_idx=torch.arange(routes, device="cuda", dtype=torch.int32),
+            gather_work_table=table,
+        )
+    sentinel = -123.0
+    storage = torch.full((routes + 2, n + 8), sentinel, device="cuda", dtype=dtype)
+    output = storage[1:-1, :n]
+    ordinary = torch.empty_like(output)
+    reference = torch.cat(
+        [
+            a[lo:hi].float() @ weights[e].float()
+            for e, (lo, hi) in enumerate(zip(offsets, offsets[1:]))
+        ]
+    )
+    baseline = torch.cat(
+        [a[lo:hi] @ weights[e] for e, (lo, hi) in enumerate(zip(offsets, offsets[1:]))]
+    )
+    atol = 2 * (baseline.float() - reference).abs().max().item() + 1e-3
+
+    def launch(mapping):
+        if mode == "bulk_rows_reduce":
+            output.zero_()
+        gemm(
+            a,
+            weights.transpose(1, 2),
+            output,
+            epilogue_store=mode,
+            scatter_table=mapping,
+            **config,
+        )
+
+    def check(mapping):
+        actual = output[mapping.long()]
+        torch.testing.assert_close(actual.float(), reference, atol=atol, rtol=1e-3)
+        torch.testing.assert_close(actual, ordinary, atol=0, rtol=0)
+        torch.testing.assert_close(storage[0], torch.full_like(storage[0], sentinel))
+        torch.testing.assert_close(storage[-1], torch.full_like(storage[-1], sentinel))
+        torch.testing.assert_close(storage[1:-1, n:], torch.full_like(storage[1:-1, n:], sentinel))
+
+    # Exercise no-scatter and scatter specializations back-to-back.
+    gemm(a, weights.transpose(1, 2), ordinary, epilogue_store="tma", **config)
+    for mapping in (
+        torch.arange(routes, device="cuda", dtype=torch.int32),
+        torch.randperm(routes, device="cuda", dtype=torch.int32),
+    ):
+        output.fill_(float("nan"))
+        launch(mapping)
+        check(mapping)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch(mapping)
+    for _ in range(2):
+        mapping.copy_(torch.randperm(routes, device="cuda", dtype=torch.int32))
+        a.neg_()
+        reference.neg_()
+        output.fill_(float("nan"))
+        graph.replay()
+        gemm(a, weights.transpose(1, 2), ordinary, epilogue_store="tma", **config)
+        check(mapping)
