@@ -51,6 +51,9 @@ Add --scatter-table to either bulk mode to write A[i]'s result to
 output[scatter_table[i]], using a seeded random CUDA int32 permutation of [0, R).
 This works with or without --gather-table. Mapping construction is untimed;
 index loads and scattered stores are included in GEMM timing.
+Add --scatter-table-with-replacement with bulk_rows_reduce to sample destinations
+with replacement. Contributions to each destination are summed; unused rows stay
+zero. The correctness check accounts for output-dtype accumulation rounding.
 The bulk_rows_reduce mode adds into the destination, so the runner zeros it
 before every launch, excluding zeroing from the reported GEMM time.
 
@@ -97,6 +100,7 @@ class PregatherInputs:
     gather_work_table: torch.Tensor | None = None
     identity_A_idx: torch.Tensor | None = None
     scatter_table: torch.Tensor | None = None
+    scatter_with_replacement: bool = False
 
 
 def parse_args() -> argparse.Namespace:
@@ -162,6 +166,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--scatter-table-with-replacement",
+        action="store_true",
+        help=(
+            "Sample scatter destinations with replacement, allowing duplicate and unused rows "
+            "(requires --scatter-table and --epilogue-store bulk_rows_reduce)"
+        ),
+    )
+    parser.add_argument(
         "--epilogue-store",
         choices=("tma", "bulk_rows", "bulk_rows_reduce"),
         default="tma",
@@ -217,6 +229,13 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"{name} must be positive, got {value}")
     if args.warmup < 0:
         raise ValueError(f"warmup must be nonnegative, got {args.warmup}")
+    if args.scatter_table_with_replacement:
+        if not args.scatter_table:
+            raise ValueError("--scatter-table-with-replacement requires --scatter-table")
+        if args.epilogue_store != "bulk_rows_reduce":
+            raise ValueError(
+                "--scatter-table-with-replacement requires --epilogue-store bulk_rows_reduce"
+            )
     if args.scatter_table and args.epilogue_store not in ("bulk_rows", "bulk_rows_reduce"):
         raise ValueError("--scatter-table requires --epilogue-store bulk_rows or bulk_rows_reduce")
     if args.gather_table_n_group_major and not args.gather_table:
@@ -326,13 +345,16 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> PregatherI
         if args.down_projection
         else up_output
     )
-    scatter_table = (
-        torch.randperm(args.routes, dtype=torch.int32, device=device)
-        if args.scatter_table
-        else None
-    )
+    scatter_table = None
+    if args.scatter_table:
+        scatter_table = (
+            torch.randint(args.routes, (args.routes,), dtype=torch.int32, device=device)
+            if args.scatter_table_with_replacement
+            else torch.randperm(args.routes, dtype=torch.int32, device=device)
+        )
     return PregatherInputs(
         scatter_table=scatter_table,
+        scatter_with_replacement=args.scatter_table_with_replacement,
         X=X,
         W_up=W_up,
         W_down=W_down,
@@ -524,6 +546,60 @@ def benchmark(
 
 
 @torch.inference_mode()
+def check_scatter_reduction(
+    inputs: PregatherInputs, *, atol: float, rtol: float
+) -> tuple[float, float, None, None]:
+    """Check all destinations, accounting for output-dtype reduction rounding.
+
+    Contributions are rounded before reduction. For c contributions, repeated
+    rounding has the conservative bound ((1 + u)**(c - 1) - 1) * sum(abs(y)),
+    with u = eps/2. This is independent of the hardware's addition order.
+    The same-dtype GEMM baseline separately accounts for GEMM rounding error.
+    All reference work runs outside timing/capture.
+    """
+    assert inputs.scatter_table is not None
+    indices = inputs.scatter_table.long()
+    output = inputs.up_output
+    reference = torch.zeros_like(output, dtype=torch.float32)
+    magnitude = torch.zeros_like(reference)
+    gemm_error = torch.zeros_like(reference)
+    offsets = inputs.cu_seqlens_m.tolist()
+    for expert, (start, end) in enumerate(zip(offsets, offsets[1:])):
+        a, w = inputs.A[start:end], inputs.W_up[expert]
+        values = a.float() @ w.float()
+        baseline = (a @ w).to(output.dtype).float()
+        destinations = indices[start:end]
+        reference.index_add_(0, destinations, values)
+        magnitude.index_add_(0, destinations, baseline.abs())
+        gemm_error.index_add_(0, destinations, (baseline - values).abs())
+
+    counts = torch.bincount(indices, minlength=output.shape[0])
+    unit_roundoff = torch.finfo(output.dtype).eps / 2
+    reduction_factor = torch.expm1(
+        (counts.float() - 1).clamp_min(0) * math.log1p(unit_roundoff)
+    )[:, None]
+    # Include GEMM error in the magnitude bound for the actual contributions.
+    allowed = (
+        atol
+        + rtol * reference.abs()
+        + 2 * gemm_error
+        + reduction_factor * (magnitude + 2 * gemm_error)
+    )
+    if not torch.isfinite(output).all():
+        raise AssertionError("scatter reduction output contains NaN or infinity")
+    unused = counts == 0
+    torch.testing.assert_close(output[unused], torch.zeros_like(output[unused]), atol=0, rtol=0)
+    error = (output.float() - reference).abs()
+    if (error > allowed).any():
+        raise AssertionError(
+            "scatter reduction exceeds its per-element rounding bound: "
+            f"max error={error.max().item():.6g}, "
+            f"max excess={(error - allowed).max().item():.6g}"
+        )
+    return error.max().item(), allowed.max().item(), None, None
+
+
+@torch.inference_mode()
 def check_correctness(
     inputs: PregatherInputs,
     *,
@@ -532,6 +608,9 @@ def check_correctness(
     rtol: float,
 ) -> tuple[float, float, float | None, float | None]:
     """Check every enabled GEMM output against per-expert float32 references."""
+    if inputs.scatter_with_replacement:
+        assert activation is None and inputs.W_down is None
+        return check_scatter_reduction(inputs, atol=atol, rtol=rtol)
     num_experts = inputs.W_up.shape[0]
     routes_per_expert = inputs.A.shape[0] // num_experts
     max_up_error = 0.0
@@ -683,7 +762,12 @@ def main() -> None:
     print(f"Fused activation: {args.activation or 'disabled'}")
     print(f"Epilogue store: {args.epilogue_store}, pingpong: {args.pingpong}")
     if inputs.scatter_table is not None:
-        print(f"Scatter table: random permutation of {args.routes} routed output rows")
+        scatter_description = (
+            "random destinations sampled with replacement"
+            if inputs.scatter_with_replacement
+            else "random permutation"
+        )
+        print(f"Scatter table: {scatter_description}, {args.routes} routed output rows")
     print(f"Approximate tensor storage: {gib(tensor_bytes):.3f} GiB")
     compile_target = "up and down kernels" if args.down_projection else "kernel"
     print(f"Compiling and warming up the specialized QuACK {compile_target}...")

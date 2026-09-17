@@ -500,10 +500,12 @@ def gemm(
     # bulk_rows_reduce adds the converted epilogue result to D; callers must
     # initialize D (zero it before every launch for ordinary GEMM semantics).
     epilogue_store: str = "tma",
-    # Optional contiguous CUDA int32[R] permutation of logical routed output rows.
+    # Optional contiguous CUDA int32[R] mapping of logical routed output rows.
     # D[scatter_table[i]] receives row i's result (adds for bulk_rows_reduce).
-    # Values must be a permutation of [0, R); callers validate contents outside
-    # capture/timing. Only plain SM90 grouped bulk-row GEMM is supported.
+    # Values must be in [0, R). Duplicates require bulk_rows_reduce; bulk_rows
+    # requires a permutation. Callers validate contents outside capture/timing.
+    # Unreferenced rows retain their initial values (zero when D is zeroed).
+    # Only plain SM90 grouped bulk-row GEMM is supported.
     scatter_table: Optional[Tensor] = None,
 ) -> _GemmPlan:
     # Alignment is pointer-dependent, unlike the metadata cached below. Check

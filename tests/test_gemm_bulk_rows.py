@@ -287,7 +287,9 @@ def test_bulk_rows_reduce_benchmark(use_cuda_graph):
 
 
 @pytest.mark.parametrize("use_cuda_graph", [False, True], ids=["direct", "graph"])
-@pytest.mark.parametrize("runner_variant", ["gather", "pregather_scatter"])
+@pytest.mark.parametrize(
+    "runner_variant", ["gather", "pregather_scatter", "pregather_duplicates"]
+)
 def test_bulk_rows_reduce_runner_main(monkeypatch, use_cuda_graph, runner_variant):
     """Enter main outside inference mode, as the CLI does, and check its output."""
     import sys
@@ -303,8 +305,10 @@ def test_bulk_rows_reduce_runner_main(monkeypatch, use_cuda_graph, runner_varian
         "--warmup 2 --iterations 2 --timing-samples 2 "
         "--epilogue-store bulk_rows_reduce --pingpong"
     ).split()
-    if runner_variant == "pregather_scatter":
+    if runner_variant != "gather":
         argv.extend(("--gather-table", "--scatter-table"))
+    if runner_variant == "pregather_duplicates":
+        argv.append("--scatter-table-with-replacement")
     if not use_cuda_graph:
         argv.append("--no-cuda-graph")
     monkeypatch.setattr(sys, "argv", argv)
@@ -321,6 +325,31 @@ def test_bulk_rows_reduce_runner_main(monkeypatch, use_cuda_graph, runner_varian
     with torch.inference_mode(False):
         runner.main()
     inputs = prepared[0]
+    if runner_variant == "pregather_duplicates":
+        # Validate the CLI contract alongside a numerically checked valid run.
+        args = runner.parse_args()
+        for store_mode in ("tma", "bulk_rows"):
+            args.epilogue_store = store_mode
+            with pytest.raises(ValueError, match="requires --epilogue-store bulk_rows_reduce"):
+                runner.validate_args(args)
+        args.epilogue_store = "bulk_rows_reduce"
+        args.scatter_table = False
+        with pytest.raises(ValueError, match="requires --scatter-table"):
+            runner.validate_args(args)
+        # main() checks the summed FP32 reference, including exact zero holes.
+        runner.check_correctness(inputs, activation=None, atol=3e-2, rtol=1e-3)
+        counts = torch.bincount(inputs.scatter_table.long(), minlength=258)
+        assert (counts > 1).any() and (counts == 0).any()
+        empty_row = (counts == 0).nonzero()[0, 0]
+        inputs.output[empty_row, 0] = 1
+        with pytest.raises(AssertionError):
+            runner.check_correctness(inputs, activation=None, atol=3e-2, rtol=1e-3)
+        inputs.output[empty_row, 0] = 0
+        destination = inputs.scatter_table[0].long()
+        inputs.output[destination, 0] += 100
+        with pytest.raises(AssertionError, match="rounding bound"):
+            runner.check_correctness(inputs, activation=None, atol=3e-2, rtol=1e-3)
+        return
     for expert in range(2):
         lo, hi = expert * 129, (expert + 1) * 129
         gathered = inputs.X[inputs.A_idx[lo:hi].long()]
@@ -445,3 +474,96 @@ def test_bulk_rows_scatter(routing, pingpong, mode, dtype):
         graph.replay()
         gemm(a, weights.transpose(1, 2), ordinary, epilogue_store="tma", **config)
         check(mapping)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("routing", ["varlen", "table_n_group_major"])
+@pytest.mark.parametrize("pingpong", [False, True], ids=["cooperative", "pingpong"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("collision", ["concentrated", "persistent"])
+def test_bulk_rows_scatter_duplicates(routing, pingpong, dtype, collision):
+    """Exact sums expose lost updates without hiding behind rounding tolerances.
+
+    Collisions cross lanes, CTAs, and experts. Concentrated collisions hit seven
+    rows; the larger case forces persistent buffer reuse. Contributions and all
+    partial sums are exactly representable in BF16/FP16 in either order.
+    """
+    from run.hopper_gather_table_gemm import build_work_table
+
+    counts = (0, 1, 129, 129) if collision == "concentrated" else (0, 1, 129, 32769)
+    offsets = [0]
+    for count in counts:
+        offsets.append(offsets[-1] + count)
+    routes, k, n = offsets[-1], 128, 392
+    destinations = 7 if collision == "concentrated" else routes // 3
+    mapping = torch.arange(routes, device="cuda", dtype=torch.int32) % destinations
+    a = torch.zeros(routes, k, device="cuda", dtype=dtype)
+    a[:, 0] = 1 / 256
+    weights = torch.zeros(len(counts), k, n, device="cuda", dtype=dtype)
+    for expert in range(len(counts)):
+        weights[expert, 0, :] = expert
+    config = dict(
+        C=None,
+        tile_count_semaphore=None,
+        tile_M=128,
+        tile_N=128,
+        cluster_M=2,
+        cluster_N=1,
+        pingpong=pingpong,
+        persistent=True,
+        is_dynamic_persistent=False,
+        max_swizzle_size=2,
+        cu_seqlens_m=torch.tensor(offsets, device="cuda", dtype=torch.int32),
+        epilogue_store="bulk_rows_reduce",
+        scatter_table=mapping,
+    )
+    if routing != "varlen":
+        table, _, _ = build_work_table(
+            list(counts),
+            output_dim=n,
+            tile_m=128,
+            tile_n=128,
+            cluster_m=2,
+            max_swizzle_size=2,
+            device=a.device,
+            n_group_major=True,
+        )
+        config.update(
+            cu_seqlens_m=None,
+            A_idx=torch.arange(routes, device="cuda", dtype=torch.int32),
+            gather_work_table=table,
+        )
+    storage = torch.full((routes + 2, n + 8), -123.0, device="cuda", dtype=dtype)
+    output = storage[1:-1, :n]
+    values = torch.cat(
+        [
+            a[lo:hi].float() @ weights[e].float()
+            for e, (lo, hi) in enumerate(zip(offsets, offsets[1:]))
+        ]
+    )
+
+    def launch():
+        gemm(a, weights.transpose(1, 2), output, **config)
+
+    def check(initial):
+        expected = torch.full_like(output, initial, dtype=torch.float32)
+        expected.index_add_(0, mapping.long(), values)
+        torch.testing.assert_close(output.float(), expected, atol=0, rtol=0)
+        torch.testing.assert_close(storage[0], torch.full_like(storage[0], -123.0))
+        torch.testing.assert_close(storage[-1], torch.full_like(storage[-1], -123.0))
+        torch.testing.assert_close(storage[1:-1, n:], torch.full_like(storage[1:-1, n:], -123.0))
+
+    for initial in (0.0, 0.125):
+        output.fill_(initial)
+        launch()
+        check(initial)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output.zero_()
+        launch()
+    for _ in range(2):
+        # Move both the collision targets and holes without recompiling/capturing.
+        mapping.add_(1).remainder_(routes)
+        output.fill_(float("nan"))
+        graph.replay()
+        check(0.0)

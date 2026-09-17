@@ -155,9 +155,10 @@ performance conclusions.
 The low-level `quack.gemm.gemm(..., scatter_table=...)` argument currently supports
 plain grouped GEMM without C/bias, with rank-2 output, and either cu_seqlens_m or
 a single-buffer four-column gather table. The caller must supply a contiguous
-CUDA int32 permutation of `[0, D.shape[0])` on the output device. Its contents
-are not scanned during launches, avoiding a synchronization or validation kernel
-in the timed/captured path. Duplicate destinations are outside this contract.
+CUDA int32 mapping with values in `[0, D.shape[0])` on the output device.
+`bulk_rows` requires a permutation; repeated destinations are supported only by
+`bulk_rows_reduce`. Contents are not scanned during launches, avoiding a
+synchronization or validation kernel in the timed/captured path.
 Reduction mode still requires output initialization before every launch; the
 runner excludes its zeroing from timing as before.
 
@@ -173,3 +174,34 @@ empty experts, both scheduling orders, cluster offsets, pingpong, FP16/BF16,
 padded output views, reduction into nonzero destinations, persistent reuse,
 and mapping changes across launches and graph replays. Comparisons use float32
 PyTorch references and the original TMA output path.
+
+
+### Duplicate scatter destinations
+
+Add `--scatter-table-with-replacement` to sample R destination indices uniformly
+from `[0, R)` with replacement. This requires `--scatter-table` and
+`--epilogue-store bulk_rows_reduce`; the existing permutation mode is unchanged.
+Sampling allows duplicates but does not force them (for example, R=1).
+
+```bash
+python run/hopper_pregather_gemm.py --gather-table --scatter-table \
+    --scatter-table-with-replacement --tile-m 128 --tile-n 128 \
+    --epilogue-store bulk_rows_reduce --pingpong
+pytest tests/test_gemm_bulk_rows.py -x -k 'scatter_duplicates and concentrated and cooperative and bf16'
+```
+
+Every source row contributes to `output[scatter_table[i]]`, even when other rows
+or experts target that same destination. Existing element-wise atomic bulk
+reductions handle these collisions without additional kernel instructions.
+Zeroing before each launch leaves unreferenced rows exactly zero. With a custom
+nonzero initial output, unreferenced rows retain that initial value instead.
+
+The reference checker accumulates all expert results into an FP32 destination
+buffer. Its per-element tolerance includes same-dtype GEMM baseline error and
+an order-independent bound for repeated output-dtype additions. BF16/FP16 sums
+can vary with addition order, and stronger collision concentrations increase
+rounding error. Tests with exactly representable contributions additionally
+require exact equality to detect lost updates, and cover concentrated collisions,
+persistent reuse, output holes, nonzero initial output, and graph replay.
+All mapping generation and correctness work remains outside GEMM timing.
+Collisions can increase contention; measure their performance on Hopper.
