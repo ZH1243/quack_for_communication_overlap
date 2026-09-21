@@ -182,6 +182,22 @@ Run the pre-gathered benchmark with the same settings:
 python run/hopper_pregather_gemm.py
 ```
 
+To use global serpentine column-group traversal with expert work waves:
+
+```bash
+python run/hopper_pregather_gemm.py --gather-table --gather-table-expert-waves \
+    --tile-m 128 --tile-n 128 --cluster-m 2 --max-swizzle-size 1
+```
+
+This mode fills each logical wave with the current expert, borrowing from its
+later column groups as necessary. Only after exhausting all of that expert's
+work may the next expert share the wave. Already assigned work is skipped on
+subsequent serpentine passes. The wave size is the launched persistent-cluster
+count, which must be divisible by the effective swizzle size; otherwise the
+runner raises an error. Logical waves do not synchronize clusters on the GPU.
+The flag takes precedence over `--gather-table-n-group-major` if both are set.
+Without the new flag, existing table orderings are unchanged.
+
 Run the table-scheduled fused gather benchmark:
 
 ```bash

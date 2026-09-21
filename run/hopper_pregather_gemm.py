@@ -23,6 +23,11 @@ excluded from timing. All three epilogue-store modes support table scheduling;
 the bulk modes require plain GEMM without a fused activation.
 Add ``--gather-table-n-group-major`` to traverse all experts for each N group,
 reversing both expert and M-cluster order on alternate N groups.
+Add ``--gather-table-expert-waves`` instead to fill logical persistent work
+waves with one expert, borrowing from its later N groups when necessary.
+Only exhausted experts may share a wave with the next expert. Wave boundaries
+are not GPU-wide synchronization points. The persistent cluster count must be
+divisible by the effective swizzle size.
 When ``--down-projection`` is enabled, the activated output is already
 expert-contiguous and feeds a second grouped GEMM using the same cu_seqlens_m.
 The pre-gather operation, compilation, warmup, graph capture, and correctness
@@ -76,6 +81,7 @@ from dataclasses import dataclass
 
 import torch
 
+from quack.cute_dsl_utils import get_max_active_clusters
 from quack.gemm import gemm as quack_gemm
 from quack.gemm_config import GemmConfig
 from quack.gemm_interface import act_to_pytorch_fn_map, gated_to_pytorch_fn_map, gemm_act
@@ -104,6 +110,7 @@ class PregatherInputs:
     identity_A_idx: torch.Tensor | None = None
     scatter_table: torch.Tensor | None = None
     scatter_with_replacement: bool = False
+    wave_work_ids: int | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -159,6 +166,15 @@ def parse_args() -> argparse.Namespace:
         "--gather-table-n-group-major",
         action="store_true",
         help="Traverse all experts per N group in serpentine order (requires --gather-table)",
+    )
+    parser.add_argument(
+        "--gather-table-expert-waves",
+        action="store_true",
+        help=(
+            "Use global serpentine order with single-expert logical waves, borrowing "
+            "later N groups until expert exhaustion (requires --gather-table; "
+            "takes precedence over --gather-table-n-group-major)"
+        ),
     )
     parser.add_argument(
         "--scatter-table",
@@ -261,6 +277,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--scatter-table requires --epilogue-store bulk_rows or bulk_rows_reduce")
     if args.gather_table_n_group_major and not args.gather_table:
         raise ValueError("--gather-table-n-group-major requires --gather-table")
+    if args.gather_table_expert_waves and not args.gather_table:
+        raise ValueError("--gather-table-expert-waves requires --gather-table")
     if args.gather_table:
         if args.max_swizzle_size <= 0:
             raise ValueError("--gather-table requires positive --max-swizzle-size")
@@ -292,7 +310,24 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> PregatherI
     """Create routing inputs and materialize the expert-major A tensor on CUDA."""
     dtype = DTYPES[args.dtype]
     routes_per_expert = args.routes // args.experts
-
+    wave_work_ids = None
+    if args.gather_table_expert_waves:
+        gemm_output_dim = args.output_dim * (2 if args.activation in GATED_ACTIVATIONS else 1)
+        clusters_n = math.ceil(gemm_output_dim / args.tile_n)
+        x = min(args.max_swizzle_size, clusters_n)
+        num_work = (
+            args.experts
+            * math.ceil(routes_per_expert / (args.tile_m * args.cluster_m))
+            * clusters_n
+        )
+        # Match GatherTableTileScheduler.get_grid_shape and GEMM's capacity query.
+        wave_work_ids = min(get_max_active_clusters(args.cluster_m), num_work)
+        if wave_work_ids <= 0 or wave_work_ids % x:
+            raise ValueError(
+                "--gather-table-expert-waves requires wave_work_ids % "
+                "effective_swizzle_size == 0, "
+                f"got {wave_work_ids} % {x}; choose a compatible --max-swizzle-size"
+            )
     X = torch.randn((args.tokens, args.hidden), dtype=dtype, device=device)
     gated = args.activation in GATED_ACTIVATIONS
     gemm_output_dim = args.output_dim * (2 if gated else 1)
@@ -357,6 +392,7 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> PregatherI
             max_swizzle_size=args.max_swizzle_size,
             device=device,
             n_group_major=args.gather_table_n_group_major,
+            wave_work_ids=wave_work_ids,
         )
         # Preserve the original routing indices separately from the kernel indices.
         identity_A_idx = torch.arange(args.routes, dtype=torch.int32, device=A.device)
@@ -393,6 +429,7 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> PregatherI
         output=output,
         gather_work_table=gather_work_table,
         identity_A_idx=identity_A_idx,
+        wave_work_ids=wave_work_ids,
     )
 
 
@@ -782,11 +819,18 @@ def main() -> None:
     if inputs.gather_work_table is not None:
         print(f"Gather work table: {tuple(inputs.gather_work_table.shape)}")
         table_order = (
-            "N-group-major, global serpentine"
+            "N-group-major, expert waves"
+            if inputs.wave_work_ids is not None
+            else "N-group-major, global serpentine"
             if args.gather_table_n_group_major
             else "expert-major, per-expert serpentine"
         )
         print(f"Gather table order: {table_order}")
+        if inputs.wave_work_ids is not None:
+            print(
+                f"Logical wave: {inputs.wave_work_ids} work IDs; "
+                "experts share a wave only on exhaustion"
+            )
     print(f"Fused activation: {args.activation or 'disabled'}")
     print(f"Epilogue store: {args.epilogue_store}, pingpong: {args.pingpong}")
     if inputs.scatter_table is not None:

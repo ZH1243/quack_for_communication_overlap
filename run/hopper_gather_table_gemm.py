@@ -282,8 +282,13 @@ def build_work_table(
     max_swizzle_size: int,
     device: torch.device,
     n_group_major: bool = False,
+    wave_work_ids: int | None = None,
 ) -> tuple[torch.Tensor, tuple[tuple[int, ...], ...], int]:
-    """Encode AlongN serpentine order, optionally traversing M across all experts."""
+    """Encode serpentine order, optionally keeping each wave on one expert.
+
+    wave_work_ids enables global N-group traversal with same-expert borrowing
+    from later groups. Experts may share a wave only when one exhausts all work.
+    """
     route_offsets = [0]
     for count in counts:
         route_offsets.append(route_offsets[-1] + count)
@@ -291,6 +296,11 @@ def build_work_table(
     clusters_n = math.ceil(output_dim / tile_n)
     x = min(max_swizzle_size, clusters_n)
     assert clusters_n % x == 0
+    if wave_work_ids is not None and (wave_work_ids <= 0 or wave_work_ids % x):
+        raise ValueError(
+            "wave_work_ids must be positive and divisible by effective_swizzle_size, "
+            f"got wave_work_ids={wave_work_ids}, effective_swizzle_size={x}"
+        )
     cluster_rows = tile_m * cluster_m
     rows: list[tuple[int, int, int, int]] = []
 
@@ -307,7 +317,28 @@ def build_work_table(
                 end = min(start + cluster_rows, expert_end)
                 rows.append((expert, start, end, cid_n_base))
 
-    if n_group_major:
+    if wave_work_ids is not None:
+        # The default rows are already each expert's complete serpentine stream.
+        # A cursor also records groups consumed early to fill a previous wave.
+        expert_rows = [[] for _ in counts]
+        for row in rows:
+            expert_rows[row[0]].append(row)
+        cursors = [0] * len(counts)
+        rows_per_wave = wave_work_ids // x
+        rows = []
+        for group in range(clusters_n // x):
+            experts = range(len(counts))
+            if group % 2:
+                experts = reversed(experts)
+            for expert in experts:
+                stream = expert_rows[expert]
+                group_end = (group + 1) * math.ceil(counts[expert] / cluster_rows)
+                while cursors[expert] < group_end:
+                    room = rows_per_wave - len(rows) % rows_per_wave
+                    end = min(cursors[expert] + room, len(stream))
+                    rows.extend(stream[cursors[expert] : end])
+                    cursors[expert] = end
+    elif n_group_major:
         # Global route offsets order both experts and their M clusters. Reverse
         # that complete traversal on odd N groups, keeping each descriptor intact.
         rows.sort(key=lambda row: (row[3], -row[1] if (row[3] // x) % 2 else row[1]))

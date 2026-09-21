@@ -3,6 +3,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from run.hopper_gather_table_gemm import (
@@ -62,6 +63,109 @@ def test_n_group_major_table_preserves_grouped_gemm_values():
     reference = torch.cat((source[routes[:5]] @ weights[0], source[routes[5:]] @ weights[2]))
     torch.testing.assert_close(output, reference)
     torch.testing.assert_close(writes, torch.ones_like(writes))
+
+
+@pytest.mark.parametrize(
+    "counts,tile_m,cluster_m,x,wave_work_ids,output_dim",
+    [
+        ([20736, 6912, 27648], 128, 2, 1, 54, 4),
+        ([20736, 6912, 27648], 128, 2, 2, 54, 4),
+        ([5, 0, 3], 2, 2, 2, 6, 16),
+        ([1, 0, 2, 7], 1, 1, 2, 12, 8),
+        ([1, 1, 1], 1, 1, 1, 8, 2),
+    ],
+)
+def test_expert_waves_preserve_grouped_gemm_values(
+    counts, tile_m, cluster_m, x, wave_work_ids, output_dim
+):
+    # tile_n=1 keeps the user's full route-count example inexpensive on CPU.
+    kwargs = dict(
+        output_dim=output_dim,
+        tile_m=tile_m,
+        tile_n=1,
+        cluster_m=cluster_m,
+        max_swizzle_size=x,
+        device=torch.device("cpu"),
+    )
+    default, _, _ = build_work_table(counts, **kwargs)
+    table, _, group_size = build_work_table(counts, wave_work_ids=wave_work_ids, **kwargs)
+    rows = table.tolist()
+    assert sorted(rows) == sorted(default.tolist())
+    assert group_size == x
+    rows_per_wave = wave_work_ids // x
+    for i, row in enumerate(rows):
+        if i % rows_per_wave and rows[i - 1][0] != row[0]:
+            # An in-wave expert transition is legal only after complete exhaustion.
+            assert all(later[0] != rows[i - 1][0] for later in rows[i:])
+
+    if counts == [20736, 6912, 27648] and x == 1:
+        # Exact first two column groups from the user's eight-wave example.
+        expected_waves = [
+            [(0, 0, range(54))],
+            [(0, 0, range(54, 81)), (0, 1, range(80, 53, -1))],
+            [(1, 0, range(27)), (1, 1, range(26, -1, -1))],
+            [(2, 0, range(54))],
+            [(2, 0, range(54, 108))],
+            [(2, 1, range(107, 53, -1))],
+            [(2, 1, range(53, -1, -1))],
+            [(0, 1, range(53, -1, -1))],
+        ]
+        offsets = [0, 20736, 27648]
+        expected = [
+            [expert, offsets[expert] + m * 256, offsets[expert] + (m + 1) * 256, group]
+            for wave in expected_waves
+            for expert, group, ms in wave
+            for m in ms
+        ]
+        assert rows[: len(expected)] == expected
+        assert rows[len(expected) :] == [row[:3] + [row[3] + 2] for row in expected]
+    if counts == [1, 0, 2, 7]:
+        # Expert 0 exhausts after four groups. Expert 2 fills the wave and
+        # finishes group 0, so the next wave resumes the global traversal at 3.
+        assert rows[:9] == [
+            [0, 0, 1, 0],
+            [0, 0, 1, 2],
+            [0, 0, 1, 4],
+            [0, 0, 1, 6],
+            [2, 1, 2, 0],
+            [2, 2, 3, 0],
+            [3, 3, 4, 0],
+            [3, 4, 5, 0],
+            [3, 5, 6, 0],
+        ]
+
+    torch.manual_seed(0)
+    routes = torch.randint(0, 11, (sum(counts),))
+    source = torch.randn(11, 3, dtype=torch.float32)
+    a = source[routes]  # Pre-gathered input; kernel indices are the identity.
+    weights = torch.randn(len(counts), 3, output_dim, dtype=torch.float32)
+    output = torch.full((sum(counts), output_dim), float("nan"))
+    writes = torch.zeros_like(output, dtype=torch.int32)
+    for expert, start, end, n_base in rows:
+        for n in range(n_base, min(n_base + x, output_dim)):
+            for cta in range(cluster_m):
+                lo = min(start + cta * tile_m, end)
+                hi = min(start + (cta + 1) * tile_m, end)
+                output[lo:hi, n : n + 1] = a[lo:hi] @ weights[expert, :, n : n + 1]
+                writes[lo:hi, n : n + 1] += 1
+    reference = torch.cat([chunk @ weight for chunk, weight in zip(a.split(counts), weights)])
+    torch.testing.assert_close(output, reference)
+    torch.testing.assert_close(writes, torch.ones_like(writes))
+
+
+@pytest.mark.parametrize("wave_work_ids", [0, -2, 3])
+def test_expert_waves_reject_incompatible_wave_size(wave_work_ids):
+    with pytest.raises(ValueError, match="divisible by effective_swizzle_size"):
+        build_work_table(
+            [8],
+            output_dim=4,
+            tile_m=2,
+            tile_n=1,
+            cluster_m=2,
+            max_swizzle_size=2,
+            device=torch.device("cpu"),
+            wave_work_ids=wave_work_ids,
+        )
 
 
 def test_balanced_buffer_allocations_redistributes_exhausted_buffer():
