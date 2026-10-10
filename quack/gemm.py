@@ -7,7 +7,7 @@ import torch
 from torch import Tensor
 
 import cutlass.cute as cute
-from cutlass import Int32, Float32
+from cutlass import Int64, Int32, Float32
 from cutlass.cute.runtime import make_ptr
 
 from quack.cache import jit_cache
@@ -96,6 +96,7 @@ def _compile_gemm(
     has_ag=False,
     epilogue_store="tma",
     has_scatter=False,
+    scatter_addresses=False,
 ):
     sm_to_cls = {
         8: GemmDefaultSm80,
@@ -122,6 +123,9 @@ def _compile_gemm(
         a_mma_dtype=a_mma_dtype,
         b_mma_dtype=b_mma_dtype,
     )
+    if scatter_addresses:
+        # Physical buffer 0's row count is independent of logical routed M.
+        mD = fake_batched(d_dtype, cute.sym_int(), n, None, 1, 128 // d_dtype.width)
     if split_k > 1 and split_k_mode == SplitKMode.SEPARATE:
         # D is the f32 partials workspace; its batch extent is l * split_k, not l,
         # so it needs its own symbolic batch dim.
@@ -147,7 +151,9 @@ def _compile_gemm(
 
     epi_args = GemmCls.EpilogueArguments(
         mScatter=(
-            fake_tensor(Int32, (m,), leading_dim=0, divisibility=1) if has_scatter else None
+            fake_tensor(Int64 if scatter_addresses else Int32, (m,), leading_dim=0, divisibility=1)
+            if has_scatter
+            else None
         ),
         alpha=fake_scalar(alpha_mode),
         beta=fake_scalar(beta_mode),
@@ -412,13 +418,75 @@ class AllGatherArguments(NamedTuple):
     num_chunks: int = 1  # sub-shard arrival granularity (flags per shard)
 
 
+def _validate_scatter_buffers(buffers: tuple[Tensor, ...] | list[Tensor]) -> None:
+    if not isinstance(buffers, (tuple, list)) or len(buffers) < 2:
+        raise ValueError("multi_buffer_scatter requires at least two output tensors")
+    first = buffers[0]
+    if not isinstance(first, Tensor) or first.ndim != 2 or not first.is_cuda:
+        raise ValueError("scatter outputs must be rank-2 CUDA tensors")
+    for buffer in buffers:
+        if (
+            not isinstance(buffer, Tensor)
+            or buffer.ndim != 2
+            or buffer.device != first.device
+            or buffer.dtype != first.dtype
+            or buffer.shape[1] != first.shape[1]
+            or buffer.shape[0] == 0
+            or buffer.stride(1) != 1
+            or buffer.stride(0) < buffer.shape[1]
+            or buffer.data_ptr() % 16
+            or buffer.stride(0) * buffer.element_size() % 16
+            or buffer.shape[1] * buffer.element_size() % 16
+        ):
+            raise ValueError(
+                "scatter outputs must share device, dtype and column count, with nonempty "
+                "rows, contiguous columns and 16-byte-aligned bases, row strides and widths"
+            )
+
+
+@torch.no_grad()
+def build_scatter_row_addresses(
+    buffers: tuple[Tensor, ...] | list[Tensor], mapping: Tensor, *, reduce: bool = False
+) -> Tensor:
+    """Convert int32/int64 [R, 2] (buffer_id, row_index) to CUDA int64[R].
+
+    Validates bounds and overlapping destinations (unless reduce=True). This
+    synchronizes: call outside graph capture/timing. Keep buffers alive until
+    all launches/replays finish; rebuild addresses when allocations change.
+    Unreferenced rows are untouched. Reduce callers must initialize all buffers.
+    """
+    _validate_scatter_buffers(buffers)
+    if (
+        mapping.ndim != 2
+        or mapping.shape[1] != 2
+        or mapping.dtype not in (torch.int32, torch.int64)
+        or mapping.device != buffers[0].device
+    ):
+        raise ValueError("mapping must be int32/int64[R, 2] on the output device")
+    ids, rows = mapping[:, 0].long(), mapping[:, 1].long()
+    sizes = torch.tensor([b.shape[0] for b in buffers], device=mapping.device)
+    if ((ids < 0) | (ids >= len(buffers))).any().item():
+        raise ValueError("scatter buffer ID out of bounds")
+    if ((rows < 0) | (rows >= sizes[ids])).any().item():
+        raise ValueError("scatter row index out of bounds")
+    bases = torch.tensor([b.data_ptr() for b in buffers], device=mapping.device)
+    strides = torch.tensor([b.stride(0) * b.element_size() for b in buffers], device=mapping.device)
+    addresses = (bases[ids] + rows * strides[ids]).contiguous()
+    if not reduce and addresses.numel() > 1:
+        ordered = addresses.sort().values
+        width = buffers[0].shape[1] * buffers[0].element_size()
+        if (ordered[1:] - ordered[:-1] < width).any().item():
+            raise ValueError("overlapping scatter destinations require bulk_rows_reduce")
+    return addresses
+
+
 def gemm(
     # (l, m, k), or (m, k) unbatched dense (SM90+; B/D/C must be 2D too), or (total_m, k)
     # if varlen_m or (m, total_k) if varlen_k or (whatever, k) if gather_A_varlen_m or
     # (m, whatever) if gather_A_varlen_k
     A: Tensor | tuple[Tensor, ...],
     B: Tensor,  # (l, n, k) or (n, k) or (n, total_k) if varlen_k
-    D: Tensor,  # (l, m, n) or (m, n) or (total_m, n) if varlen_m
+    D: Tensor | tuple[Tensor, ...],  # (l, m, n) or (m, n) or (total_m, n) if varlen_m
     C: Optional[Tensor],  # (l, m, n) or (m, n) or (total_m, n) if varlen_m
     tile_count_semaphore: Optional[Tensor],  # (1,)
     tile_M: int,
@@ -507,7 +575,20 @@ def gemm(
     # Unreferenced rows retain their initial values (zero when D is zeroed).
     # Only plain SM90 grouped bulk-row GEMM is supported.
     scatter_table: Optional[Tensor] = None,
+    # D is a sequence of output buffers; scatter_table is int64[R] row addresses
+    # from build_scatter_row_addresses. Keep all buffers alive through completion.
+    multi_buffer_scatter: bool = False,
 ) -> _GemmPlan:
+    if multi_buffer_scatter:
+        _validate_scatter_buffers(D)
+        input_device = A[0].device if isinstance(A, (tuple, list)) else A.device
+        if D[0].device != input_device:
+            raise ValueError("scatter outputs must be on the GEMM input device")
+        if scatter_table is None:
+            raise ValueError("multi_buffer_scatter requires scatter_table row addresses")
+        D = D[0]  # Supplies dtype/N/layout metadata; stores use row addresses.
+    elif isinstance(D, (tuple, list)):
+        raise ValueError("output tensor sequences require multi_buffer_scatter=True")
     # Alignment is pointer-dependent, unlike the metadata cached below. Check
     # every launch so an unaligned view cannot reuse an aligned tensor's plan.
     if epilogue_store in ("bulk_rows", "bulk_rows_reduce") and D.data_ptr() % 16:
@@ -562,6 +643,7 @@ def gemm(
         tensor_key(cu_seqlens_m),
         tensor_key(cu_seqlens_k),
         tensor_key(scatter_table),
+        multi_buffer_scatter,
         tensor_key(gather_work_table),
         tensor_key(gather_work_table_ready),
         tuple(tensor_key(t) for t in A_buffers),
@@ -648,6 +730,7 @@ def gemm(
             SFDCol=SFDCol,
             epilogue_store=epilogue_store,
             scatter_table=scatter_table,
+            multi_buffer_scatter=multi_buffer_scatter,
         )
         _gemm_plan_cache[key] = plan
     run_gemm_plan(
@@ -837,6 +920,7 @@ def _build_gemm_plan(
     SFDCol=None,
     epilogue_store="tma",
     scatter_table=None,
+    multi_buffer_scatter=False,
 ) -> _GemmPlan:
     if scatter_table is not None:
         if epilogue_store not in ("bulk_rows", "bulk_rows_reduce"):
@@ -850,13 +934,21 @@ def _build_gemm_plan(
         if C is not None or rowvec_bias is not None or colvec_bias is not None:
             raise ValueError("scatter_table currently requires plain GEMM without C or bias")
         if (
-            scatter_table.dtype != torch.int32
+            scatter_table.dtype != (torch.int64 if multi_buffer_scatter else torch.int32)
             or not scatter_table.is_cuda
             or scatter_table.ndim != 1
-            or scatter_table.shape[0] != D.shape[0]
+            or (not multi_buffer_scatter and scatter_table.shape[0] != D.shape[0])
             or scatter_table.stride(0) != 1
         ):
-            raise ValueError("scatter_table must be contiguous CUDA int32[D.shape[0]] on D's device")
+            raise ValueError(
+                "scatter_table must be contiguous CUDA int32[R] (int64[R] for multi-buffer)"
+            )
+        if multi_buffer_scatter:
+            logical_rows = A_idx.shape[0] if A_idx is not None else A.shape[0]
+            if scatter_table.shape[0] != logical_rows or D.shape[1] != B.shape[1]:
+                raise ValueError("scatter addresses must match logical routed rows and output N")
+            if any(t is not None for t in (SFA, SFB, SFD, SFDCol)) or concat_layout:
+                raise ValueError("multi_buffer_scatter does not support block scaling or concat")
     gather_table = gather_work_table is not None
     gather_table_num_buffers = (
         len(multi_buffer_gather_args.x_buffers) + 1
@@ -970,7 +1062,7 @@ def _build_gemm_plan(
                         f"and be int32 on {A.device}"
                     )
                 total_routes += A_idx_extra.shape[0]
-        if D.shape != (total_routes, B.shape[1]):
+        if not multi_buffer_scatter and D.shape != (total_routes, B.shape[1]):
             raise ValueError(
                 f"D must have shape ({total_routes}, {B.shape[1]}), got {tuple(D.shape)}"
             )
@@ -1249,6 +1341,7 @@ def _build_gemm_plan(
         has_ag,
         epilogue_store,
         scatter_table is not None,
+        multi_buffer_scatter,
     )
 
     cluster_size = cluster_M * cluster_N * cluster_K

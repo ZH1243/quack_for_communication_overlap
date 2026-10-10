@@ -61,6 +61,18 @@ with replacement. Contributions to each destination are summed; unused rows stay
 zero. --scatter-table-destination-rows R1 restricts sampling to [0, R1), with
 1 <= R1 <= R (default R), leaving output[R1:] zero. Smaller R1 increases the
 average number of contributions per eligible destination to R/R1.
+Add --multi-buffer-scatter --scatter-output-buffers B to distribute the same
+logical destination space across B separately allocated output buffers (default
+B=2). A (buffer_id, row_index) mapping is converted to int64 destination-row
+addresses before timing. No single [R,N] output is allocated in this mode;
+concatenation is used only for untimed reference checking. This works with
+expert-wave scheduling and both bulk store modes. For example:
+
+    python run/hopper_pregather_gemm.py --gather-table \
+        --gather-table-expert-waves --max-swizzle-size 1 \
+        --scatter-table --multi-buffer-scatter --scatter-output-buffers 4 \
+        --epilogue-store bulk_rows --tile-m 128 --tile-n 128
+
 The correctness check accounts for output-dtype accumulation rounding.
 The bulk_rows_reduce mode adds into the destination, so the runner zeros it
 before every launch, excluding zeroing from the reported GEMM time.
@@ -82,7 +94,7 @@ from dataclasses import dataclass
 import torch
 
 from quack.cute_dsl_utils import get_max_active_clusters
-from quack.gemm import gemm as quack_gemm
+from quack.gemm import build_scatter_row_addresses, gemm as quack_gemm
 from quack.gemm_config import GemmConfig
 from quack.gemm_interface import act_to_pytorch_fn_map, gated_to_pytorch_fn_map, gemm_act
 
@@ -104,13 +116,26 @@ class PregatherInputs:
     A_idx: torch.Tensor
     cu_seqlens_m: torch.Tensor
     A: torch.Tensor
-    up_output: torch.Tensor
-    output: torch.Tensor
+    up_output: torch.Tensor | tuple[torch.Tensor, ...]
+    output: torch.Tensor | tuple[torch.Tensor, ...]
     gather_work_table: torch.Tensor | None = None
     identity_A_idx: torch.Tensor | None = None
     scatter_table: torch.Tensor | None = None
+    scatter_row_addresses: torch.Tensor | None = None
+    scatter_mapping: torch.Tensor | None = None
     scatter_with_replacement: bool = False
     wave_work_ids: int | None = None
+
+    def output_buffers(self) -> tuple[torch.Tensor, ...]:
+        return self.up_output if isinstance(self.up_output, tuple) else (self.up_output,)
+
+    def collected_up_output(self) -> torch.Tensor:
+        # Reference checking only: no concatenation on the GEMM launch path.
+        return torch.cat(self.up_output) if isinstance(self.up_output, tuple) else self.up_output
+
+    def zero_up_output(self) -> None:
+        for buffer in self.output_buffers():
+            buffer.zero_()
 
 
 def parse_args() -> argparse.Namespace:
@@ -183,6 +208,17 @@ def parse_args() -> argparse.Namespace:
             "Scatter routed output rows using a random permutation (requires "
             "--epilogue-store bulk_rows or bulk_rows_reduce; works with either scheduler)"
         ),
+    )
+    parser.add_argument(
+        "--multi-buffer-scatter",
+        action="store_true",
+        help="Scatter directly to separately allocated output buffers (requires --scatter-table)",
+    )
+    parser.add_argument(
+        "--scatter-output-buffers",
+        type=int,
+        default=2,
+        help="Number of output buffers for --multi-buffer-scatter (default: 2)",
     )
     parser.add_argument(
         "--scatter-table-with-replacement",
@@ -259,6 +295,11 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"{name} must be positive, got {value}")
     if args.warmup < 0:
         raise ValueError(f"warmup must be nonnegative, got {args.warmup}")
+    if args.multi_buffer_scatter:
+        if not args.scatter_table:
+            raise ValueError("--multi-buffer-scatter requires --scatter-table")
+        if not 2 <= args.scatter_output_buffers <= args.routes:
+            raise ValueError("--scatter-output-buffers must be between 2 and routes")
     if args.scatter_table_destination_rows is not None:
         if not args.scatter_table_with_replacement:
             raise ValueError(
@@ -396,7 +437,15 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> PregatherI
         )
         # Preserve the original routing indices separately from the kernel indices.
         identity_A_idx = torch.arange(args.routes, dtype=torch.int32, device=A.device)
-    up_output = torch.empty((args.routes, args.output_dim), dtype=dtype, device=device)
+    if args.multi_buffer_scatter:
+        # Split logical destination space evenly; no monolithic output allocation.
+        count = args.scatter_output_buffers
+        sizes = [args.routes // count + (i < args.routes % count) for i in range(count)]
+        up_output = tuple(
+            torch.empty((size, args.output_dim), dtype=dtype, device=device) for size in sizes
+        )
+    else:
+        up_output = torch.empty((args.routes, args.output_dim), dtype=dtype, device=device)
     output = (
         torch.empty((args.routes, args.hidden), dtype=dtype, device=device)
         if args.down_projection
@@ -416,8 +465,20 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> PregatherI
             if args.scatter_table_with_replacement
             else torch.randperm(args.routes, dtype=torch.int32, device=device)
         )
+    scatter_mapping = None
+    scatter_row_addresses = None
+    if args.multi_buffer_scatter:
+        offsets = torch.tensor([0, *sizes], device=device, dtype=torch.int64).cumsum(0)
+        destinations = scatter_table.long()
+        buffer_ids = torch.bucketize(destinations, offsets[1:], right=True)
+        scatter_mapping = torch.stack((buffer_ids, destinations - offsets[buffer_ids]), dim=1)
+        scatter_row_addresses = build_scatter_row_addresses(
+            up_output, scatter_mapping, reduce=args.epilogue_store == "bulk_rows_reduce"
+        )
     return PregatherInputs(
         scatter_table=scatter_table,
+        scatter_mapping=scatter_mapping,
+        scatter_row_addresses=scatter_row_addresses,
         scatter_with_replacement=args.scatter_table_with_replacement,
         X=X,
         W_up=W_up,
@@ -502,7 +563,12 @@ def make_launch(args: argparse.Namespace, inputs: PregatherInputs):
                 **table_kwargs,
                 use_tma_gather=False,
                 epilogue_store=args.epilogue_store,
-                scatter_table=inputs.scatter_table,
+                scatter_table=(
+                    inputs.scatter_row_addresses
+                    if args.multi_buffer_scatter
+                    else inputs.scatter_table
+                ),
+                multi_buffer_scatter=args.multi_buffer_scatter,
             )
 
         if args.down_projection:
@@ -624,7 +690,7 @@ def check_scatter_reduction(
     """
     assert inputs.scatter_table is not None
     indices = inputs.scatter_table.long()
-    output = inputs.up_output
+    output = inputs.collected_up_output()
     reference = torch.zeros_like(output, dtype=torch.float32)
     magnitude = torch.zeros_like(reference)
     gemm_error = torch.zeros_like(reference)
@@ -676,6 +742,7 @@ def check_correctness(
     if inputs.scatter_with_replacement:
         assert activation is None and inputs.W_down is None
         return check_scatter_reduction(inputs, atol=atol, rtol=rtol)
+    up_output = inputs.collected_up_output()
     num_experts = inputs.W_up.shape[0]
     routes_per_expert = inputs.A.shape[0] // num_experts
     max_up_error = 0.0
@@ -702,9 +769,9 @@ def check_correctness(
             up_baseline = act_to_pytorch_fn_map[activation](up_baseline)
 
         up_actual = (
-            inputs.up_output[start:end]
+            up_output[start:end]
             if inputs.scatter_table is None
-            else inputs.up_output[inputs.scatter_table[start:end].long()]
+            else up_output[inputs.scatter_table[start:end].long()]
         )
         if not torch.isfinite(up_actual).all():
             raise AssertionError(f"expert {expert} up output contains NaN or infinity")
@@ -783,7 +850,7 @@ def main() -> None:
         inputs.A_idx,
         inputs.cu_seqlens_m,
         inputs.A,
-        inputs.up_output,
+        *inputs.output_buffers(),
     ]
     if inputs.W_down is not None:
         allocated_tensors.extend((inputs.W_down, inputs.output))
@@ -791,6 +858,8 @@ def main() -> None:
         allocated_tensors.extend((inputs.gather_work_table, inputs.identity_A_idx))
     if inputs.scatter_table is not None:
         allocated_tensors.append(inputs.scatter_table)
+    if inputs.scatter_row_addresses is not None:
+        allocated_tensors.extend((inputs.scatter_row_addresses, inputs.scatter_mapping))
     tensor_bytes = sum(tensor.numel() * tensor.element_size() for tensor in allocated_tensors)
     routes_per_expert = args.routes // args.experts
     print(f"Device: {torch.cuda.get_device_name(device)} (SM{capability[0]}{capability[1]})")
@@ -801,6 +870,8 @@ def main() -> None:
             f"W_down: {tuple(inputs.W_down.shape)}, up output: {tuple(inputs.up_output.shape)}, "
             f"final output: {tuple(inputs.output.shape)}"
         )
+    elif args.multi_buffer_scatter:
+        print(f"Output buffers: {[tuple(b.shape) for b in inputs.output_buffers()]}")
     else:
         print(f"Output: {tuple(inputs.output.shape)}, down projection: disabled")
     print(
@@ -855,7 +926,7 @@ def main() -> None:
     print(f"Compiling and warming up the specialized QuACK {compile_target}...")
 
     launch = make_launch(args, inputs)
-    reset_output = inputs.up_output.zero_ if args.epilogue_store == "bulk_rows_reduce" else None
+    reset_output = inputs.zero_up_output if args.epilogue_store == "bulk_rows_reduce" else None
     for _ in range(max(1, args.warmup)):
         if reset_output is not None:
             reset_output()

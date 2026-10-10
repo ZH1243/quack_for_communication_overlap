@@ -891,7 +891,9 @@ class GemmBase:
             tile_sched_args = VarlenMTileSchedulerArguments(
                 problem_shape_ntile_mnl=problem_shape_ntile_mnl,
                 total_m=(
-                    mD.shape[0]
+                    epilogue_args.mScatter.shape[0]
+                    if const_expr(getattr(self, "scatter_addresses", False))
+                    else mD.shape[0]
                     if mD is not None
                     else (
                         varlen_args.mAIdx.shape[0]

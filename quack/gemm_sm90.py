@@ -465,6 +465,9 @@ class GemmSm90(GemmTmaBase):
         """
         self._setup_tiled_mma()
         self.scatter_rows = getattr(epilogue_args, "mScatter", None) is not None
+        self.scatter_addresses = (
+            self.scatter_rows and epilogue_args.mScatter.element_type == Int64
+        )
         if self.bulk_row_store:
             assert self.d_dtype in (cutlass.Float16, cutlass.BFloat16, cutlass.Float32)
             assert self.d_layout.is_n_major_c(), "bulk_rows requires row-major D"
@@ -1469,11 +1472,13 @@ class GemmSm90(GemmTmaBase):
                     scatter_rows = None
                     if const_expr(self.scatter_rows):
                         # Load consecutive mapping entries across the store warp
-                        # before R2S staging. Keep only ceil(tile_m / 32) indices
+                        # before R2S staging. Keep only ceil(tile_m / 32) entries
                         # per lane in registers; no extra SMEM or barrier needed.
                         tile_m = const_expr(self.cta_tile_shape_mnk[0])
                         rows_per_lane = const_expr(cute.ceil_div(tile_m, cute.arch.WARP_SIZE))
-                        scatter_rows = cute.make_rmem_tensor((rows_per_lane,), Int32)
+                        scatter_rows = cute.make_rmem_tensor(
+                            (rows_per_lane,), Int64 if const_expr(self.scatter_addresses) else Int32
+                        )
                         scatter_rows.fill(0)
                         source_start = Int32(0)
                         source_end = Int32(0)
@@ -1676,6 +1681,8 @@ class GemmSm90(GemmTmaBase):
         ordinary GMEM tensor, and each lane predicates its sequence-local row.
         With scatter_rows, gD is the global output base and each lane uses its
         prefetched destination indices, while keeping the same source bounds.
+        In address mode these registers instead hold int64 destination-row
+        pointers; gD supplies only the dtype and column extent.
         The host validates 16-byte alignment, including the final N tile width.
         """
         tile_m, tile_n = self.cta_tile_shape_mnk[:2]
@@ -1687,11 +1694,20 @@ class GemmSm90(GemmTmaBase):
             row = row_block * cute.arch.WARP_SIZE + lane
             if row < tile_m and row_start + row < len_m and store_bytes > 0:
                 dst_row = row_start + row
-                if const_expr(scatter_rows is not None):
+                if const_expr(scatter_rows is not None and not self.scatter_addresses):
                     dst_row = scatter_rows[row_block]
+                if const_expr(self.scatter_addresses):
+                    dst_ptr = cute.make_ptr(
+                        self.d_dtype,
+                        scatter_rows[row_block],
+                        gD.iterator.memspace,
+                        assumed_align=16,
+                    ) + col_start
+                else:
+                    dst_ptr = gD.iterator + cute.crd2idx((dst_row, col_start), gD.layout)
                 copy_utils.cpasync_bulk_s2g(
                     sD.iterator + row * tile_n,
-                    gD.iterator + cute.crd2idx((dst_row, col_start), gD.layout),
+                    dst_ptr,
                     store_bytes,
                     reduction_kind="add" if const_expr(self.bulk_row_reduce) else None,
                     dtype=self.d_dtype,
