@@ -710,3 +710,141 @@ def test_multi_buffer_scatter_runner(monkeypatch, reduce):
         argv.extend(("--scatter-table-with-replacement", "--scatter-table-destination-rows", "17"))
     monkeypatch.setattr(sys, "argv", argv)
     runner.main()  # Includes per-expert float32 numerical validation of every output buffer.
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("routing", ["varlen", "table", "expert_waves"])
+@pytest.mark.parametrize("pingpong", [False, True])
+@pytest.mark.parametrize("mode", ["bulk_rows", "bulk_rows_reduce"])
+@pytest.mark.parametrize("n", [256, 136])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_n_tile_major_output(routing, pingpong, mode, n, dtype):
+    """Direct physical stores, scatter collisions, padding, cache reuse and graph replay."""
+    from run.hopper_gather_table_gemm import build_work_table
+    from quack.cute_dsl_utils import get_max_active_clusters
+
+    torch.manual_seed(73)
+    counts = [129, 257]
+    routes, k, tile_n = sum(counts), 128, 128
+    a = torch.randn(routes, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(2, k, n, device="cuda", dtype=a.dtype) / math.sqrt(k)
+    reference = torch.cat([a[:129].float() @ w[0].float(), a[129:].float() @ w[1].float()])
+    baseline = torch.cat([a[:129] @ w[0], a[129:] @ w[1]]).to(dtype).float()
+    reduce = mode == "bulk_rows_reduce"
+    destinations = (
+        torch.arange(routes, device="cuda") % 97
+        if reduce
+        else torch.randperm(routes, device="cuda")
+    )
+    config = dict(
+        C=None,
+        tile_count_semaphore=None,
+        tile_M=128,
+        tile_N=tile_n,
+        cluster_M=2,
+        cluster_N=1,
+        pingpong=pingpong,
+        max_swizzle_size=1,
+        epilogue_store=mode,
+        scatter_table=destinations.int(),
+    )
+    if routing == "varlen":
+        config["cu_seqlens_m"] = torch.tensor([0, 129, routes], device="cuda", dtype=torch.int32)
+    else:
+        work_count = sum(math.ceil(c / 256) for c in counts) * math.ceil(n / tile_n)
+        table, _, _ = build_work_table(
+            counts,
+            output_dim=n,
+            tile_m=128,
+            tile_n=tile_n,
+            cluster_m=2,
+            max_swizzle_size=1,
+            device=a.device,
+            wave_work_ids=min(get_max_active_clusters(2), work_count)
+            if routing == "expert_waves"
+            else None,
+        )
+        config.update(
+            gather_work_table=table,
+            A_idx=torch.arange(routes, device="cuda", dtype=torch.int32),
+        )
+
+    expected = torch.zeros(routes, n, device="cuda")
+    expected.index_add_(0, destinations, reference)
+    gemm_error = torch.zeros_like(expected)
+    gemm_error.index_add_(0, destinations, (baseline - reference).abs())
+    magnitude = torch.zeros_like(expected)
+    magnitude.index_add_(0, destinations, baseline.abs())
+    counts_per_dst = torch.bincount(destinations, minlength=routes)
+    factor = torch.expm1(
+        (counts_per_dst.float() - 1).clamp_min(0) * math.log1p(torch.finfo(dtype).eps / 2)
+    )[:, None]
+    allowed = (
+        0.03 + 1e-3 * expected.abs() + 2 * gemm_error + factor * (magnitude + 2 * gemm_error)
+    )
+    tiles = math.ceil(n / tile_n)
+    # Switch layouts and pointers on warm caches; guard both ends of the allocation.
+    for tiled in (False, True, False, True):
+        shape = (tiles, routes * tile_n) if tiled else (routes, n)
+        storage = torch.full((math.prod(shape) + 16,), -123., device="cuda", dtype=dtype)
+        output = storage[8:-8].view(shape)
+
+        def launch():
+            if reduce:
+                output.zero_()
+            gemm(a, w.transpose(1, 2), output, n_tile_major_output=tiled, **config)
+
+        launch()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            launch()
+        graph.replay()
+        graph.replay()
+        padded = (
+            output.view(tiles, routes, tile_n).permute(1, 0, 2).reshape(routes, -1)
+            if tiled
+            else output
+        )
+        actual = padded[:, :n].float()
+        assert torch.isfinite(actual).all()
+        assert ((actual - expected).abs() <= allowed).all()
+        assert (actual[counts_per_dst == 0] == 0).all()
+        assert (storage[:8] == -123).all() and (storage[-8:] == -123).all()
+        if tiled:
+            assert (padded[:, n:] == (0 if reduce else -123)).all()
+
+    with pytest.raises(ValueError, match="multi_buffer_scatter"):
+        gemm(
+            a, w.transpose(1, 2), (output, output), n_tile_major_output=True,
+            multi_buffer_scatter=True, **config,
+        )
+    with pytest.raises(ValueError, match="16-byte-multiple width"):
+        gemm(
+            a, w.transpose(1, 2)[:, :129],
+            torch.empty((2, routes * tile_n), device="cuda", dtype=dtype),
+            n_tile_major_output=True, **config,
+        )
+
+
+@pytest.mark.parametrize("mode", ["bulk_rows", "bulk_rows_reduce"])
+@pytest.mark.parametrize("expert_waves", [False, True])
+def test_n_tile_major_runner(monkeypatch, mode, expert_waves):
+    import sys
+    from run import hopper_pregather_gemm as runner
+
+    argv = (
+        "hopper_pregather_gemm.py --tokens 257 --hidden 128 --output-dim 136 "
+        "--experts 2 --routes 258 --tile-m 128 --tile-n 128 --max-swizzle-size 1 "
+        "--scatter-table --n-tile-major-output --warmup 2 --iterations 2 --timing-samples 1"
+    ).split()
+    argv.extend(("--epilogue-store", mode))
+    if expert_waves:
+        argv.extend(("--gather-table", "--gather-table-expert-waves"))
+    if mode == "bulk_rows_reduce":
+        argv.extend(("--scatter-table-with-replacement", "--scatter-table-destination-rows", "17"))
+    monkeypatch.setattr(sys, "argv", argv)
+    runner.main()  # Runs the runner's float32 reference and same-dtype error checks.
+    args = runner.parse_args()
+    args.multi_buffer_scatter = True
+    with pytest.raises(ValueError, match="does not support --multi-buffer-scatter"):
+        runner.validate_args(args)

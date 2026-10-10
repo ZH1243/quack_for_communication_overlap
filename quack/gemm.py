@@ -97,6 +97,7 @@ def _compile_gemm(
     epilogue_store="tma",
     has_scatter=False,
     scatter_addresses=False,
+    n_tile_major_output=False,
 ):
     sm_to_cls = {
         8: GemmDefaultSm80,
@@ -262,6 +263,7 @@ def _compile_gemm(
         gather_table=gather_table,
         gather_table_num_buffers=gather_table_num_buffers,
         epilogue_store=epilogue_store,
+        n_tile_major_output=n_tile_major_output,
     )
 
 
@@ -578,7 +580,36 @@ def gemm(
     # D is a sequence of output buffers; scatter_table is int64[R] row addresses
     # from build_scatter_row_addresses. Keep all buffers alive through completion.
     multi_buffer_scatter: bool = False,
+    # SM90 single-buffer scatter: contiguous D[ceil(N/tile_N), R*tile_N].
+    # D.view(-1, R, tile_N).permute(1, 0, 2).reshape(R, -1)[:, :N]
+    # restores logical values (may copy); reshaping alone does not. Padding
+    # is untouched. N and the final segment must satisfy bulk's 16-byte alignment.
+    n_tile_major_output: bool = False,
 ) -> _GemmPlan:
+    if n_tile_major_output:
+        if multi_buffer_scatter:
+            raise ValueError("n_tile_major_output does not support multi_buffer_scatter")
+        if scatter_table is None or epilogue_store not in ("bulk_rows", "bulk_rows_reduce"):
+            raise ValueError("n_tile_major_output requires scatter_table and bulk-row stores")
+        if cluster_N != 1 or multi_buffer_gather or b_kn:
+            raise ValueError("n_tile_major_output requires cluster_N=1 and single-buffer gather")
+        if not isinstance(D, Tensor) or A.ndim != 2 or B.ndim != 3:
+            raise ValueError("n_tile_major_output requires grouped GEMM and a single output tensor")
+        if any(t is not None for t in (SFA, SFB, SFD, SFDCol)):
+            raise ValueError("n_tile_major_output does not support block scaling")
+        if tile_N <= 0:
+            raise ValueError("n_tile_major_output requires positive tile_N")
+        routes = A_idx.shape[0] if A_idx is not None else A.shape[0]
+        output_dim = B.shape[1]
+        num_tile_n = (output_dim + tile_N - 1) // tile_N
+        if D.shape != (num_tile_n, routes * tile_N) or not D.is_contiguous():
+            raise ValueError("n_tile_major_output requires contiguous D[ceil(N/tile_N), R*tile_N]")
+        if tile_N * D.element_size() % 16:
+            raise ValueError("n_tile_major_output requires a 16-byte-aligned tile width")
+        # Metadata-only alias: preserve logical M/N for scheduling and tail bounds.
+        # This is NOT a logical view of the values. Only the custom bulk store
+        # interprets the backing storage; no ordinary output is allocated.
+        D = D.as_strided((routes, output_dim), (num_tile_n * tile_N, 1))
     if multi_buffer_scatter:
         _validate_scatter_buffers(D)
         input_device = A[0].device if isinstance(A, (tuple, list)) else A.device
@@ -644,6 +675,7 @@ def gemm(
         tensor_key(cu_seqlens_k),
         tensor_key(scatter_table),
         multi_buffer_scatter,
+        n_tile_major_output,
         tensor_key(gather_work_table),
         tensor_key(gather_work_table_ready),
         tuple(tensor_key(t) for t in A_buffers),
@@ -731,6 +763,7 @@ def gemm(
             epilogue_store=epilogue_store,
             scatter_table=scatter_table,
             multi_buffer_scatter=multi_buffer_scatter,
+            n_tile_major_output=n_tile_major_output,
         )
         _gemm_plan_cache[key] = plan
     run_gemm_plan(
@@ -921,6 +954,7 @@ def _build_gemm_plan(
     epilogue_store="tma",
     scatter_table=None,
     multi_buffer_scatter=False,
+    n_tile_major_output=False,
 ) -> _GemmPlan:
     if scatter_table is not None:
         if epilogue_store not in ("bulk_rows", "bulk_rows_reduce"):
@@ -1342,6 +1376,7 @@ def _build_gemm_plan(
         epilogue_store,
         scatter_table is not None,
         multi_buffer_scatter,
+        n_tile_major_output,
     )
 
     cluster_size = cluster_M * cluster_N * cluster_K

@@ -759,12 +759,15 @@ def compile_gemm_kernel(
     gather_table=False,
     gather_table_num_buffers=1,
     epilogue_store="tma",
+    n_tile_major_output=False,
 ):
     """Build GemmCls instance, apply SM90 partial, and cute.compile with TVM-FFI."""
     split_k_kwargs = {}
     if split_k != 1:
         assert device_capacity[0] in [9, 10, 11, 12], "split_k requires SM90/SM100/SM120"
         split_k_kwargs = {"split_k": split_k, "split_k_mode": split_k_mode}
+    if n_tile_major_output:
+        split_k_kwargs["n_tile_major_output"] = True
     if epilogue_store != "tma":
         assert device_capacity[0] == 9, "bulk_rows epilogue requires SM90"
         assert split_k == 1, "bulk_rows epilogue does not support split-K"

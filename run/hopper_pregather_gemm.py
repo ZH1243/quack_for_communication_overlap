@@ -61,6 +61,17 @@ with replacement. Contributions to each destination are summed; unused rows stay
 zero. --scatter-table-destination-rows R1 restricts sampling to [0, R1), with
 1 <= R1 <= R (default R), leaving output[R1:] zero. Smaller R1 increases the
 average number of contributions per eligible destination to R/R1.
+Add --n-tile-major-output with --scatter-table and either bulk mode to allocate
+Y_prime directly as [ceil(N/tile_n), routes * tile_n]. Element (dst_row, n) is
+stored at Y_prime[n // tile_n, dst_row * tile_n + n % tile_n]. The last tile is
+padded; only valid columns are written and N * element_bytes must be divisible
+by 16. Reduction resets the whole allocation, including padding, before each
+launch. Multi-buffer scatter and down projection are unsupported with this flag.
+Consumers can recover ordinary Y with
+Y_prime.view(-1, routes, tile_n).permute(1, 0, 2).reshape(routes, -1)[:, :N].
+This may copy: reshaping alone does not restore row-major Y. The runner performs
+this conversion only for correctness checking, outside GEMM timing.
+
 Add --multi-buffer-scatter --scatter-output-buffers B to distribute the same
 logical destination space across B separately allocated output buffers (default
 B=2). A (buffer_id, row_index) mapping is converted to int64 destination-row
@@ -124,13 +135,21 @@ class PregatherInputs:
     scatter_row_addresses: torch.Tensor | None = None
     scatter_mapping: torch.Tensor | None = None
     scatter_with_replacement: bool = False
+    n_tile_major_tile_n: int | None = None
     wave_work_ids: int | None = None
 
     def output_buffers(self) -> tuple[torch.Tensor, ...]:
         return self.up_output if isinstance(self.up_output, tuple) else (self.up_output,)
 
     def collected_up_output(self) -> torch.Tensor:
-        # Reference checking only: no concatenation on the GEMM launch path.
+        # Reference checking only: no conversion on the GEMM launch path.
+        if self.n_tile_major_tile_n is not None:
+            routes, n = self.A.shape[0], self.W_up.shape[-1]
+            return (
+                self.up_output.view(-1, routes, self.n_tile_major_tile_n)
+                .permute(1, 0, 2)
+                .reshape(routes, -1)[:, :n]
+            )
         return torch.cat(self.up_output) if isinstance(self.up_output, tuple) else self.up_output
 
     def zero_up_output(self) -> None:
@@ -208,6 +227,11 @@ def parse_args() -> argparse.Namespace:
             "Scatter routed output rows using a random permutation (requires "
             "--epilogue-store bulk_rows or bulk_rows_reduce; works with either scheduler)"
         ),
+    )
+    parser.add_argument(
+        "--n-tile-major-output",
+        action="store_true",
+        help="Store directly as [ceil(N/tile_n), routes*tile_n] (single-buffer scatter only)",
     )
     parser.add_argument(
         "--multi-buffer-scatter",
@@ -295,6 +319,15 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"{name} must be positive, got {value}")
     if args.warmup < 0:
         raise ValueError(f"warmup must be nonnegative, got {args.warmup}")
+    if args.n_tile_major_output:
+        if args.multi_buffer_scatter:
+            raise ValueError("--n-tile-major-output does not support --multi-buffer-scatter")
+        if not args.scatter_table:
+            raise ValueError("--n-tile-major-output requires --scatter-table")
+        if args.output_dim % 8 or args.tile_n % 8:
+            raise ValueError("--n-tile-major-output requires 16-byte-aligned N and tile_n widths")
+        if args.down_projection or args.activation is not None:
+            raise ValueError("--n-tile-major-output requires plain GEMM without down projection")
     if args.multi_buffer_scatter:
         if not args.scatter_table:
             raise ValueError("--multi-buffer-scatter requires --scatter-table")
@@ -444,6 +477,12 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> PregatherI
         up_output = tuple(
             torch.empty((size, args.output_dim), dtype=dtype, device=device) for size in sizes
         )
+    elif args.n_tile_major_output:
+        up_output = torch.empty(
+            (math.ceil(args.output_dim / args.tile_n), args.routes * args.tile_n),
+            dtype=dtype,
+            device=device,
+        )
     else:
         up_output = torch.empty((args.routes, args.output_dim), dtype=dtype, device=device)
     output = (
@@ -476,6 +515,7 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> PregatherI
             up_output, scatter_mapping, reduce=args.epilogue_store == "bulk_rows_reduce"
         )
     return PregatherInputs(
+        n_tile_major_tile_n=args.tile_n if args.n_tile_major_output else None,
         scatter_table=scatter_table,
         scatter_mapping=scatter_mapping,
         scatter_row_addresses=scatter_row_addresses,
@@ -569,6 +609,7 @@ def make_launch(args: argparse.Namespace, inputs: PregatherInputs):
                     else inputs.scatter_table
                 ),
                 multi_buffer_scatter=args.multi_buffer_scatter,
+                n_tile_major_output=args.n_tile_major_output,
             )
 
         if args.down_projection:
@@ -869,6 +910,11 @@ def main() -> None:
         print(
             f"W_down: {tuple(inputs.W_down.shape)}, up output: {tuple(inputs.up_output.shape)}, "
             f"final output: {tuple(inputs.output.shape)}"
+        )
+    elif args.n_tile_major_output:
+        print(
+            f"Output: N-tile-major physical {tuple(inputs.output.shape)}, "
+            f"logical ({args.routes}, {args.output_dim}), tile_n={args.tile_n}"
         )
     elif args.multi_buffer_scatter:
         print(f"Output buffers: {[tuple(b.shape) for b in inputs.output_buffers()]}")

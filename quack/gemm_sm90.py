@@ -170,6 +170,7 @@ class GemmSm90(GemmTmaBase):
         gather_table: bool = False,
         gather_table_num_buffers: int = 1,
         epilogue_store: str = "tma",
+        n_tile_major_output: bool = False,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -188,6 +189,9 @@ class GemmSm90(GemmTmaBase):
         self.acc_dtype = acc_dtype
         if epilogue_store not in ("tma", "bulk_rows", "bulk_rows_reduce"):
             raise ValueError("epilogue_store must be 'tma', 'bulk_rows', or 'bulk_rows_reduce'")
+        self.n_tile_major_output = n_tile_major_output
+        if n_tile_major_output:
+            assert cluster_shape_mnk[1] == 1 and epilogue_store != "tma"
         self.bulk_row_reduce = epilogue_store == "bulk_rows_reduce"
         self.bulk_row_store = epilogue_store in ("bulk_rows", "bulk_rows_reduce")
         if self.bulk_row_store:
@@ -468,6 +472,8 @@ class GemmSm90(GemmTmaBase):
         self.scatter_addresses = (
             self.scatter_rows and epilogue_args.mScatter.element_type == Int64
         )
+        if self.n_tile_major_output:
+            assert self.scatter_rows and not self.scatter_addresses
         if self.bulk_row_store:
             assert self.d_dtype in (cutlass.Float16, cutlass.BFloat16, cutlass.Float32)
             assert self.d_layout.is_n_major_c(), "bulk_rows requires row-major D"
@@ -1696,7 +1702,13 @@ class GemmSm90(GemmTmaBase):
                 dst_row = row_start + row
                 if const_expr(scatter_rows is not None and not self.scatter_addresses):
                     dst_row = scatter_rows[row_block]
-                if const_expr(self.scatter_addresses):
+                if const_expr(self.n_tile_major_output):
+                    # gD carries logical (routes, N), but storage is [ntiles, routes, tile_n].
+                    # Widen before multiplication for allocations exceeding 2 Gi elements.
+                    dst_ptr = gD.iterator + (
+                        Int64(tile_coord[1]) * gD.shape[0] + Int64(dst_row)
+                    ) * tile_n
+                elif const_expr(self.scatter_addresses):
                     dst_ptr = cute.make_ptr(
                         self.d_dtype,
                         scatter_rows[row_block],
