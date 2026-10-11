@@ -476,6 +476,7 @@ def build_scatter_row_addresses(
     *,
     reduce: bool = False,
     tile_n: int | None = None,
+    used_rows: tuple[int, ...] | list[int] | None = None,
 ) -> Tensor:
     """Convert int32/int64 [R, 2] (buffer_id, row_index) to CUDA store metadata.
 
@@ -487,8 +488,21 @@ def build_scatter_row_addresses(
     With tile_n, buffers are contiguous [num_n_tiles, rows_in_buffer * tile_n].
     Returns int64[R, 2] containing (tile-0 segment address, N-tile stride in bytes).
     Pass this metadata with multi_buffer_scatter=True and n_tile_major_output=True.
+    used_rows optionally sets each buffer's logical row count (requires tile_n).
+    Tile strides use these counts, packing all tiles into a contiguous prefix of
+    each allocation. Counts must be positive and no larger than allocated capacity.
+    Rebuild metadata when counts change; allocation shape remains capacity metadata.
     """
     _validate_scatter_buffers(buffers, tile_n=tile_n)
+    capacities = [b.shape[0] if tile_n is None else b.shape[1] // tile_n for b in buffers]
+    if used_rows is not None:
+        if tile_n is None:
+            raise ValueError("used_rows requires N-tile-major scatter (tile_n)")
+        if len(used_rows) != len(buffers) or any(
+            not isinstance(rows, int) or isinstance(rows, bool) or not 0 < rows <= capacity
+            for rows, capacity in zip(used_rows, capacities)
+        ):
+            raise ValueError("used_rows must contain one positive count per buffer within capacity")
     if (
         mapping.ndim != 2
         or mapping.shape[1] != 2
@@ -498,7 +512,7 @@ def build_scatter_row_addresses(
         raise ValueError("mapping must be int32/int64[R, 2] on the output device")
     ids, rows = mapping[:, 0].long(), mapping[:, 1].long()
     sizes = torch.tensor(
-        [b.shape[0] if tile_n is None else b.shape[1] // tile_n for b in buffers],
+        capacities if used_rows is None else used_rows,
         device=mapping.device,
     )
     if ((ids < 0) | (ids >= len(buffers))).any().item():
@@ -507,6 +521,8 @@ def build_scatter_row_addresses(
         raise ValueError("scatter row index out of bounds")
     bases = torch.tensor([b.data_ptr() for b in buffers], device=mapping.device)
     strides = torch.tensor([b.stride(0) * b.element_size() for b in buffers], device=mapping.device)
+    if tile_n is not None:
+        strides = sizes * tile_n * buffers[0].element_size()
     row_bytes = strides[ids] if tile_n is None else tile_n * buffers[0].element_size()
     addresses = (bases[ids] + rows * row_bytes).contiguous()
     if tile_n is not None:

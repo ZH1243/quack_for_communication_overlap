@@ -65,7 +65,7 @@ Add --n-tile-major-output with --scatter-table and either bulk mode to allocate
 Y_prime directly as [ceil(N/tile_n), routes * tile_n]. Element (dst_row, n) is
 stored at Y_prime[n // tile_n, dst_row * tile_n + n % tile_n]. The last tile is
 padded; only valid columns are written and N * element_bytes must be divisible
-by 16. Reduction resets the whole allocation, including padding, before each
+by 16. Reduction resets the used region, including column padding, before each
 launch. With --multi-buffer-scatter, each buffer instead has shape
 [ceil(N/tile_n), rows_in_buffer * tile_n]; per-route metadata supplies its
 tile-0 address and N-tile stride. Down projection is unsupported with this flag.
@@ -89,6 +89,13 @@ expert-wave scheduling and both bulk store modes. For example:
         --epilogue-store bulk_rows --tile-m 128 --tile-n 128
 
 Add --n-tile-major-output to this command to use tiled storage in every buffer.
+Use --scatter-output-rows U0 U1 ... to choose used rows per buffer (sum: routes),
+and --scatter-output-capacity-rows C0 C1 ... to overallocate (Cb >= Ub > 0).
+A single count broadcasts to all buffers. Defaults are a balanced used-row split
+and capacity equal to used rows. All N tiles are packed into the first
+ceil(N/tile_n) * Ub * tile_n elements of buffer b; unused capacity follows this
+prefix and is neither written by GEMM nor cleared by the runner. The tensor's
+allocated shape describes capacity, not the packed data's logical layout.
 
 The correctness check accounts for output-dtype accumulation rounding.
 The bulk_rows_reduce mode adds into the destination, so the runner zeros it
@@ -142,6 +149,7 @@ class PregatherInputs:
     scatter_mapping: torch.Tensor | None = None
     scatter_with_replacement: bool = False
     n_tile_major_tile_n: int | None = None
+    scatter_output_rows: tuple[int, ...] | None = None
     wave_work_ids: int | None = None
 
     def output_buffers(self) -> tuple[torch.Tensor, ...]:
@@ -152,17 +160,26 @@ class PregatherInputs:
         if self.n_tile_major_tile_n is not None:
             tile_n, n = self.n_tile_major_tile_n, self.W_up.shape[-1]
             outputs = [
-                buffer.view(-1, buffer.shape[1] // tile_n, tile_n)
+                buffer.view(-1)[:math.ceil(n / tile_n) * rows * tile_n]
+                .view(-1, rows, tile_n)
                 .permute(1, 0, 2)
-                .reshape(buffer.shape[1] // tile_n, -1)[:, :n]
-                for buffer in self.output_buffers()
+                .reshape(rows, -1)[:, :n]
+                for buffer, rows in zip(
+                    self.output_buffers(),
+                    self.scatter_output_rows
+                    or tuple(b.shape[1] // tile_n for b in self.output_buffers()),
+                )
             ]
             return torch.cat(outputs) if isinstance(self.up_output, tuple) else outputs[0]
         return torch.cat(self.up_output) if isinstance(self.up_output, tuple) else self.up_output
 
     def zero_up_output(self) -> None:
-        for buffer in self.output_buffers():
-            buffer.zero_()
+        for i, buffer in enumerate(self.output_buffers()):
+            if self.scatter_output_rows is not None and self.n_tile_major_tile_n is not None:
+                count = buffer.shape[0] * self.scatter_output_rows[i] * self.n_tile_major_tile_n
+                buffer.view(-1)[:count].zero_()
+            else:
+                buffer.zero_()
 
 
 def parse_args() -> argparse.Namespace:
@@ -253,6 +270,16 @@ def parse_args() -> argparse.Namespace:
         help="Number of output buffers for --multi-buffer-scatter (default: 2)",
     )
     parser.add_argument(
+        "--scatter-output-rows", type=int, nargs="+", metavar="ROWS",
+        help="Used rows per N-tile-major buffer; one count broadcasts, otherwise one per buffer. "
+        "Counts must sum to --routes (default: balanced split).",
+    )
+    parser.add_argument(
+        "--scatter-output-capacity-rows", type=int, nargs="+", metavar="ROWS",
+        help="Allocated row capacity per N-tile-major buffer; one count broadcasts. "
+        "Must cover used rows (default: used rows).",
+    )
+    parser.add_argument(
         "--scatter-table-with-replacement",
         action="store_true",
         help=(
@@ -309,6 +336,26 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def scatter_output_sizes(args: argparse.Namespace) -> tuple[list[int], list[int]]:
+    """Resolve logical rows separately from allocation capacities."""
+    count = args.scatter_output_buffers
+    balanced = [args.routes // count + (i < args.routes % count) for i in range(count)]
+
+    def expand(values, default):
+        result = default if values is None else values * count if len(values) == 1 else values
+        if len(result) != count or any(value <= 0 for value in result):
+            raise ValueError("scatter output rows require one positive count or one per buffer")
+        return result
+
+    used = expand(args.scatter_output_rows, balanced)
+    capacity = expand(args.scatter_output_capacity_rows, used)
+    if sum(used) != args.routes:
+        raise ValueError("--scatter-output-rows must sum to --routes")
+    if any(rows > allocated for rows, allocated in zip(used, capacity)):
+        raise ValueError("scatter output used rows must not exceed allocated capacity")
+    return used, capacity
+
+
 def validate_args(args: argparse.Namespace) -> None:
     named_positive = {
         "tokens": args.tokens,
@@ -339,6 +386,10 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError("--multi-buffer-scatter requires --scatter-table")
         if not 2 <= args.scatter_output_buffers <= args.routes:
             raise ValueError("--scatter-output-buffers must be between 2 and routes")
+        scatter_output_sizes(args)
+    if args.scatter_output_rows is not None or args.scatter_output_capacity_rows is not None:
+        if not args.multi_buffer_scatter or not args.n_tile_major_output:
+            raise ValueError("scatter output row options require multi-buffer N-tile-major output")
     if args.scatter_table_destination_rows is not None:
         if not args.scatter_table_with_replacement:
             raise ValueError(
@@ -478,8 +529,7 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> PregatherI
         identity_A_idx = torch.arange(args.routes, dtype=torch.int32, device=A.device)
     if args.multi_buffer_scatter:
         # Split logical destination space evenly; no monolithic output allocation.
-        count = args.scatter_output_buffers
-        sizes = [args.routes // count + (i < args.routes % count) for i in range(count)]
+        sizes, capacities = scatter_output_sizes(args)
         up_output = tuple(
             torch.empty(
                 (math.ceil(args.output_dim / args.tile_n), size * args.tile_n)
@@ -488,7 +538,7 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> PregatherI
                 dtype=dtype,
                 device=device,
             )
-            for size in sizes
+            for size in capacities
         )
     elif args.n_tile_major_output:
         up_output = torch.empty(
@@ -529,9 +579,11 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> PregatherI
             scatter_mapping,
             reduce=args.epilogue_store == "bulk_rows_reduce",
             tile_n=args.tile_n if args.n_tile_major_output else None,
+            used_rows=sizes if args.n_tile_major_output else None,
         )
     return PregatherInputs(
         n_tile_major_tile_n=args.tile_n if args.n_tile_major_output else None,
+        scatter_output_rows=tuple(sizes) if args.multi_buffer_scatter else None,
         scatter_table=scatter_table,
         scatter_mapping=scatter_mapping,
         scatter_row_addresses=scatter_row_addresses,
@@ -932,6 +984,8 @@ def main() -> None:
             f"Output: N-tile-major physical {[tuple(b.shape) for b in inputs.output_buffers()]}, "
             f"logical ({args.routes}, {args.output_dim}), tile_n={args.tile_n}"
         )
+        if args.multi_buffer_scatter:
+            print(f"Output used rows: {list(inputs.scatter_output_rows)}")
     elif args.multi_buffer_scatter:
         print(f"Output buffers: {[tuple(b.shape) for b in inputs.output_buffers()]}")
     else:

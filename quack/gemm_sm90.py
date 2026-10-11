@@ -1505,7 +1505,8 @@ class GemmSm90(GemmTmaBase):
                                         self.scatter_addresses and self.n_tile_major_output
                                     ):
                                         # Resolve this tile's byte address before R2S; buffers may
-                                        # have different row counts and therefore tile strides.
+                                        # have different used-row counts (independent of their
+                                        # allocation capacities) and therefore tile strides.
                                         scatter_rows[rb] = (
                                             epilogue_params.mScatter[source_start + row, 0]
                                             + Int64(tile_coord_mnkl[1])

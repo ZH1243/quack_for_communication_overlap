@@ -649,15 +649,16 @@ def test_multi_buffer_scatter(routing, pingpong, reduce, tiled, n, dtype):
         config.update(cu_seqlens_m=torch.tensor([0, 129, routes], device="cuda", dtype=torch.int32))
 
     # Reallocate between launches to exercise a warm plan with new pointers.
-    for _ in range(2):
+    for allocation_round in range(2):
         if tiled:
             tiles = math.ceil(n / tile_n)
+            capacities = [size + allocation_round * (i + 13) for i, size in enumerate(sizes)]
             storage = tuple(
                 torch.full((tiles * size * tile_n + 16,), -123., device="cuda", dtype=dtype)
-                for size in sizes
+                for size in capacities
             )
             buffers = tuple(
-                t[8:-8].view(tiles, size * tile_n) for t, size in zip(storage, sizes)
+                t[8:-8].view(tiles, size * tile_n) for t, size in zip(storage, capacities)
             )
         else:
             storage = tuple(
@@ -665,13 +666,16 @@ def test_multi_buffer_scatter(routing, pingpong, reduce, tiled, n, dtype):
                 for i, size in enumerate(sizes)
             )
             buffers = tuple(t[1:-1, :n] for t in storage)
-        address_kwargs = dict(tile_n=tile_n) if tiled else {}
+        address_kwargs = dict(tile_n=tile_n, used_rows=sizes) if tiled else {}
         addresses = build_scatter_row_addresses(buffers, mapping, reduce=reduce, **address_kwargs)
 
         def launch():
             if reduce:
-                for buffer in buffers:
-                    buffer.zero_()
+                for buffer, size in zip(buffers, sizes):
+                    if tiled:
+                        buffer.view(-1)[:tiles * size * tile_n].zero_()
+                    else:
+                        buffer.zero_()
             gemm(a, w.transpose(1, 2), buffers, scatter_table=addresses, **config)
 
         launch()
@@ -682,12 +686,25 @@ def test_multi_buffer_scatter(routing, pingpong, reduce, tiled, n, dtype):
         graph.replay()
         if tiled:
             padded = [
-                b.view(tiles, size, tile_n).permute(1, 0, 2).reshape(size, -1)
+                b.view(-1)[:tiles * size * tile_n]
+                .view(tiles, size, tile_n).permute(1, 0, 2).reshape(size, -1)
                 for b, size in zip(buffers, sizes)
             ]
             actual = torch.cat([p[:, :n] for p in padded]).float()
             for p in padded:
                 assert (p[:, n:] == (0 if reduce else -123)).all()
+            for b, size in zip(buffers, sizes):
+                assert (b.view(-1)[tiles * size * tile_n:] == -123).all()
+            with pytest.raises(ValueError, match="within capacity"):
+                build_scatter_row_addresses(
+                    buffers, mapping, tile_n=tile_n,
+                    used_rows=[capacities[0] + 1, *sizes[1:]],
+                )
+            bad_used_row = mapping.clone()
+            bad_used_row[0, 0] = 0
+            bad_used_row[0, 1] = sizes[0]
+            with pytest.raises(ValueError, match="row index"):
+                build_scatter_row_addresses(buffers, bad_used_row, **address_kwargs)
         else:
             actual = torch.cat(buffers).float()
         expected = torch.zeros_like(actual)
@@ -744,7 +761,10 @@ def test_multi_buffer_scatter_runner(monkeypatch, reduce, tiled):
     ).split()
     argv.append("bulk_rows_reduce" if reduce else "bulk_rows")
     if tiled:
-        argv.append("--n-tile-major-output")
+        argv.extend((
+            "--n-tile-major-output", "--scatter-output-rows", "40", "90", "130",
+            "--scatter-output-capacity-rows", "160",
+        ))
     if reduce:
         argv.extend(("--scatter-table-with-replacement", "--scatter-table-destination-rows", "17"))
     monkeypatch.setattr(sys, "argv", argv)
