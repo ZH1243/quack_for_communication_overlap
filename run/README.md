@@ -366,3 +366,47 @@ python run/hopper_gather_table_gemm.py --indexed-gather \
 
 pytest tests/test_gemm_gather_table.py -k indexed_gather -x
 ```
+
+### Gather/activation followed by configurable down projection
+
+`hopper_gather_table_gemm.py --down-projection2` reuses the plain grouped GEMM
+setup and launch from `hopper_pregather_gemm.py`. It consumes the contiguous
+activated intermediate directly, preserving the actual (possibly unequal)
+expert row counts. It is mutually exclusive with `--down-projection` and
+requires `--activation`.
+
+All plain-GEMM kernel options from the pregather runner are available with a
+`--down-` prefix and independent defaults. For example:
+
+```bash
+python run/hopper_gather_table_gemm.py \
+    --tokens 4096 --hidden 4096 --output-dim 14336 \
+    --experts 8 --routes 8195 --activation swiglu --down-projection2 \
+    --down-tile-m 128 --down-tile-n 128 --down-pingpong \
+    --down-scatter-table --down-n-tile-major-output \
+    --down-gather-table --down-gather-table-expert-waves \
+    --down-max-swizzle-size 1 --down-gather-table-wave-barrier \
+    --down-epilogue-store bulk_rows
+```
+
+Down options include tile/cluster sizes, swizzle, pingpong, both table traversal
+orders, wave barriers, all epilogue store modes, single/multiple scatter buffers,
+N-tile-major output, used/capacity rows, and scatter with replacement. Existing
+compatibility constraints still apply. The down table uses identity input
+indices and the final hidden width; it is independent of the up table, including
+when up uses indexed or multi-buffer gather.
+
+The scatter destinations are benchmark-generated permutations, or random
+indices with `--down-scatter-table-with-replacement`; they do not automatically
+implement the original MoE routing or routing weights. Duplicate destinations
+require `--down-epilogue-store bulk_rows_reduce`. Reduction outputs are zeroed
+on every pipeline invocation, including CUDA graph replay, and this reset is
+included in the reported pipeline time. N-tile-major outputs are converted to
+logical rows only for correctness checking. Up and down execute sequentially
+on the same stream; wave barriers order the down kernel's stores.
+
+Hopper numerical regression coverage (including repeated CUDA graph replay):
+
+```bash
+pytest tests/test_gemm_gather_table.py -k down_projection2 -x
+```

@@ -77,6 +77,12 @@ import torch
 from quack.gemm_interface import act_to_pytorch_fn_map, gated_to_pytorch_fn_map
 
 
+if __package__:
+    from . import hopper_pregather_gemm as pregather
+else:
+    import hopper_pregather_gemm as pregather
+
+
 DTYPES = {
     "bf16": torch.bfloat16,
     "fp16": torch.float16,
@@ -94,11 +100,13 @@ class TableGatherInputs:
     work_table: torch.Tensor
     route_offsets: tuple[tuple[int, ...], ...]
     output_segments: tuple[tuple[int, int, int, int], ...]
-    output: torch.Tensor
+    output: torch.Tensor | tuple[torch.Tensor, ...]
     work_group_size: int
     W_down: torch.Tensor | None = None
     up_output: torch.Tensor | None = None
     cu_seqlens_m: torch.Tensor | None = None
+    down_inputs: pregather.PregatherInputs | None = None
+    down_args: argparse.Namespace | None = None
 
 
 def make_arg_parser(
@@ -106,6 +114,7 @@ def make_arg_parser(
     *,
     include_activation: bool = True,
     include_down_projection: bool = False,
+    include_down_projection2: bool = False,
 ) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=description
@@ -157,11 +166,18 @@ def make_arg_parser(
             ),
         )
     if include_activation and include_down_projection:
-        parser.add_argument(
+        down_group = parser.add_mutually_exclusive_group()
+        down_group.add_argument(
             "--down-projection",
             action="store_true",
             help="Run a grouped down projection after activation (requires --activation)",
         )
+        if include_down_projection2:
+            down_group.add_argument(
+                "--down-projection2", action="store_true",
+                help="Use the pregather plain-GEMM features for down projection (requires --activation)",
+            )
+            pregather.add_kernel_arguments(parser, prefix="down-")
     parser.add_argument("--tile-m", type=int, default=256)
     parser.add_argument("--tile-n", type=int, default=256)
     parser.add_argument("--tile-k", type=int, default=None)
@@ -180,13 +196,36 @@ def make_arg_parser(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = make_arg_parser(include_down_projection=True)
+    parser = make_arg_parser(include_down_projection=True, include_down_projection2=True)
     parser.add_argument(
         "--indexed-gather",
         action="store_true",
         help="Single-buffer table with direct token indices and -1 tail padding",
     )
     return parser.parse_args()
+
+
+def has_down_projection(args: argparse.Namespace) -> bool:
+    return getattr(args, "down_projection", False) or getattr(args, "down_projection2", False)
+
+
+def down_projection_args(args: argparse.Namespace, routes: int) -> argparse.Namespace:
+    """Translate independent down options into the shared plain-GEMM configuration."""
+    values = vars(args).copy()
+    values.update({
+        key[5:]: value for key, value in vars(args).items()
+        if key.startswith("down_") and key not in ("down_projection", "down_projection2")
+    })
+    values.update(
+        hidden=args.output_dim, output_dim=args.hidden, routes=routes,
+        activation=None, down_projection=False,
+    )
+    down = argparse.Namespace(**values)
+    try:
+        pregather.validate_args(down, prepacked=True)
+    except ValueError as exc:
+        raise ValueError(f"down-projection2 configuration: {exc}") from exc
+    return down
 
 
 def route_counts(total_routes: int, experts: int) -> list[int]:
@@ -234,14 +273,18 @@ def validate_args(args: argparse.Namespace) -> None:
                 f"pingpong with tile-m={args.tile_m} requires tile-n divisible by 16 "
                 f"and no larger than {tile_n_max}"
             )
-    if getattr(args, "down_projection", False) and getattr(args, "activation", None) is None:
-        raise ValueError("--down-projection requires --activation")
+    if getattr(args, "down_projection2", False) and getattr(args, "down_projection", False):
+        raise ValueError("--down-projection and --down-projection2 are mutually exclusive")
+    if has_down_projection(args) and getattr(args, "activation", None) is None:
+        raise ValueError("--down-projection/--down-projection2 requires --activation")
     tokens = args.tokens_per_buffer if args.multi_buffer_gather else args.tokens
     routes = args.routes_per_buffer if args.multi_buffer_gather else args.routes
     if tokens is None:
         tokens = args.tokens
     if routes is None:
         routes = args.routes
+    if getattr(args, "down_projection2", False):
+        down_projection_args(args, routes * (args.num_input_buffers if args.multi_buffer_gather else 1))
     if tokens <= 0 or routes <= 0:
         raise ValueError("tokens-per-buffer and routes-per-buffer must be positive")
     if getattr(args, "indexed_gather", False) and args.multi_buffer_gather:
@@ -553,7 +596,7 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> TableGathe
         )
     W.mul_(1.0 / math.sqrt(args.hidden))
     W_down = None
-    if args.down_projection:
+    if has_down_projection(args):
         W_down = torch.randn(
             (args.experts, args.output_dim, args.hidden), dtype=dtype, device=device
         )
@@ -642,13 +685,13 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> TableGathe
         else up_output
     )
     cu_seqlens_m = None
-    if args.down_projection:
+    if has_down_projection(args):
         cumulative_routes = [0]
         for count in down_counts:
             cumulative_routes.append(cumulative_routes[-1] + count)
         assert cumulative_routes[-1] == total_routes
         cu_seqlens_m = torch.tensor(cumulative_routes, dtype=torch.int32, device=device)
-    return TableGatherInputs(
+    inputs = TableGatherInputs(
         X,
         W,
         A_idx,
@@ -661,6 +704,15 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> TableGathe
         up_output=up_output,
         cu_seqlens_m=cu_seqlens_m,
     )
+
+    if getattr(args, "down_projection2", False):
+        down_args = down_projection_args(args, total_routes)
+        inputs.down_args = down_args
+        inputs.down_inputs = pregather.prepare_grouped_inputs(
+            down_args, up_output, W_down, down_counts
+        )
+        inputs.output = inputs.down_inputs.output
+    return inputs
 
 
 def make_launch(args: argparse.Namespace, inputs: TableGatherInputs):
@@ -686,6 +738,11 @@ def make_launch(args: argparse.Namespace, inputs: TableGatherInputs):
             device_capacity=9,
             use_tma_gather=False,
         )
+
+    down_launch = (
+        pregather.make_launch(inputs.down_args, inputs.down_inputs)
+        if inputs.down_inputs is not None else None
+    )
 
     def launch() -> None:
         if args.activation is not None:
@@ -727,7 +784,12 @@ def make_launch(args: argparse.Namespace, inputs: TableGatherInputs):
                 use_tma_gather=False,
             )
 
-        if args.down_projection:
+        if down_launch is not None:
+            # A reduction must start fresh on every invocation, including graph replay.
+            if inputs.down_args.epilogue_store == "bulk_rows_reduce":
+                inputs.down_inputs.zero_up_output()
+            down_launch()
+        elif args.down_projection:
             assert B_down is not None and inputs.cu_seqlens_m is not None
             # The gather-table output is packed in expert-contiguous order, so
             # the down projection is an ordinary varlen grouped GEMM.
@@ -847,6 +909,11 @@ def check_down_correctness(
     rtol: float,
 ) -> tuple[float, float]:
     """Check the optional down projection against per-expert float32 references."""
+    if inputs.down_inputs is not None:
+        error, allowed, _, _ = pregather.check_correctness(
+            inputs.down_inputs, activation=None, atol=atol, rtol=rtol
+        )
+        return error, allowed
     assert inputs.W_down is not None
     assert inputs.up_output is not None
     assert inputs.cu_seqlens_m is not None
@@ -905,9 +972,13 @@ def main() -> None:
     )
     if inputs.W_down is not None:
         assert inputs.up_output is not None
+        output_shapes = (
+            [tuple(t.shape) for t in inputs.down_inputs.output_buffers()]
+            if inputs.down_inputs is not None else [tuple(inputs.output.shape)]
+        )
         print(
             f"W_down: {tuple(inputs.W_down.shape)}, up output: {tuple(inputs.up_output.shape)}, "
-            f"final output: {tuple(inputs.output.shape)}"
+            f"final output buffers: {output_shapes}"
         )
     else:
         print(f"Output: {tuple(inputs.output.shape)}, down projection: disabled")
@@ -916,7 +987,15 @@ def main() -> None:
         f"Work table: {tuple(inputs.work_table.shape)}, x={inputs.work_group_size}, "
         f"expanded work IDs={inputs.work_table.shape[0] * inputs.work_group_size}"
     )
-    down_description = ", down=expert-contiguous TMA" if args.down_projection else ""
+    if inputs.down_args is not None:
+        down_options = {k: v for k, v in vars(args).items() if k.startswith("down_")}
+        print(f"Down-projection2 options: {down_options}")
+        if inputs.down_args.epilogue_store == "bulk_rows_reduce":
+            print("Pipeline timing includes down-output zeroing before each reduction.")
+    down_description = (
+        ", down=pregather configurable GEMM" if inputs.down_inputs is not None
+        else ", down=expert-contiguous TMA" if args.down_projection else ""
+    )
     print(
         f"Kernel: tile=({args.tile_m}, {args.tile_n}, {args.tile_k or 'auto'}), "
         f"cluster=({args.cluster_m}, 1, 1), static persistent, table gather=cp.async, "
@@ -925,7 +1004,7 @@ def main() -> None:
         f"round-robin-m-clusters={args.round_robin_m_clusters}{down_description}"
     )
     print(f"Fused activation: {args.activation or 'disabled'}")
-    compile_target = "up and down kernels" if args.down_projection else "kernel"
+    compile_target = "up and down kernels" if has_down_projection(args) else "kernel"
     print(f"Compiling and warming up the specialized QuACK {compile_target}...")
 
     launch = make_launch(args, inputs)
@@ -940,13 +1019,14 @@ def main() -> None:
         use_cuda_graph=not args.no_cuda_graph,
     )
     median_ms = statistics.median(timings_ms)
-    total_routes = (args.routes if args.indexed_gather else inputs.output.shape[0])
+    total_routes = (args.routes if args.indexed_gather else inputs.up_output.shape[0])
     up_flops = 2 * total_routes * args.hidden * inputs.W.shape[-1]
     down_flops = (
-        2 * inputs.output.shape[0] * args.output_dim * args.hidden if args.down_projection else 0
+        2 * inputs.up_output.shape[0] * args.output_dim * args.hidden
+        if has_down_projection(args) else 0
     )
     tflops = (up_flops + down_flops) / (median_ms * 1e9)
-    operation_name = "two-GEMM MLP" if args.down_projection else "up GEMM"
+    operation_name = "two-GEMM MLP" if has_down_projection(args) else "up GEMM"
     print(f"Per-operation samples (ms): {[round(value, 4) for value in timings_ms]}")
     print(f"Median {operation_name} time: {median_ms:.4f} ms")
     print(f"Effective throughput: {tflops:.2f} TFLOP/s")
@@ -955,7 +1035,7 @@ def main() -> None:
         max_abs_error, max_allowed_error = check_correctness(
             inputs, activation=args.activation, atol=args.atol, rtol=args.rtol
         )
-        if args.down_projection:
+        if has_down_projection(args):
             down_error, down_allowed = check_down_correctness(
                 inputs, atol=args.atol, rtol=args.rtol
             )

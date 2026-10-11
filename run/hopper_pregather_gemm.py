@@ -187,6 +187,122 @@ class PregatherInputs:
                 buffer.zero_()
 
 
+def add_kernel_arguments(parser: argparse.ArgumentParser, *, prefix: str = "") -> None:
+    """Share plain-GEMM options with composed runners, optionally namespaced."""
+
+    def add_argument(*flags, **kwargs):
+        if "help" in kwargs and prefix:
+            kwargs["help"] = kwargs["help"].replace("--", "--" + prefix)
+            kwargs["help"] = kwargs["help"].replace("--" + prefix + "routes", "--routes")
+            kwargs["help"] = kwargs["help"].replace(
+                "with output zeroing excluded from timing",
+                "with output zeroing included in pipeline timing",
+            )
+        parser.add_argument(*(flag.replace("--", "--" + prefix, 1) for flag in flags), **kwargs)
+
+    add_argument("--tile-m", type=int, default=256)
+    add_argument("--tile-n", type=int, default=256)
+    add_argument(
+        "--tile-k",
+        type=int,
+        default=None,
+        help="Optional K tile; by default QuACK chooses it from the operand dtype",
+    )
+    add_argument("--cluster-m", type=int, default=2)
+    add_argument("--max-swizzle-size", type=int, default=8)
+    add_argument("--pingpong", action="store_true")
+    add_argument(
+        "--gather-table",
+        action="store_true",
+        help="Use table-scheduled cp.async gather on pre-gathered A with identity indices",
+    )
+    add_argument(
+        "--gather-table-n-group-major",
+        action="store_true",
+        help="Traverse all experts per N group in serpentine order (requires --gather-table)",
+    )
+    add_argument(
+        "--gather-table-expert-waves",
+        action="store_true",
+        help=(
+            "Use global serpentine order with single-expert logical waves, borrowing "
+            "later N groups until expert exhaustion (requires --gather-table; "
+            "takes precedence over --gather-table-n-group-major)"
+        ),
+    )
+    add_argument(
+        "--gather-table-wave-barrier",
+        action="store_true",
+        help="Order bulk output stores across expert waves (requires "
+        "--gather-table-expert-waves, --pingpong, and a bulk-row epilogue; "
+        "uses a cooperative CUDA launch)",
+    )
+    add_argument(
+        "--scatter-table",
+        action="store_true",
+        help=(
+            "Scatter routed output rows using a random permutation (requires "
+            "--epilogue-store bulk_rows or bulk_rows_reduce; works with either scheduler)"
+        ),
+    )
+    add_argument(
+        "--n-tile-major-output",
+        action="store_true",
+        help="Store each output buffer as [ceil(N/tile_n), rows_in_buffer*tile_n]",
+    )
+    add_argument(
+        "--multi-buffer-scatter",
+        action="store_true",
+        help="Scatter directly to separately allocated output buffers (requires --scatter-table)",
+    )
+    add_argument(
+        "--scatter-output-buffers",
+        type=int,
+        default=2,
+        help="Number of output buffers for --multi-buffer-scatter (default: 2)",
+    )
+    add_argument(
+        "--scatter-output-rows", type=int, nargs="+", metavar="ROWS",
+        help="Used rows per N-tile-major buffer; one count broadcasts, otherwise one per buffer. "
+        "Counts must sum to --routes (default: balanced split).",
+    )
+    add_argument(
+        "--scatter-output-capacity-rows", type=int, nargs="+", metavar="ROWS",
+        help="Allocated row capacity per N-tile-major buffer; one count broadcasts. "
+        "Must cover used rows (default: used rows).",
+    )
+    add_argument(
+        "--scatter-table-with-replacement",
+        action="store_true",
+        help=(
+            "Sample scatter destinations with replacement, allowing duplicate and unused rows "
+            "(requires --scatter-table and --epilogue-store bulk_rows_reduce)"
+        ),
+    )
+    add_argument(
+        "--scatter-table-destination-rows",
+        type=int,
+        default=None,
+        metavar="R1",
+        help=(
+            "Sample scatter destinations from [0, R1), with 1 <= R1 <= routes "
+            "(default: routes; requires --scatter-table-with-replacement). "
+            "Output retains routes rows; rows R1: remain zero."
+        ),
+    )
+    add_argument(
+        "--epilogue-store",
+        choices=("tma", "bulk_rows", "bulk_rows_reduce"),
+        default="tma",
+        help=(
+            "Output I/O: tma uses the existing subtile tensor stores; bulk_rows stages "
+            "the full tile in SMEM and issues one linear cp.async.bulk per valid row "
+            "(plain GEMM only; supports --pingpong). bulk_rows_reduce uses per-row "
+            "reduce-add instead, with output zeroing excluded from timing."
+        ),
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Benchmark QuACK's SM90 grouped GEMM after pre-gathering routed tokens."
@@ -220,107 +336,7 @@ def parse_args() -> argparse.Namespace:
         help="Run a grouped down projection after the fused activation (requires --activation)",
     )
 
-    parser.add_argument("--tile-m", type=int, default=256)
-    parser.add_argument("--tile-n", type=int, default=256)
-    parser.add_argument(
-        "--tile-k",
-        type=int,
-        default=None,
-        help="Optional K tile; by default QuACK chooses it from the operand dtype",
-    )
-    parser.add_argument("--cluster-m", type=int, default=2)
-    parser.add_argument("--max-swizzle-size", type=int, default=8)
-    parser.add_argument("--pingpong", action="store_true")
-    parser.add_argument(
-        "--gather-table",
-        action="store_true",
-        help="Use table-scheduled cp.async gather on pre-gathered A with identity indices",
-    )
-    parser.add_argument(
-        "--gather-table-n-group-major",
-        action="store_true",
-        help="Traverse all experts per N group in serpentine order (requires --gather-table)",
-    )
-    parser.add_argument(
-        "--gather-table-expert-waves",
-        action="store_true",
-        help=(
-            "Use global serpentine order with single-expert logical waves, borrowing "
-            "later N groups until expert exhaustion (requires --gather-table; "
-            "takes precedence over --gather-table-n-group-major)"
-        ),
-    )
-    parser.add_argument(
-        "--gather-table-wave-barrier",
-        action="store_true",
-        help="Order bulk output stores across expert waves (requires "
-        "--gather-table-expert-waves, --pingpong, and a bulk-row epilogue; "
-        "uses a cooperative CUDA launch)",
-    )
-    parser.add_argument(
-        "--scatter-table",
-        action="store_true",
-        help=(
-            "Scatter routed output rows using a random permutation (requires "
-            "--epilogue-store bulk_rows or bulk_rows_reduce; works with either scheduler)"
-        ),
-    )
-    parser.add_argument(
-        "--n-tile-major-output",
-        action="store_true",
-        help="Store each output buffer as [ceil(N/tile_n), rows_in_buffer*tile_n]",
-    )
-    parser.add_argument(
-        "--multi-buffer-scatter",
-        action="store_true",
-        help="Scatter directly to separately allocated output buffers (requires --scatter-table)",
-    )
-    parser.add_argument(
-        "--scatter-output-buffers",
-        type=int,
-        default=2,
-        help="Number of output buffers for --multi-buffer-scatter (default: 2)",
-    )
-    parser.add_argument(
-        "--scatter-output-rows", type=int, nargs="+", metavar="ROWS",
-        help="Used rows per N-tile-major buffer; one count broadcasts, otherwise one per buffer. "
-        "Counts must sum to --routes (default: balanced split).",
-    )
-    parser.add_argument(
-        "--scatter-output-capacity-rows", type=int, nargs="+", metavar="ROWS",
-        help="Allocated row capacity per N-tile-major buffer; one count broadcasts. "
-        "Must cover used rows (default: used rows).",
-    )
-    parser.add_argument(
-        "--scatter-table-with-replacement",
-        action="store_true",
-        help=(
-            "Sample scatter destinations with replacement, allowing duplicate and unused rows "
-            "(requires --scatter-table and --epilogue-store bulk_rows_reduce)"
-        ),
-    )
-    parser.add_argument(
-        "--scatter-table-destination-rows",
-        type=int,
-        default=None,
-        metavar="R1",
-        help=(
-            "Sample scatter destinations from [0, R1), with 1 <= R1 <= routes "
-            "(default: routes; requires --scatter-table-with-replacement). "
-            "Output retains routes rows; rows R1: remain zero."
-        ),
-    )
-    parser.add_argument(
-        "--epilogue-store",
-        choices=("tma", "bulk_rows", "bulk_rows_reduce"),
-        default="tma",
-        help=(
-            "Output I/O: tma uses the existing subtile tensor stores; bulk_rows stages "
-            "the full tile in SMEM and issues one linear cp.async.bulk per valid row "
-            "(plain GEMM only; supports --pingpong). bulk_rows_reduce uses per-row "
-            "reduce-add instead, with output zeroing excluded from timing."
-        ),
-    )
+    add_kernel_arguments(parser)
 
     parser.add_argument(
         "--routing-with-replacement",
@@ -368,7 +384,7 @@ def scatter_output_sizes(args: argparse.Namespace) -> tuple[list[int], list[int]
     return used, capacity
 
 
-def validate_args(args: argparse.Namespace) -> None:
+def validate_args(args: argparse.Namespace, *, prepacked: bool = False) -> None:
     named_positive = {
         "tokens": args.tokens,
         "hidden": args.hidden,
@@ -447,6 +463,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             f"--epilogue-store {args.epilogue_store} requires --activation to be omitted"
         )
+    if prepacked:
+        return
     if args.routes % args.experts != 0:
         raise ValueError(f"routes ({args.routes}) must be divisible by experts ({args.experts})")
     routes_per_expert = args.routes // args.experts
@@ -462,24 +480,6 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> PregatherI
     """Create routing inputs and materialize the expert-major A tensor on CUDA."""
     dtype = DTYPES[args.dtype]
     routes_per_expert = args.routes // args.experts
-    wave_work_ids = None
-    if args.gather_table_expert_waves:
-        gemm_output_dim = args.output_dim * (2 if args.activation in GATED_ACTIVATIONS else 1)
-        clusters_n = math.ceil(gemm_output_dim / args.tile_n)
-        x = min(args.max_swizzle_size, clusters_n)
-        num_work = (
-            args.experts
-            * math.ceil(routes_per_expert / (args.tile_m * args.cluster_m))
-            * clusters_n
-        )
-        # Match GatherTableTileScheduler.get_grid_shape and GEMM's capacity query.
-        wave_work_ids = min(get_max_active_clusters(args.cluster_m), num_work)
-        if wave_work_ids <= 0 or wave_work_ids % x:
-            raise ValueError(
-                "--gather-table-expert-waves requires wave_work_ids % "
-                "effective_swizzle_size == 0, "
-                f"got {wave_work_ids} % {x}; choose a compatible --max-swizzle-size"
-            )
     X = torch.randn((args.tokens, args.hidden), dtype=dtype, device=device)
     gated = args.activation in GATED_ACTIVATIONS
     gemm_output_dim = args.output_dim * (2 if gated else 1)
@@ -503,9 +503,6 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> PregatherI
         )
         W_down.mul_(1.0 / math.sqrt(args.output_dim))
 
-    cu_seqlens_m = torch.arange(args.experts + 1, dtype=torch.int32, device=device)
-    cu_seqlens_m.mul_(routes_per_expert)
-
     if args.routing_with_replacement:
         A_idx = torch.randint(
             args.tokens,
@@ -526,6 +523,49 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> PregatherI
     # route order. It runs before all GEMM warmup and timing regions.
     A = X[A_idx]
     assert A.is_contiguous()
+    inputs = prepare_grouped_inputs(args, A, W_up, [routes_per_expert] * args.experts, W_down)
+    inputs.X, inputs.A_idx = X, A_idx
+    return inputs
+
+
+@torch.inference_mode()
+def prepare_grouped_inputs(
+    args: argparse.Namespace,
+    A: torch.Tensor,
+    W_up: torch.Tensor,
+    counts: list[int],
+    W_down: torch.Tensor | None = None,
+) -> PregatherInputs:
+    """Prepare output and scheduling metadata around an existing expert-major input."""
+    if len(counts) != args.experts or sum(counts) != A.shape[0] or any(c < 0 for c in counts):
+        raise ValueError("expert counts must partition the input rows")
+    if A.shape != (args.routes, args.hidden) or W_up.shape != (
+        args.experts, args.hidden,
+        args.output_dim * (2 if args.activation in GATED_ACTIVATIONS else 1),
+    ):
+        raise ValueError("grouped operands do not match the configured GEMM dimensions")
+    device, dtype = A.device, A.dtype
+    gemm_output_dim = W_up.shape[-1]
+    cu_seqlens_m = torch.tensor([0, *counts], dtype=torch.int32, device=device).cumsum(
+        0, dtype=torch.int32
+    )
+    wave_work_ids = None
+    if args.gather_table_expert_waves:
+        gemm_output_dim = args.output_dim * (2 if args.activation in GATED_ACTIVATIONS else 1)
+        clusters_n = math.ceil(gemm_output_dim / args.tile_n)
+        x = min(args.max_swizzle_size, clusters_n)
+        num_work = (
+            sum(math.ceil(count / (args.tile_m * args.cluster_m)) for count in counts)
+            * clusters_n
+        )
+        # Match GatherTableTileScheduler.get_grid_shape and GEMM's capacity query.
+        wave_work_ids = min(get_max_active_clusters(args.cluster_m), num_work)
+        if wave_work_ids <= 0 or wave_work_ids % x:
+            raise ValueError(
+                "--gather-table-expert-waves requires wave_work_ids % "
+                "effective_swizzle_size == 0, "
+                f"got {wave_work_ids} % {x}; choose a compatible --max-swizzle-size"
+            )
     gather_work_table = None
     identity_A_idx = None
     if args.gather_table:
@@ -536,7 +576,7 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> PregatherI
             from hopper_gather_table_gemm import build_work_table
 
         gather_work_table, _, _ = build_work_table(
-            [routes_per_expert] * args.experts,
+            counts,
             output_dim=gemm_output_dim,
             tile_m=args.tile_m,
             tile_n=args.tile_n,
@@ -609,10 +649,10 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> PregatherI
         scatter_mapping=scatter_mapping,
         scatter_row_addresses=scatter_row_addresses,
         scatter_with_replacement=args.scatter_table_with_replacement,
-        X=X,
+        X=A,
         W_up=W_up,
         W_down=W_down,
-        A_idx=A_idx,
+        A_idx=torch.arange(args.routes, dtype=torch.int32, device=device),
         cu_seqlens_m=cu_seqlens_m,
         A=A,
         up_output=up_output,
@@ -879,15 +919,14 @@ def check_correctness(
         assert activation is None and inputs.W_down is None
         return check_scatter_reduction(inputs, atol=atol, rtol=rtol)
     up_output = inputs.collected_up_output()
-    num_experts = inputs.W_up.shape[0]
-    routes_per_expert = inputs.A.shape[0] // num_experts
+    offsets = inputs.cu_seqlens_m.tolist()
     max_up_error = 0.0
     max_up_allowed = 0.0
     max_down_error = 0.0 if inputs.W_down is not None else None
     max_down_allowed = 0.0 if inputs.W_down is not None else None
-    for expert in range(num_experts):
-        start = expert * routes_per_expert
-        end = start + routes_per_expert
+    for expert, (start, end) in enumerate(zip(offsets, offsets[1:])):
+        if start == end:
+            continue
         A_expert = inputs.A[start:end]
         W_up_expert = inputs.W_up[expert]
         up_reference = A_expert.float() @ W_up_expert.float()

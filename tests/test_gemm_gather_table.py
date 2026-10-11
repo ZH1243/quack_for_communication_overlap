@@ -372,3 +372,80 @@ def test_stream_indexed_gather_proxy(proxy_mode, routes, extra_args):
     # the SwiGLU case additionally verifies the packed grouped down projection.
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Reference check: PASSED" in result.stdout
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize(
+    "mode,multi_input,indexed",
+    [("tma", False, False), ("waves", False, True),
+     ("multi_scatter", True, False), ("reduce", False, False)],
+)
+def test_gather_table_down_projection2(mode, multi_input, indexed):
+    """Compose activated gather with configurable down GEMM, including graph replay."""
+    from run.hopper_gather_table_gemm import (
+        check_correctness,
+        check_down_correctness,
+        make_arg_parser,
+        make_launch,
+        prepare_inputs,
+        validate_args,
+    )
+
+    flags = [
+        "--down-projection2", "--activation", "swiglu",
+        "--tokens", "97", "--routes", "421", "--experts", "3",
+        "--hidden", "80", "--output-dim", "256",
+        "--tile-m", "64", "--tile-n", "128", "--max-swizzle-size", "1",
+        "--routing-with-replacement",
+        "--down-tile-m", "64", "--down-tile-n", "64", "--down-cluster-m", "1",
+        "--down-max-swizzle-size", "1",
+    ]
+    if mode == "waves":
+        # Enough tiles for multiple persistent waves on Hopper.
+        flags += ["--routes", "12613"]
+    if mode != "tma":
+        flags += [
+            "--down-gather-table", "--down-gather-table-expert-waves",
+            "--down-gather-table-wave-barrier", "--down-pingpong",
+            "--down-scatter-table", "--down-n-tile-major-output",
+            "--down-epilogue-store", "bulk_rows_reduce" if mode == "reduce" else "bulk_rows",
+        ]
+    if mode == "multi_scatter":
+        flags += [
+            "--down-multi-buffer-scatter", "--down-scatter-output-buffers", "3",
+            "--down-scatter-output-rows", "100", "250", "492",
+            "--down-scatter-output-capacity-rows", "160", "300", "512",
+        ]
+    if mode == "reduce":
+        flags += ["--down-scatter-table-with-replacement",
+                  "--down-scatter-table-destination-rows", "211"]
+    if multi_input:
+        flags += ["--multi-buffer-gather", "--num-input-buffers", "2"]
+    args = make_arg_parser(
+        include_down_projection=True, include_down_projection2=True
+    ).parse_args(flags)
+    args.indexed_gather = indexed
+    validate_args(args)
+    torch.manual_seed(42)
+    inputs = prepare_inputs(args, torch.device("cuda"))
+    launch = make_launch(args, inputs)
+    for _ in range(2):
+        launch()
+    torch.cuda.synchronize()
+    check_correctness(inputs, activation=args.activation, atol=args.atol, rtol=args.rtol)
+    check_down_correctness(inputs, atol=args.atol, rtol=args.rtol)
+
+    # Changing the source between replays catches stale intermediates. Two launches
+    # in one graph also catch missing per-invocation resets for reduction stores.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+        launch()
+    buffers = inputs.X if isinstance(inputs.X, tuple) else (inputs.X,)
+    for scale in (0.5, -0.75):
+        for buffer in buffers:
+            buffer.mul_(scale)
+        graph.replay()
+        torch.cuda.synchronize()
+        check_correctness(inputs, activation=args.activation, atol=args.atol, rtol=args.rtol)
+        check_down_correctness(inputs, atol=args.atol, rtol=args.rtol)
