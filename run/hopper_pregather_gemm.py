@@ -535,6 +535,9 @@ def prepare_grouped_inputs(
     W_up: torch.Tensor,
     counts: list[int],
     W_down: torch.Tensor | None = None,
+    *,
+    output_buffers: tuple[torch.Tensor, ...] | None = None,
+    scatter_mapping: torch.Tensor | None = None,
 ) -> PregatherInputs:
     """Prepare output and scheduling metadata around an existing expert-major input."""
     if len(counts) != args.experts or sum(counts) != A.shape[0] or any(c < 0 for c in counts):
@@ -588,7 +591,15 @@ def prepare_grouped_inputs(
         )
         # Preserve the original routing indices separately from the kernel indices.
         identity_A_idx = torch.arange(args.routes, dtype=torch.int32, device=A.device)
-    if args.multi_buffer_scatter:
+    if output_buffers is not None:
+        if not args.multi_buffer_scatter or scatter_mapping is None or args.down_projection:
+            raise ValueError("external outputs require mapped multi-buffer plain GEMM")
+        sizes = [
+            b.shape[1] // args.tile_n if args.n_tile_major_output else b.shape[0]
+            for b in output_buffers
+        ]
+        up_output = output_buffers
+    elif args.multi_buffer_scatter:
         # Split logical destination space evenly; no monolithic output allocation.
         sizes, capacities = scatter_output_sizes(args)
         up_output = tuple(
@@ -615,7 +626,7 @@ def prepare_grouped_inputs(
         else up_output
     )
     scatter_table = None
-    if args.scatter_table:
+    if args.scatter_table and output_buffers is None:
         scatter_table = (
             torch.randint(
                 args.scatter_table_destination_rows
@@ -628,13 +639,16 @@ def prepare_grouped_inputs(
             if args.scatter_table_with_replacement
             else torch.randperm(args.routes, dtype=torch.int32, device=device)
         )
-    scatter_mapping = None
     scatter_row_addresses = None
     if args.multi_buffer_scatter:
         offsets = torch.tensor([0, *sizes], device=device, dtype=torch.int64).cumsum(0)
-        destinations = scatter_table.long()
-        buffer_ids = torch.bucketize(destinations, offsets[1:], right=True)
-        scatter_mapping = torch.stack((buffer_ids, destinations - offsets[buffer_ids]), dim=1)
+        if scatter_mapping is None:
+            destinations = scatter_table.long()
+            buffer_ids = torch.bucketize(destinations, offsets[1:], right=True)
+            scatter_mapping = torch.stack((buffer_ids, destinations - offsets[buffer_ids]), dim=1)
+        else:
+            # Flatten token destinations only for the numerical reference.
+            scatter_table = offsets[scatter_mapping[:, 0].long()] + scatter_mapping[:, 1]
         scatter_row_addresses = build_scatter_row_addresses(
             up_output,
             scatter_mapping,

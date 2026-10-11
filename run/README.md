@@ -410,3 +410,41 @@ Hopper numerical regression coverage (including repeated CUDA graph replay):
 ```bash
 pytest tests/test_gemm_gather_table.py -k down_projection2 -x
 ```
+
+### In-place original-token local combine
+
+Add `--down-combine-in-place` to a `--multi-buffer-gather --down-projection2`
+run to write results back into the **original input allocations**. The mode
+selects multi-buffer scatter and `bulk_rows_reduce` automatically; its mapping
+comes from original buffer IDs and token indices in packed intermediate order,
+including balanced gathering and round-robin scheduling. Repeated routes sum
+at the original token destination. Tokens without local routes become zero.
+This is an **unweighted** local combine (routing probabilities are not applied).
+
+For example, retain your up-projection arguments and add:
+
+```bash
+--down-projection2 --down-combine-in-place \
+--down-tile-m 128 --down-tile-n 128 --down-pingpong \
+--down-n-tile-major-output \
+--down-gather-table --down-gather-table-expert-waves \
+--down-max-swizzle-size 1 --down-gather-table-wave-barrier
+```
+
+Output buffer count and token-row counts come from the inputs. Do not supply
+random-destination or output-row/capacity options. The mode overrides the
+ordinary down scatter-buffer count and epilogue-store selections.
+N-tile-major output reinterprets the same memory: downstream consumers must
+use that layout. It requires `hidden % down_tile_n == 0` to avoid padding beyond
+the original allocation. Without that flag, outputs retain row-major layout.
+
+Each invocation restores a saved copy of the original inputs, runs the up
+projection, zeros the destination allocations, then runs down projection and
+reduction on the same stream. **Reported pipeline timing includes restoration
+and zeroing**, including on CUDA graph replay. Saved copies also preserve the
+original inputs for reference checking; they require additional GPU memory.
+The final contents of the input allocations are the combined outputs.
+
+```bash
+pytest tests/test_gemm_gather_table.py -k down_combine_in_place_original_tokens -x
+```

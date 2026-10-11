@@ -107,6 +107,7 @@ class TableGatherInputs:
     cu_seqlens_m: torch.Tensor | None = None
     down_inputs: pregather.PregatherInputs | None = None
     down_args: argparse.Namespace | None = None
+    original_X: tuple[torch.Tensor, ...] | None = None
 
 
 def make_arg_parser(
@@ -178,6 +179,12 @@ def make_arg_parser(
                 help="Use the pregather plain-GEMM features for down projection (requires --activation)",
             )
             pregather.add_kernel_arguments(parser, prefix="down-")
+            parser.add_argument(
+                "--down-combine-in-place", action="store_true",
+                help="Reduce routed down outputs into the original input allocations; "
+                "requires multi-buffer-gather and down-projection2. Enables multi-buffer "
+                "scatter and bulk_rows_reduce; benchmark restores inputs every invocation.",
+            )
     parser.add_argument("--tile-m", type=int, default=256)
     parser.add_argument("--tile-n", type=int, default=256)
     parser.add_argument("--tile-k", type=int, default=None)
@@ -220,6 +227,12 @@ def down_projection_args(args: argparse.Namespace, routes: int) -> argparse.Name
         hidden=args.output_dim, output_dim=args.hidden, routes=routes,
         activation=None, down_projection=False,
     )
+    if getattr(args, "down_combine_in_place", False):
+        values.update(
+            scatter_table=True, multi_buffer_scatter=True,
+            scatter_table_with_replacement=True, epilogue_store="bulk_rows_reduce",
+            scatter_output_buffers=args.num_input_buffers,
+        )
     down = argparse.Namespace(**values)
     try:
         pregather.validate_args(down, prepacked=True)
@@ -273,6 +286,20 @@ def validate_args(args: argparse.Namespace) -> None:
                 f"pingpong with tile-m={args.tile_m} requires tile-n divisible by 16 "
                 f"and no larger than {tile_n_max}"
             )
+    if getattr(args, "down_combine_in_place", False):
+        if not getattr(args, "down_projection2", False) or not args.multi_buffer_gather:
+            raise ValueError("--down-combine-in-place requires --down-projection2 and --multi-buffer-gather")
+        if (args.down_scatter_table_with_replacement
+                or args.down_scatter_table_destination_rows is not None
+                or args.down_scatter_output_rows is not None
+                or args.down_scatter_output_capacity_rows is not None):
+            raise ValueError("in-place combine derives destinations and buffer sizes from input routing; "
+                             "omit random-destination and output-row options")
+        if args.down_tile_n <= 0:
+            raise ValueError("down-tile-n must be positive")
+        if args.down_n_tile_major_output and args.hidden % args.down_tile_n:
+            raise ValueError("in-place N-tile-major output requires hidden divisible by down-tile-n "
+                             "so padding does not exceed the original allocation")
     if getattr(args, "down_projection2", False) and getattr(args, "down_projection", False):
         raise ValueError("--down-projection and --down-projection2 are mutually exclusive")
     if has_down_projection(args) and getattr(args, "activation", None) is None:
@@ -708,11 +735,40 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> TableGathe
     if getattr(args, "down_projection2", False):
         down_args = down_projection_args(args, total_routes)
         inputs.down_args = down_args
+        output_buffers = None
+        scatter_mapping = None
+        if getattr(args, "down_combine_in_place", False):
+            inputs.original_X = tuple(buffer.clone() for buffer in X)
+            output_buffers = tuple(
+                buffer.view(args.hidden // down_args.tile_n, -1)
+                if down_args.n_tile_major_output else buffer
+                for buffer in X
+            )
+            scatter_mapping = build_original_token_mapping(inputs)
         inputs.down_inputs = pregather.prepare_grouped_inputs(
-            down_args, up_output, W_down, down_counts
+            down_args, up_output, W_down, down_counts,
+            output_buffers=output_buffers, scatter_mapping=scatter_mapping,
         )
         inputs.output = inputs.down_inputs.output
     return inputs
+
+
+def build_original_token_mapping(inputs: TableGatherInputs) -> torch.Tensor:
+    """Map packed intermediate rows back to (input buffer, original token)."""
+    if not isinstance(inputs.A_idx, tuple):
+        raise ValueError("original-token combine requires multi-buffer routing")
+    mapping = torch.empty(
+        (inputs.up_output.shape[0], 2), dtype=torch.int64, device=inputs.up_output.device
+    )
+    offset = 0
+    for _, buffer_id, start, end in inputs.output_segments:
+        count = end - start
+        mapping[offset:offset + count, 0] = buffer_id
+        mapping[offset:offset + count, 1] = inputs.A_idx[buffer_id][start:end]
+        offset += count
+    if offset != mapping.shape[0]:
+        raise ValueError("output segments do not cover all intermediate routes")
+    return mapping
 
 
 def make_launch(args: argparse.Namespace, inputs: TableGatherInputs):
@@ -745,6 +801,10 @@ def make_launch(args: argparse.Namespace, inputs: TableGatherInputs):
     )
 
     def launch() -> None:
+        if inputs.original_X is not None:
+            # Benchmark each invocation on identical inputs, including graph replay.
+            for buffer, original in zip(inputs.X, inputs.original_X):
+                buffer.copy_(original)
         if args.activation is not None:
             gemm_act(
                 inputs.X,
@@ -854,7 +914,7 @@ def check_correctness(
 ) -> tuple[float, float]:
     max_abs_error = 0.0
     max_allowed_error = 0.0
-    X_buffers = inputs.X if isinstance(inputs.X, tuple) else (inputs.X,)
+    X_buffers = inputs.original_X or (inputs.X if isinstance(inputs.X, tuple) else (inputs.X,))
     idx_buffers = inputs.A_idx if isinstance(inputs.A_idx, tuple) else (inputs.A_idx,)
     up_output = inputs.up_output if inputs.up_output is not None else inputs.output
     output_offset = 0
@@ -990,6 +1050,9 @@ def main() -> None:
     if inputs.down_args is not None:
         down_options = {k: v for k, v in vars(args).items() if k.startswith("down_")}
         print(f"Down-projection2 options: {down_options}")
+        if inputs.original_X is not None:
+            print("In-place local combine: original-token destinations, unweighted sum; "
+                  "pipeline timing includes input restoration and output zeroing.")
         if inputs.down_args.epilogue_store == "bulk_rows_reduce":
             print("Pipeline timing includes down-output zeroing before each reduction.")
     down_description = (

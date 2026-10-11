@@ -488,3 +488,81 @@ def test_gather_table_swiglu_without_primary_epilogue_storage(num_buffers):
     # The runner uses store_preact=False and C=None. Its reference compares
     # the activated output to fp32 SwiGLU and a same-dtype rounding baseline.
     check_correctness(inputs, activation="swiglu", atol=args.atol, rtol=args.rtol)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("tiled", [False, True])
+def test_down_combine_in_place_original_tokens(tiled):
+    """In-place local combine matches original per-buffer routing across replays."""
+    from run.hopper_gather_table_gemm import (
+        check_correctness, check_down_correctness, make_arg_parser,
+        make_launch, prepare_inputs, validate_args,
+    )
+
+    flags = [
+        "--multi-buffer-gather", "--balanced-multi-buffer-gather",
+        "--round-robin-m-clusters", "--num-input-buffers", "3",
+        "--tokens-per-buffer", "32", "--routes-per-buffer", "17",
+        "--experts", "3", "--hidden", "128", "--output-dim", "128",
+        "--tile-m", "64", "--tile-n", "128", "--pingpong",
+        "--activation", "swiglu", "--routing-with-replacement",
+        "--down-projection2", "--down-combine-in-place",
+        "--down-tile-m", "64", "--down-tile-n", "64", "--down-pingpong",
+        "--down-gather-table", "--down-gather-table-expert-waves",
+        "--down-max-swizzle-size", "1", "--down-gather-table-wave-barrier",
+    ]
+    if tiled:
+        flags += ["--down-n-tile-major-output"]
+    args = make_arg_parser(
+        include_down_projection=True, include_down_projection2=True
+    ).parse_args(flags)
+    validate_args(args)
+    torch.manual_seed(42)
+    inputs = prepare_inputs(args, torch.device("cuda"))
+    originals = tuple(x.clone() for x in inputs.X)
+    assert all(x.data_ptr() == y.data_ptr()
+               for x, y in zip(inputs.X, inputs.down_inputs.output_buffers()))
+
+    # Independent reference: iterate original buffer/expert routing, without
+    # using output_segments, the scatter table, or the packed intermediate.
+    references = []
+    used = []
+    for b, source in enumerate(originals):
+        reference = torch.zeros_like(source, dtype=torch.float32)
+        counts = torch.zeros(source.shape[0], dtype=torch.int32, device=source.device)
+        offsets = inputs.route_offsets[b]
+        for e, (start, end) in enumerate(zip(offsets, offsets[1:])):
+            indices = inputs.A_idx[b][start:end].long()
+            preact = source[indices].float() @ inputs.W[e].float()
+            gate, up = preact.chunk(2, dim=-1)
+            activated = (torch.nn.functional.silu(gate) * up).to(source.dtype)
+            values = activated.float() @ inputs.W_down[e].float()
+            reference.index_add_(0, indices, values)
+            counts.index_add_(0, indices, torch.ones_like(indices, dtype=torch.int32))
+        references.append(reference)
+        used.append(counts > 0)
+    reference = torch.cat(references)
+    used = torch.cat(used)
+    assert (~used).any()  # Include tokens with no local expert contribution.
+
+    launch = make_launch(args, inputs)
+
+    def verify():
+        actual = inputs.down_inputs.collected_up_output()
+        torch.testing.assert_close(actual.float(), reference, atol=6e-2, rtol=2e-2)
+        torch.testing.assert_close(actual[~used], torch.zeros_like(actual[~used]), atol=0, rtol=0)
+        check_correctness(inputs, activation="swiglu", atol=args.atol, rtol=args.rtol)
+        check_down_correctness(inputs, atol=args.atol, rtol=args.rtol)
+
+    for _ in range(2):
+        launch()
+        torch.cuda.synchronize()
+        verify()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+        launch()
+    for _ in range(2):
+        graph.replay()
+        torch.cuda.synchronize()
+        verify()
