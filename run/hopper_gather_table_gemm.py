@@ -800,6 +800,10 @@ def make_launch(args: argparse.Namespace, inputs: TableGatherInputs):
         if inputs.down_inputs is not None else None
     )
 
+    # prepare_inputs creates inference tensors. Restores, reduction resets, and
+    # kernel-side counter resets must be valid even when the caller is not in
+    # inference mode (the CLI and CUDA graph capture both use this closure).
+    @torch.inference_mode()
     def launch() -> None:
         if inputs.original_X is not None:
             # Benchmark each invocation on identical inputs, including graph replay.

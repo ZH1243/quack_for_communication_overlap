@@ -490,10 +490,9 @@ def test_gather_table_swiglu_without_primary_epilogue_storage(num_buffers):
     check_correctness(inputs, activation="swiglu", atol=args.atol, rtol=args.rtol)
 
 
-@torch.inference_mode()
 @pytest.mark.parametrize("tiled", [False, True])
 def test_down_combine_in_place_original_tokens(tiled):
-    """In-place local combine matches original per-buffer routing across replays."""
+    """Combine inference tensors from a normal caller, including graph capture."""
     from run.hopper_gather_table_gemm import (
         check_correctness, check_down_correctness, make_arg_parser,
         make_launch, prepare_inputs, validate_args,
@@ -546,6 +545,8 @@ def test_down_combine_in_place_original_tokens(tiled):
     assert (~used).any()  # Include tokens with no local expert contribution.
 
     launch = make_launch(args, inputs)
+    assert not torch.is_inference_mode_enabled()
+    assert all(torch.is_inference(x) for x in inputs.X)
 
     def verify():
         actual = inputs.down_inputs.collected_up_output()
