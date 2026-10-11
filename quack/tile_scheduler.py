@@ -253,6 +253,8 @@ class TileSchedulerOptions(NamedTuple):
     # Optional monotonically increasing count of gather-table rows resident in
     # HBM. The scheduler warp waits for row ``i`` until ``ready[0] >= i + 1``.
     gather_table_ready: Optional[cute.Tensor] = None
+    # Completed CTA tiles; enables cooperative wave-ordered bulk epilogues.
+    wave_store_counter: Optional[cute.Tensor] = None
     # Opt-in multi-buffer gather operands. The first X/A_idx pair continues to
     # travel through the ordinary GEMM/VarlenArguments slots; these tuples hold
     # buffers 1..b-1. Keeping them in one nested JIT argument makes b a static
@@ -1118,6 +1120,7 @@ class GatherTableTileSchedulerArguments:
     persistence_mode: cutlass.Constexpr[PersistenceMode] = PersistenceMode.STATIC
     multi_buffer_gather: Optional[MultiBufferGatherArguments] = None
     ready_rows: Optional[cute.Tensor] = None
+    wave_store_counter: Optional[cute.Tensor] = None
 
 
 class GatherTableTileScheduler(TileScheduler):
@@ -1149,6 +1152,7 @@ class GatherTableTileScheduler(TileScheduler):
         ready_rows: Optional[cute.Tensor] = None
         num_split_k: cutlass.Constexpr[int] = 1
         ag: Optional[AgParams] = None
+        wave_store_counter: Optional[cute.Tensor] = None
 
         @staticmethod
         @cute.jit
@@ -1170,6 +1174,7 @@ class GatherTableTileScheduler(TileScheduler):
                 args.persistence_mode,
                 args.multi_buffer_gather,
                 args.ready_rows,
+                wave_store_counter=args.wave_store_counter,
             )
 
     @staticmethod

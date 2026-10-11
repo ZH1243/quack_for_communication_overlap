@@ -834,6 +834,7 @@ class GemmBase:
                 persistence_mode=persistence_mode,
                 multi_buffer_gather=scheduler_args.multi_buffer_gather,
                 ready_rows=scheduler_args.gather_table_ready,
+                wave_store_counter=scheduler_args.wave_store_counter,
             )
         elif const_expr(varlen_args.mCuSeqlensM is None):
             num_problems = (

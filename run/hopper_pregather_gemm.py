@@ -26,7 +26,12 @@ reversing both expert and M-cluster order on alternate N groups.
 Add ``--gather-table-expert-waves`` instead to fill logical persistent work
 waves with one expert, borrowing from its later N groups when necessary.
 Only exhausted experts may share a wave with the next expert. Wave boundaries
-are not GPU-wide synchronization points. The persistent cluster count must be
+are not GPU-wide synchronization points unless --gather-table-wave-barrier is enabled.
+This opt-in requires --pingpong and bulk_rows/bulk_rows_reduce. Each CTA drains
+its tile stores completely before reporting completion; the next wave waits
+for every preceding-wave CTA before entering its epilogue. The kernel uses a
+cooperative launch (an oversized grid is rejected by CUDA). The per-call counter
+reset is included in timing and CUDA Graph capture. The persistent cluster count must be
 divisible by the effective swizzle size.
 When ``--down-projection`` is enabled, the activated output is already
 expert-contiguous and feeds a second grouped GEMM using the same cu_seqlens_m.
@@ -246,6 +251,13 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--gather-table-wave-barrier",
+        action="store_true",
+        help="Order bulk output stores across expert waves (requires "
+        "--gather-table-expert-waves, --pingpong, and a bulk-row epilogue; "
+        "uses a cooperative CUDA launch)",
+    )
+    parser.add_argument(
         "--scatter-table",
         action="store_true",
         help=(
@@ -408,6 +420,15 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--scatter-table requires --epilogue-store bulk_rows or bulk_rows_reduce")
     if args.gather_table_n_group_major and not args.gather_table:
         raise ValueError("--gather-table-n-group-major requires --gather-table")
+    if args.gather_table_wave_barrier and (
+        not args.gather_table_expert_waves
+        or not args.pingpong
+        or args.epilogue_store not in ("bulk_rows", "bulk_rows_reduce")
+    ):
+        raise ValueError(
+            "--gather-table-wave-barrier requires --gather-table-expert-waves, "
+            "--pingpong, and --epilogue-store bulk_rows or bulk_rows_reduce"
+        )
     if args.gather_table_expert_waves and not args.gather_table:
         raise ValueError("--gather-table-expert-waves requires --gather-table")
     if args.gather_table:
@@ -616,6 +637,12 @@ def make_launch(args: argparse.Namespace, inputs: PregatherInputs):
         up_cu_seqlens_m = None
         up_A_idx = inputs.identity_A_idx
         table_kwargs = dict(gather_work_table=inputs.gather_work_table, multi_buffer_gather=False)
+        if args.gather_table_wave_barrier:
+            # Private to this launch closure; quack_gemm resets it on its stream
+            # for every invocation, including invocations captured in a graph.
+            table_kwargs["wave_store_counter"] = torch.empty(
+                (1,), dtype=torch.int32, device=inputs.A.device
+            )
 
     if args.activation is not None:
         config = GemmConfig(
@@ -1020,6 +1047,10 @@ def main() -> None:
             )
     print(f"Fused activation: {args.activation or 'disabled'}")
     print(f"Epilogue store: {args.epilogue_store}, pingpong: {args.pingpong}")
+    barrier_description = (
+        "enabled (cooperative launch)" if args.gather_table_wave_barrier else "disabled"
+    )
+    print(f"Wave store barrier: {barrier_description}")
     if inputs.scatter_table is not None:
         scatter_description = (
             "random destinations sampled with replacement"

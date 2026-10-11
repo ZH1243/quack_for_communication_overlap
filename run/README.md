@@ -198,6 +198,45 @@ runner raises an error. Logical waves do not synchronize clusters on the GPU.
 The flag takes precedence over `--gather-table-n-group-major` if both are set.
 Without the new flag, existing table orderings are unchanged.
 
+To order the output stores of successive waves, add `--gather-table-wave-barrier`:
+
+```bash
+python run/hopper_pregather_gemm.py --gather-table --gather-table-expert-waves \
+    --gather-table-wave-barrier --pingpong --epilogue-store bulk_rows \
+    --tile-m 128 --tile-n 128 --cluster-m 2 --max-swizzle-size 1
+```
+
+This requires expert-wave scheduling, pingpong, and `bulk_rows` or
+`bulk_rows_reduce`. Each store-warp lane waits for its tile's global writes to
+complete. After a warp synchronization, one lane increments a GPU-scope release
+counter once per CTA tile, even for an entirely predicated tile. Before the next
+wave enters its epilogue, it acquire-waits for all preceding-wave CTA tiles.
+Operand loading and MMA may still overlap across waves. Global-memory completion
+does not mean a physical flush past L2 or establish an RDMA notification protocol.
+
+The barrier path uses a cooperative CUDA launch with PDL disabled, ensuring that
+waiting CTAs do not prevent other participants from running. CUDA rejects a grid
+that cannot meet cooperative-launch residency requirements; there is no fallback
+to an ordinary spinning launch. The counter is private to the runner's launch
+closure and reset on the same stream before **every** GEMM, including each
+invocation inside CUDA Graph capture/replay. Counter reset and barrier overhead
+are included in the reported time. Output zeroing for `bulk_rows_reduce` remains
+excluded as before. Expect reduced overlap and sensitivity to the slowest CTA.
+
+The low-level `quack.gemm.gemm` API enables this behavior with
+`wave_store_counter=counter`, where `counter` is a separate contiguous CUDA
+`torch.int32` tensor of shape `[1]`. The API resets it on every launch and leaves
+the completed CTA-tile count there afterward. Do not share the workspace between
+concurrent invocations. This initial implementation accepts only static,
+single-buffer, non-streaming four-column gather tables with pingpong bulk stores.
+At this level the barrier works for any table order, not only expert-wave order.
+
+Hopper numerical regression checks (including partial waves and graph replay):
+
+```bash
+pytest tests/test_gemm_wave_store_barrier.py -x
+```
+
 Run the table-scheduled fused gather benchmark:
 
 ```bash

@@ -98,6 +98,7 @@ def _compile_gemm(
     has_scatter=False,
     scatter_addresses=False,
     n_tile_major_output=False,
+    has_wave_store_counter=False,
 ):
     sm_to_cls = {
         8: GemmDefaultSm80,
@@ -222,6 +223,7 @@ def _compile_gemm(
         has_ag=has_ag,
         has_gather_table=gather_table,
         has_gather_table_ready=has_gather_table_ready,
+        has_wave_store_counter=has_wave_store_counter,
         gather_table_num_buffers=gather_table_num_buffers,
         gather_table_width=gather_table_width,
         multi_buffer_gather=multi_buffer_gather,
@@ -626,6 +628,8 @@ def gemm(
     # Optional int32[1] count of the prefix of gather_work_table currently
     # resident in HBM. The scheduler warp waits before loading an unavailable row.
     gather_work_table_ready: Optional[Tensor] = None,
+    # Opt-in wave store barrier: private int32[1] workspace, reset on every launch.
+    wave_store_counter: Optional[Tensor] = None,
     # SM90: stage the full D tile and issue one linear bulk copy/reduction per row.
     # bulk_rows_reduce adds the converted epilogue result to D; callers must
     # initialize D (zero it before every launch for ordinary GEMM semantics).
@@ -750,6 +754,7 @@ def gemm(
         n_tile_major_output,
         tensor_key(gather_work_table),
         tensor_key(gather_work_table_ready),
+        tensor_key(wave_store_counter),
         tuple(tensor_key(t) for t in A_buffers),
         tuple(tensor_key(t) for t in A_idx_buffers),
         multi_buffer_gather,
@@ -811,6 +816,7 @@ def gemm(
             A_idx=A_idx,
             gather_work_table=gather_work_table,
             gather_work_table_ready=gather_work_table_ready,
+            wave_store_counter=wave_store_counter,
             multi_buffer_gather_args=multi_buffer_gather_args,
             batch_idx_permute=batch_idx_permute,
             add_to_output=add_to_output,
@@ -856,6 +862,7 @@ def gemm(
         scatter_table=scatter_table,
         gather_work_table=gather_work_table,
         gather_work_table_ready=gather_work_table_ready,
+        wave_store_counter=wave_store_counter,
         multi_buffer_gather_args=multi_buffer_gather_args,
         batch_idx_permute=batch_idx_permute,
         SFA=SFA,
@@ -887,6 +894,8 @@ def run_gemm_plan(
     scatter_table: Optional[Tensor] = None,
     gather_work_table: Optional[Tensor] = None,
     gather_work_table_ready: Optional[Tensor] = None,
+    # Opt-in wave store barrier: private int32[1] workspace, reset on every launch.
+    wave_store_counter: Optional[Tensor] = None,
     multi_buffer_gather_args: Optional[MultiBufferGatherArguments] = None,
     batch_idx_permute: Optional[Tensor] = None,
     SFA: Optional[Tensor] = None,
@@ -958,10 +967,14 @@ def run_gemm_plan(
         A=A,
         gather_table=gather_work_table,
         gather_table_ready=gather_work_table_ready,
+        wave_store_counter=wave_store_counter,
         multi_buffer_gather=multi_buffer_gather_args,
     )
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
 
+    if wave_store_counter is not None:
+        # Stream ordered and captured with each GEMM, never reset inside the grid.
+        wave_store_counter.zero_()
     launch_gemm(plan, A, B, D_gemm, C_gemm, epi_args, scheduler_args, varlen_args, SFA, SFB)
 
     if staged_split_k:
@@ -1002,6 +1015,7 @@ def _build_gemm_plan(
     A_idx,
     gather_work_table,
     gather_work_table_ready,
+    wave_store_counter,
     multi_buffer_gather_args,
     batch_idx_permute,
     add_to_output,
@@ -1028,6 +1042,29 @@ def _build_gemm_plan(
     multi_buffer_scatter=False,
     n_tile_major_output=False,
 ) -> _GemmPlan:
+    if wave_store_counter is not None:
+        if (
+            gather_work_table is None
+            or not pingpong
+            or not persistent
+            or is_dynamic_persistent
+            or epilogue_store not in ("bulk_rows", "bulk_rows_reduce")
+            or multi_buffer_gather_args is not None
+            or gather_work_table_ready is not None
+            or gather_work_table.ndim != 2
+            or gather_work_table.shape[1] != 4
+        ):
+            raise ValueError(
+                "wave_store_counter requires a non-streaming, four-column gather table, "
+                "single-buffer gather, static persistence, pingpong, and bulk-row stores"
+            )
+        if (
+            wave_store_counter.shape != (1,)
+            or wave_store_counter.dtype != torch.int32
+            or not wave_store_counter.is_contiguous()
+            or wave_store_counter.device != A.device
+        ):
+            raise ValueError("wave_store_counter must be contiguous int32[1] on the input device")
     if scatter_table is not None:
         if epilogue_store not in ("bulk_rows", "bulk_rows_reduce"):
             raise ValueError("scatter_table requires bulk_rows or bulk_rows_reduce")
@@ -1188,6 +1225,9 @@ def _build_gemm_plan(
             num_n_groups = clusters_n // work_group_size
             if gather_work_table.shape[0] % num_n_groups:
                 raise ValueError("indexed gather requires complete consecutive N-group bundles")
+        if wave_store_counter is not None:
+            if gather_work_table.shape[0] * work_group_size * cluster_M > 2**31 - 1:
+                raise ValueError("wave store completion count exceeds int32 capacity")
         if gather_work_table.shape[0] == 0:
             raise ValueError("gather_work_table must contain at least one row")
     if has_ag:
@@ -1452,6 +1492,7 @@ def _build_gemm_plan(
         scatter_table is not None,
         multi_buffer_scatter,
         n_tile_major_output,
+        wave_store_counter is not None,
     )
 
     cluster_size = cluster_M * cluster_N * cluster_K

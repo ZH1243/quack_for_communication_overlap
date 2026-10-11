@@ -894,6 +894,12 @@ class GemmSm90(GemmTmaBase):
 
         self.shared_storage = SharedStorage
 
+        if const_expr(scheduler_args.wave_store_counter is not None):
+            assert self.gather_table and self.pingpong and self.bulk_row_store
+            # This grid must be co-resident. Do not overlap dependent launches
+            # through PDL while CTAs are participating in a global spin barrier.
+            self.use_pdl = False
+
         # Launch the kernel synchronously
         self.kernel(
             self.tiled_mma,
@@ -932,6 +938,7 @@ class GemmSm90(GemmTmaBase):
             # ptxas caps registers for 2 resident CTAs
             min_blocks_per_mp=self.occupancy,
             use_pdl=self.use_pdl,
+            cooperative=scheduler_args.wave_store_counter is not None,
         )
         return
 
@@ -999,6 +1006,9 @@ class GemmSm90(GemmTmaBase):
 
         from cutlass.cute.experimental import iket
 
+        wave_store_counter = (
+            tile_sched_params.wave_store_counter if const_expr(self.gather_table) else None
+        )
         varlen_m = const_expr(varlen_params.cu_seqlens_m is not None or self.gather_table)
         varlen_k = const_expr(varlen_params.cu_seqlens_k is not None)
         assert not (varlen_m and varlen_k)
@@ -1394,6 +1404,10 @@ class GemmSm90(GemmTmaBase):
                         # positioned at stage 1 before its initial read above.
                         tile_scheduler.advance_to_next_work()
                         work_tile = tile_scheduler.get_current_work()
+            # Static table work advances by one grid of clusters per tile.
+            # Pingpong WG0 owns even waves; WG1 owns odd waves. Track this
+            # separately from the scheduler ring's private consumer cursor.
+            store_wave = Int32(warp_group_idx)
             while work_tile.is_valid_tile:
                 # (pid_m, pid_n, split_idx | None, batch_idx), decoded by the scheduler
                 tile_coord_mnkl = work_tile.tile_idx
@@ -1448,6 +1462,27 @@ class GemmSm90(GemmTmaBase):
                 # EPILOGUE
                 if const_expr(self.pingpong):
                     self.pingpong_barrier_sync(warp_group_idx, "epi")
+                if const_expr(wave_store_counter is not None):
+                    # Only this WG's store warp polls. Broadcast the acquire
+                    # before any thread enters the epilogue or issues a store.
+                    if is_tma_warp:
+                        if cute.arch.lane_idx() == 0:
+                            grid_ctas = cute.arch.grid_dim()
+                            target = store_wave * grid_ctas[0] * grid_ctas[1] * grid_ctas[2]
+                            completed = cute.arch.load(
+                                wave_store_counter.iterator.llvm_ptr,
+                                Int32,
+                                sem="acquire",
+                                scope="gpu",
+                            )
+                            while completed < target:
+                                completed = cute.arch.load(
+                                    wave_store_counter.iterator.llvm_ptr,
+                                    Int32,
+                                    sem="acquire",
+                                    scope="gpu",
+                                )
+                    self.epilogue_barrier.arrive_and_wait()
                 iket.range_push("epilogue")
 
                 copy_D = None
@@ -1633,9 +1668,27 @@ class GemmSm90(GemmTmaBase):
                     if is_tma_warp:
                         if const_expr(self.bulk_row_store):
                             # Every lane issued its own rows and bulk group.
-                            # Drain each lane's SMEM reads before the other WG
-                            # can overwrite the shared full-tile buffer.
-                            cute.arch.cp_async_bulk_wait_group(0, read=True)
+                            # Normally only drain SMEM reads for buffer reuse.
+                            # With the wave barrier, drain destination writes too
+                            # before reporting completion and handing off to the peer.
+                            cute.arch.cp_async_bulk_wait_group(
+                                0, read=const_expr(wave_store_counter is None)
+                            )
+                            if const_expr(wave_store_counter is not None):
+                                # Bulk groups are per issuing lane. Collect all
+                                # 32 full completions before publishing ONE CTA
+                                # arrival (including entirely predicated tiles).
+                                cute.arch.sync_warp()
+                                if cute.arch.lane_idx() == 0:
+                                    cute.arch.red(
+                                        wave_store_counter.iterator.llvm_ptr,
+                                        Int32(1),
+                                        op="add",
+                                        dtype="s32",
+                                        sem="release",
+                                        scope="gpu",
+                                    )
+                                cute.arch.sync_warp()
                         else:
                             epi_store_pipeline.producer_tail()
                     self.pingpong_barrier_arrive(1 - warp_group_idx, stage="epi")
@@ -1678,6 +1731,8 @@ class GemmSm90(GemmTmaBase):
                             epi_producer_state.advance_iters(c_cnt)
                             tile_scheduler.advance_to_next_work()
                             work_tile = tile_scheduler.get_current_work()
+                if const_expr(wave_store_counter is not None):
+                    store_wave += 2
                 # End of persistent scheduler loop
 
             # PDL: hint next kernel to launch (matches cutlass C++ sm90 consumer)
