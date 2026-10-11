@@ -601,7 +601,10 @@ def test_bulk_rows_scatter_duplicates(routing, pingpong, dtype, collision):
 @pytest.mark.parametrize("routing", ["varlen", "expert_waves"])
 @pytest.mark.parametrize("pingpong", [False, True])
 @pytest.mark.parametrize("reduce", [False, True])
-def test_multi_buffer_scatter(routing, pingpong, reduce):
+@pytest.mark.parametrize("tiled", [False, True])
+@pytest.mark.parametrize("n", [136, 256])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_multi_buffer_scatter(routing, pingpong, reduce, tiled, n, dtype):
     """Separate allocations/pitches, N/M tails, collisions, guards and graph replay."""
     from quack.gemm import build_scatter_row_addresses
     from run.hopper_gather_table_gemm import build_work_table
@@ -609,11 +612,11 @@ def test_multi_buffer_scatter(routing, pingpong, reduce):
 
     torch.manual_seed(73)
     counts = [129, 1025]
-    routes, k, n = sum(counts), 128, 136
+    routes, k, tile_n = sum(counts), 128, 128
     a = torch.randn(routes, k, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(2, k, n, device="cuda", dtype=a.dtype) / math.sqrt(k)
     reference = torch.cat([a[:129].float() @ w[0].float(), a[129:].float() @ w[1].float()])
-    baseline = torch.cat([a[:129] @ w[0], a[129:] @ w[1]]).float()
+    baseline = torch.cat([a[:129] @ w[0], a[129:] @ w[1]]).to(dtype).float()
     sizes = [7, 131, routes - 138]
     if reduce:
         sizes = [7, 31, 131]  # Physical capacity is smaller than logical M.
@@ -629,6 +632,7 @@ def test_multi_buffer_scatter(routing, pingpong, reduce):
         cluster_M=2, cluster_N=1, pingpong=pingpong, max_swizzle_size=1,
         epilogue_store="bulk_rows_reduce" if reduce else "bulk_rows",
         multi_buffer_scatter=True,
+        n_tile_major_output=tiled,
     )
     if routing == "expert_waves":
         work_count = sum(math.ceil(c / 256) for c in counts) * math.ceil(n / 128)
@@ -646,12 +650,23 @@ def test_multi_buffer_scatter(routing, pingpong, reduce):
 
     # Reallocate between launches to exercise a warm plan with new pointers.
     for _ in range(2):
-        storage = tuple(
-            torch.full((size + 2, n + 8 * (i + 1)), -123., device="cuda", dtype=torch.float32)
-            for i, size in enumerate(sizes)
-        )
-        buffers = tuple(t[1:-1, :n] for t in storage)
-        addresses = build_scatter_row_addresses(buffers, mapping, reduce=reduce)
+        if tiled:
+            tiles = math.ceil(n / tile_n)
+            storage = tuple(
+                torch.full((tiles * size * tile_n + 16,), -123., device="cuda", dtype=dtype)
+                for size in sizes
+            )
+            buffers = tuple(
+                t[8:-8].view(tiles, size * tile_n) for t, size in zip(storage, sizes)
+            )
+        else:
+            storage = tuple(
+                torch.full((size + 2, n + 8 * (i + 1)), -123., device="cuda", dtype=dtype)
+                for i, size in enumerate(sizes)
+            )
+            buffers = tuple(t[1:-1, :n] for t in storage)
+        address_kwargs = dict(tile_n=tile_n) if tiled else {}
+        addresses = build_scatter_row_addresses(buffers, mapping, reduce=reduce, **address_kwargs)
 
         def launch():
             if reduce:
@@ -665,47 +680,71 @@ def test_multi_buffer_scatter(routing, pingpong, reduce):
             launch()
         graph.replay()
         graph.replay()
-        actual = torch.cat(buffers)
+        if tiled:
+            padded = [
+                b.view(tiles, size, tile_n).permute(1, 0, 2).reshape(size, -1)
+                for b, size in zip(buffers, sizes)
+            ]
+            actual = torch.cat([p[:, :n] for p in padded]).float()
+            for p in padded:
+                assert (p[:, n:] == (0 if reduce else -123)).all()
+        else:
+            actual = torch.cat(buffers).float()
         expected = torch.zeros_like(actual)
         expected.index_add_(0, destinations, reference)
         gemm_error = torch.zeros_like(actual)
         gemm_error.index_add_(0, destinations, (baseline - reference).abs())
         error = (actual - expected).abs()
-        allowed = 0.03 + 1e-3 * expected.abs() + 2 * gemm_error
+        magnitude = torch.zeros_like(actual)
+        magnitude.index_add_(0, destinations, baseline.abs())
+        counts_per_dst = torch.bincount(destinations, minlength=sum(sizes))
+        factor = torch.expm1(
+            (counts_per_dst.float() - 1).clamp_min(0) * math.log1p(torch.finfo(dtype).eps / 2)
+        )[:, None]
+        allowed = (
+            0.03 + 1e-3 * expected.abs() + 2 * gemm_error + factor * (magnitude + 2 * gemm_error)
+        )
         assert torch.isfinite(actual).all()
         assert (error <= allowed).all()
+        assert (actual[counts_per_dst == 0] == 0).all()
         for backing in storage:
-            assert (backing[0] == -123).all() and (backing[-1] == -123).all()
-            assert (backing[:, n:] == -123).all()
+            if tiled:
+                assert (backing[:8] == -123).all() and (backing[-8:] == -123).all()
+            else:
+                assert (backing[0] == -123).all() and (backing[-1] == -123).all()
+                assert (backing[:, n:] == -123).all()
 
         bad = mapping.clone()
         bad[0, 0] = len(buffers)
         with pytest.raises(ValueError, match="buffer ID"):
-            build_scatter_row_addresses(buffers, bad)
+            build_scatter_row_addresses(buffers, bad, **address_kwargs)
         bad = mapping.clone()
         bad[0, 1] = sum(sizes)
         with pytest.raises(ValueError, match="row index"):
-            build_scatter_row_addresses(buffers, bad)
+            build_scatter_row_addresses(buffers, bad, **address_kwargs)
         bad = mapping.clone()
         bad[1] = bad[0]
         with pytest.raises(ValueError, match="overlapping"):
-            build_scatter_row_addresses(buffers, bad)
+            build_scatter_row_addresses(buffers, bad, **address_kwargs)
 
 
 @pytest.mark.parametrize("reduce", [False, True])
-def test_multi_buffer_scatter_runner(monkeypatch, reduce):
+@pytest.mark.parametrize("tiled", [False, True])
+def test_multi_buffer_scatter_runner(monkeypatch, reduce, tiled):
     """Exercise CLI allocation, zeroing and numerical checks with expert waves."""
     import sys
     from run import hopper_pregather_gemm as runner
 
     argv = (
         "hopper_pregather_gemm.py --tokens 257 --hidden 128 --output-dim 136 "
-        "--experts 2 --routes 258 --tile-m 128 --tile-n 128 --max-swizzle-size 1 "
+        "--experts 2 --routes 260 --tile-m 128 --tile-n 128 --max-swizzle-size 1 "
         "--gather-table --gather-table-expert-waves --scatter-table "
         "--multi-buffer-scatter --scatter-output-buffers 3 "
         "--warmup 2 --iterations 2 --timing-samples 1 --epilogue-store"
     ).split()
     argv.append("bulk_rows_reduce" if reduce else "bulk_rows")
+    if tiled:
+        argv.append("--n-tile-major-output")
     if reduce:
         argv.extend(("--scatter-table-with-replacement", "--scatter-table-destination-rows", "17"))
     monkeypatch.setattr(sys, "argv", argv)
@@ -813,7 +852,7 @@ def test_n_tile_major_output(routing, pingpong, mode, n, dtype):
         if tiled:
             assert (padded[:, n:] == (0 if reduce else -123)).all()
 
-    with pytest.raises(ValueError, match="multi_buffer_scatter"):
+    with pytest.raises(ValueError, match="scatter_table"):
         gemm(
             a, w.transpose(1, 2), (output, output), n_tile_major_output=True,
             multi_buffer_scatter=True, **config,
@@ -844,7 +883,3 @@ def test_n_tile_major_runner(monkeypatch, mode, expert_waves):
         argv.extend(("--scatter-table-with-replacement", "--scatter-table-destination-rows", "17"))
     monkeypatch.setattr(sys, "argv", argv)
     runner.main()  # Runs the runner's float32 reference and same-dtype error checks.
-    args = runner.parse_args()
-    args.multi_buffer_scatter = True
-    with pytest.raises(ValueError, match="does not support --multi-buffer-scatter"):
-        runner.validate_args(args)

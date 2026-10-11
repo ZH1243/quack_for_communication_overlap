@@ -473,7 +473,7 @@ class GemmSm90(GemmTmaBase):
             self.scatter_rows and epilogue_args.mScatter.element_type == Int64
         )
         if self.n_tile_major_output:
-            assert self.scatter_rows and not self.scatter_addresses
+            assert self.scatter_rows
         if self.bulk_row_store:
             assert self.d_dtype in (cutlass.Float16, cutlass.BFloat16, cutlass.Float32)
             assert self.d_layout.is_n_major_c(), "bulk_rows requires row-major D"
@@ -1501,7 +1501,20 @@ class GemmSm90(GemmTmaBase):
                             for rb in cutlass.range_constexpr(rows_per_lane):
                                 row = rb * cute.arch.WARP_SIZE + tidx % cute.arch.WARP_SIZE
                                 if row < tile_m and source_start + row < source_end:
-                                    scatter_rows[rb] = epilogue_params.mScatter[source_start + row]
+                                    if const_expr(
+                                        self.scatter_addresses and self.n_tile_major_output
+                                    ):
+                                        # Resolve this tile's byte address before R2S; buffers may
+                                        # have different row counts and therefore tile strides.
+                                        scatter_rows[rb] = (
+                                            epilogue_params.mScatter[source_start + row, 0]
+                                            + Int64(tile_coord_mnkl[1])
+                                            * epilogue_params.mScatter[source_start + row, 1]
+                                        )
+                                    else:
+                                        scatter_rows[rb] = epilogue_params.mScatter[
+                                            source_start + row
+                                        ]
                         # Scatter indices are global routed rows, so discard the
                         # descriptor/sequence-local output base used above.
                         d_tensor = mD_mnl
@@ -1688,7 +1701,8 @@ class GemmSm90(GemmTmaBase):
         With scatter_rows, gD is the global output base and each lane uses its
         prefetched destination indices, while keeping the same source bounds.
         In address mode these registers instead hold int64 destination-row
-        pointers; gD supplies only the dtype and column extent.
+        pointers (already offset to this N tile for N-tile-major storage);
+        gD supplies only the dtype and column extent.
         The host validates 16-byte alignment, including the final N tile width.
         """
         tile_m, tile_n = self.cta_tile_shape_mnk[:2]
@@ -1702,7 +1716,7 @@ class GemmSm90(GemmTmaBase):
                 dst_row = row_start + row
                 if const_expr(scatter_rows is not None and not self.scatter_addresses):
                     dst_row = scatter_rows[row_block]
-                if const_expr(self.n_tile_major_output):
+                if const_expr(self.n_tile_major_output and not self.scatter_addresses):
                     # gD carries logical (routes, N), but storage is [ntiles, routes, tile_n].
                     # Widen before multiplication for allocations exceeding 2 Gi elements.
                     dst_ptr = gD.iterator + (
@@ -1714,7 +1728,9 @@ class GemmSm90(GemmTmaBase):
                         scatter_rows[row_block],
                         gD.iterator.memspace,
                         assumed_align=16,
-                    ) + col_start
+                    )
+                    if const_expr(not self.n_tile_major_output):
+                        dst_ptr = dst_ptr + col_start
                 else:
                     dst_ptr = gD.iterator + cute.crd2idx((dst_row, col_start), gD.layout)
                 copy_utils.cpasync_bulk_s2g(
