@@ -969,8 +969,10 @@ class GemmSm90(GemmTmaBase):
         b_smem_layout: cute.ComposedLayout,
         sfa_smem_layout: Optional[cute.Layout],
         sfb_smem_layout: Optional[cute.Layout],
-        epi_smem_layout: Union[cute.ComposedLayout, cute.Layout],
-        epi_c_smem_layout: cute.ComposedLayout,
+        # D/C storage is absent when the corresponding tensor is None (e.g.
+        # activation-only epilogues store through their own TileStore buffers).
+        epi_smem_layout: Optional[Union[cute.ComposedLayout, cute.Layout]],
+        epi_c_smem_layout: Optional[cute.ComposedLayout],
         tma_atom_aux_a: Optional[cute.CopyAtom],
         mAuxA_mkl: Optional[cute.Tensor],
         aux_a_smem_layout: Optional[cute.Layout],

@@ -449,3 +449,42 @@ def test_gather_table_down_projection2(mode, multi_input, indexed):
         torch.cuda.synchronize()
         check_correctness(inputs, activation=args.activation, atol=args.atol, rtol=args.rtol)
         check_down_correctness(inputs, atol=args.atol, rtol=args.rtol)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("num_buffers", [1, 32])
+def test_gather_table_swiglu_without_primary_epilogue_storage(num_buffers):
+    """No preactivation D or input C: both primary epilogue layouts are None.
+
+    Keep the reported 128x128 pingpong tile and balanced/round-robin scheduling,
+    but shrink GEMM dimensions to isolate the host-to-kernel annotation failure.
+    """
+    from run.hopper_gather_table_gemm import (
+        check_correctness,
+        make_arg_parser,
+        make_launch,
+        prepare_inputs,
+        validate_args,
+    )
+
+    flags = [
+        "--tokens", "32", "--routes", "17", "--experts", "2",
+        "--hidden", "64", "--output-dim", "128",
+        "--tile-m", "128", "--tile-n", "128", "--pingpong",
+        "--activation", "swiglu",
+    ]
+    if num_buffers > 1:
+        flags += [
+            "--multi-buffer-gather", "--balanced-multi-buffer-gather",
+            "--round-robin-m-clusters", "--num-input-buffers", str(num_buffers),
+            "--tokens-per-buffer", "32", "--routes-per-buffer", "17",
+        ]
+    args = make_arg_parser(include_down_projection=True).parse_args(flags)
+    validate_args(args)
+    torch.manual_seed(42)
+    inputs = prepare_inputs(args, torch.device("cuda"))
+    make_launch(args, inputs)()
+    torch.cuda.synchronize()
+    # The runner uses store_preact=False and C=None. Its reference compares
+    # the activated output to fp32 SwiGLU and a same-dtype rounding baseline.
+    check_correctness(inputs, activation="swiglu", atol=args.atol, rtol=args.rtol)
