@@ -99,6 +99,7 @@ def _compile_gemm(
     scatter_addresses=False,
     n_tile_major_output=False,
     has_wave_store_counter=False,
+    bulk_row_double_buffer=False,
 ):
     sm_to_cls = {
         8: GemmDefaultSm80,
@@ -269,6 +270,7 @@ def _compile_gemm(
         gather_table=gather_table,
         gather_table_num_buffers=gather_table_num_buffers,
         epilogue_store=epilogue_store,
+        bulk_row_double_buffer=bulk_row_double_buffer,
         n_tile_major_output=n_tile_major_output,
     )
 
@@ -650,6 +652,8 @@ def gemm(
     # restores logical values (may copy); reshaping alone does not. Padding
     # is untouched. N and the final segment must satisfy bulk's 16-byte alignment.
     n_tile_major_output: bool = False,
+    # SM90 bulk-row pingpong: one D staging buffer per WG; epilogues stay ordered.
+    bulk_row_double_buffer: bool = False,
 ) -> _GemmPlan:
     if n_tile_major_output:
         if scatter_table is None or epilogue_store not in ("bulk_rows", "bulk_rows_reduce"):
@@ -759,6 +763,7 @@ def gemm(
         tuple(tensor_key(t) for t in A_idx_buffers),
         multi_buffer_gather,
         epilogue_store,
+        bulk_row_double_buffer,
         A_idx is not None,
         batch_idx_permute is not None,
         tile_count_semaphore is not None,
@@ -839,6 +844,7 @@ def gemm(
             sfd_norm_const=sfd_norm_const,
             SFDCol=SFDCol,
             epilogue_store=epilogue_store,
+            bulk_row_double_buffer=bulk_row_double_buffer,
             scatter_table=scatter_table,
             multi_buffer_scatter=multi_buffer_scatter,
             n_tile_major_output=n_tile_major_output,
@@ -1041,6 +1047,7 @@ def _build_gemm_plan(
     scatter_table=None,
     multi_buffer_scatter=False,
     n_tile_major_output=False,
+    bulk_row_double_buffer=False,
 ) -> _GemmPlan:
     if wave_store_counter is not None:
         if (
@@ -1260,6 +1267,10 @@ def _build_gemm_plan(
         assert B.stride(-2) == 1, "varlen_k requires B to be n-major"
 
     device_capacity = get_device_capacity(A.device)
+    if bulk_row_double_buffer and (
+        not pingpong or epilogue_store not in ("bulk_rows", "bulk_rows_reduce")
+    ):
+        raise ValueError("bulk_row_double_buffer requires pingpong and bulk-row stores")
     if epilogue_store not in ("tma", "bulk_rows", "bulk_rows_reduce"):
         raise ValueError("epilogue_store must be 'tma', 'bulk_rows', or 'bulk_rows_reduce'")
     if epilogue_store in ("bulk_rows", "bulk_rows_reduce"):
@@ -1493,6 +1504,7 @@ def _build_gemm_plan(
         multi_buffer_scatter,
         n_tile_major_output,
         wave_store_counter is not None,
+        bulk_row_double_buffer=bulk_row_double_buffer,
     )
 
     cluster_size = cluster_M * cluster_N * cluster_K

@@ -54,6 +54,12 @@ Use table scheduling with pre-gathered tokens:
     python run/hopper_pregather_gemm.py --gather-table
 
 The default --epilogue-store tma retains the existing subtile tensor stores.
+Add --bulk-row-double-buffer with --pingpong and either bulk-row mode to give
+each warp group its own full-tile output SMEM buffer. Epilogues remain ordered,
+but stores only wait for SMEM reads before the issuing warp group reuses its
+own buffer. This costs one extra output tile of SMEM and may reduce A/B stages.
+The optional wave store barrier still drains destination writes at every wave.
+
 Both bulk_rows and bulk_rows_reduce require plain GEMM without --activation.
 Output rows must have a 16-byte-multiple width (N divisible by 8 for BF16/FP16).
 Full-tile staging uses more shared memory; use a 128x128 tile to start.
@@ -211,6 +217,12 @@ def add_kernel_arguments(parser: argparse.ArgumentParser, *, prefix: str = "") -
     add_argument("--cluster-m", type=int, default=2)
     add_argument("--max-swizzle-size", type=int, default=8)
     add_argument("--pingpong", action="store_true")
+    add_argument(
+        "--bulk-row-double-buffer",
+        action="store_true",
+        help="Use one output SMEM buffer per pingpong WG; requires --pingpong and "
+        "--epilogue-store bulk_rows or bulk_rows_reduce. Costs one extra full output tile.",
+    )
     add_argument(
         "--gather-table",
         action="store_true",
@@ -432,6 +444,13 @@ def validate_args(args: argparse.Namespace, *, prepacked: bool = False) -> None:
             raise ValueError(
                 "--scatter-table-with-replacement requires --epilogue-store bulk_rows_reduce"
             )
+    if args.bulk_row_double_buffer and (
+        not args.pingpong or args.epilogue_store not in ("bulk_rows", "bulk_rows_reduce")
+    ):
+        raise ValueError(
+            "--bulk-row-double-buffer requires --pingpong and "
+            "--epilogue-store bulk_rows or bulk_rows_reduce"
+        )
     if args.scatter_table and args.epilogue_store not in ("bulk_rows", "bulk_rows_reduce"):
         raise ValueError("--scatter-table requires --epilogue-store bulk_rows or bulk_rows_reduce")
     if args.gather_table_n_group_major and not args.gather_table:
@@ -752,6 +771,7 @@ def make_launch(args: argparse.Namespace, inputs: PregatherInputs):
                 **table_kwargs,
                 use_tma_gather=False,
                 epilogue_store=args.epilogue_store,
+                bulk_row_double_buffer=args.bulk_row_double_buffer,
                 scatter_table=(
                     inputs.scatter_row_addresses
                     if args.multi_buffer_scatter
@@ -784,6 +804,7 @@ def make_launch(args: argparse.Namespace, inputs: PregatherInputs):
                 A_idx=None,
                 use_tma_gather=False,
                 epilogue_store=args.epilogue_store,
+                bulk_row_double_buffer=args.bulk_row_double_buffer,
             )
 
     return launch
@@ -1100,6 +1121,8 @@ def main() -> None:
             )
     print(f"Fused activation: {args.activation or 'disabled'}")
     print(f"Epilogue store: {args.epilogue_store}, pingpong: {args.pingpong}")
+    if args.bulk_row_double_buffer:
+        print("Bulk-row double buffer: enabled (one full output tile per warp group)")
     barrier_description = (
         "enabled (cooperative launch)" if args.gather_table_wave_barrier else "disabled"
     )

@@ -19,7 +19,11 @@ pytestmark = pytest.mark.skipif(
 
 @torch.inference_mode()
 @pytest.mark.parametrize("routing", ["varlen", "table", "pregather_table"])
-@pytest.mark.parametrize("pingpong", [False, True], ids=["cooperative", "pingpong"])
+@pytest.mark.parametrize(
+    "pingpong,double_buffer",
+    [(False, False), (True, False), (True, True)],
+    ids=["cooperative", "pingpong", "pingpong_double_buffer"],
+)
 @pytest.mark.parametrize("mode", ["bulk_rows", "bulk_rows_reduce"])
 @pytest.mark.parametrize("n", [128, 136], ids=["full_n", "tail_n"])
 @pytest.mark.parametrize(
@@ -31,7 +35,7 @@ pytestmark = pytest.mark.skipif(
     ],
     ids=["bf16", "fp16", "fp32_output"],
 )
-def test_bulk_rows_gather(routing, pingpong, mode, n, dtype, out_dtype):
+def test_bulk_rows_gather(routing, pingpong, double_buffer, mode, n, dtype, out_dtype):
     """Ragged/empty experts, N tails, padded pitches, persistent reuse and graph replay.
 
     The large final expert has more tiles than resident CTAs on H100/H200,
@@ -87,7 +91,14 @@ def test_bulk_rows_gather(routing, pingpong, mode, n, dtype, out_dtype):
             config["A_idx"] = indices
 
     def launch(mode, out):
-        gemm(x, b, out, epilogue_store=mode, **config)
+        gemm(
+            x,
+            b,
+            out,
+            epilogue_store=mode,
+            bulk_row_double_buffer=double_buffer and mode != "tma",
+            **config,
+        )
 
     # Compile before capture. Calling the modes back-to-back also checks that
     # the host plan and JIT caches distinguish the store mode.
@@ -184,8 +195,10 @@ def test_table_bulk_rows_output_view(mode, scatter):
 
 @torch.inference_mode()
 @pytest.mark.parametrize("mode", ["bulk_rows", "bulk_rows_reduce"])
-@pytest.mark.parametrize("tile_m,pingpong", [(256, False), (128, True)])
-def test_bulk_rows_dense_linear_epilogue(tile_m, pingpong, mode):
+@pytest.mark.parametrize(
+    "tile_m,pingpong,double_buffer", [(256, False, False), (128, True, False), (128, True, True)]
+)
+def test_bulk_rows_dense_linear_epilogue(tile_m, pingpong, double_buffer, mode):
     """The full-tile store preserves C, alpha/beta, and batch addressing."""
     torch.manual_seed(7)
     dtype = torch.bfloat16
@@ -208,13 +221,21 @@ def test_bulk_rows_dense_linear_epilogue(tile_m, pingpong, mode):
     )
     output.zero_()
     for store_mode, out in (("tma", tma_output), (mode, output)):
-        gemm(a, b, out, epilogue_store=store_mode, **config)
+        gemm(
+            a,
+            b,
+            out,
+            epilogue_store=store_mode,
+            bulk_row_double_buffer=double_buffer and store_mode != "tma",
+            **config,
+        )
     reference = 0.5 * (a.float() @ b.float().transpose(1, 2)) + 0.25 * c.float()
     baseline = (0.5 * (a @ b.transpose(1, 2)).float() + 0.25 * c.float()).to(dtype).float()
     torch.testing.assert_close(output, tma_output, atol=0, rtol=0)
     baseline_error = (baseline - reference).abs().max().item()
     torch.testing.assert_close(output.float(), reference, atol=2 * baseline_error + 1e-3, rtol=1e-3)
 
+    config["bulk_row_double_buffer"] = double_buffer
     if mode == "bulk_rows_reduce":
         # A nonzero destination distinguishes a real reduction from a plain copy.
         initial = torch.randn_like(output)
@@ -903,3 +924,52 @@ def test_n_tile_major_runner(monkeypatch, mode, expert_waves):
         argv.extend(("--scatter-table-with-replacement", "--scatter-table-destination-rows", "17"))
     monkeypatch.setattr(sys, "argv", argv)
     runner.main()  # Runs the runner's float32 reference and same-dtype error checks.
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("mode", ["bulk_rows", "bulk_rows_reduce"])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("k", [64, 256])
+def test_bulk_rows_double_buffer_reuse(mode, out_dtype, k):
+    """Many persistent tiles force both WGs to reuse their private D buffers.
+
+    Alternate the flag on identical metadata to exercise both host/JIT cache keys.
+    Tail rows/columns, repeated launches, and nonzero reduction destinations catch
+    stale data, incorrect WG offsets, and premature buffer reuse.
+    """
+    torch.manual_seed(42)
+    m, n = 128 * 1024 + 3, 136
+    a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / math.sqrt(k)
+    output = torch.empty(m, n, device="cuda", dtype=out_dtype)
+    initial = torch.randn_like(output)
+    reference = a.float() @ b.float().T
+    baseline = (a @ b.T).to(out_dtype).float()
+    config = dict(
+        tile_M=128,
+        tile_N=128,
+        tile_K=64,
+        cluster_M=1,
+        cluster_N=1,
+        pingpong=True,
+        persistent=True,
+        is_dynamic_persistent=False,
+        epilogue_store=mode,
+    )
+    single_buffer_output = None
+    for double_buffer in (False, True, True, False):
+        output.copy_(initial)
+        gemm(a, b, output, bulk_row_double_buffer=double_buffer, **config)
+        expected = reference
+        expected_baseline = baseline
+        if mode == "bulk_rows_reduce":
+            expected = initial.float() + reference
+            expected_baseline = (initial.float() + baseline).to(out_dtype).float()
+        baseline_error = (expected_baseline - expected).abs().max().item()
+        torch.testing.assert_close(
+            output.float(), expected, atol=2 * baseline_error + 1e-3, rtol=1e-3
+        )
+        if single_buffer_output is None:
+            single_buffer_output = output.clone()
+        else:
+            torch.testing.assert_close(output, single_buffer_output, atol=0, rtol=0)

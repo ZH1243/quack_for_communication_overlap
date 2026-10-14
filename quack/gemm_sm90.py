@@ -171,6 +171,7 @@ class GemmSm90(GemmTmaBase):
         gather_table_num_buffers: int = 1,
         epilogue_store: str = "tma",
         n_tile_major_output: bool = False,
+        bulk_row_double_buffer: bool = False,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -192,6 +193,11 @@ class GemmSm90(GemmTmaBase):
         self.n_tile_major_output = n_tile_major_output
         if n_tile_major_output:
             assert cluster_shape_mnk[1] == 1 and epilogue_store != "tma"
+        if bulk_row_double_buffer and (
+            not pingpong or epilogue_store not in ("bulk_rows", "bulk_rows_reduce")
+        ):
+            raise ValueError("bulk_row_double_buffer requires pingpong and bulk-row stores")
+        self.bulk_row_double_buffer = bulk_row_double_buffer
         self.bulk_row_reduce = epilogue_store == "bulk_rows_reduce"
         self.bulk_row_store = epilogue_store in ("bulk_rows", "bulk_rows_reduce")
         if self.bulk_row_store:
@@ -499,6 +505,11 @@ class GemmSm90(GemmTmaBase):
             fixed_user_smem_bytes = (
                 math.ceil(address_table_bytes / self.buffer_align_bytes)
                 * self.buffer_align_bytes
+            )
+        if self.bulk_row_double_buffer:
+            # Reserve the second full D tile before assigning the remaining SMEM to A/B.
+            fixed_user_smem_bytes += (
+                self.cta_tile_shape_mnk[0] * self.cta_tile_shape_mnk[1] * self.d_dtype.width // 8
             )
         self.ab_stage, self.epi_stage, self.epi_c_stage = self._compute_stages(
             self.cta_tile_shape_mnk,
@@ -841,6 +852,8 @@ class GemmSm90(GemmTmaBase):
         )
 
         epi_smem_size = cute.cosize(self.epi_smem_layout_staged) if mD is not None else 0
+        if self.bulk_row_double_buffer:
+            epi_smem_size *= 2
         epi_c_smem_size = cute.cosize(self.epi_c_smem_layout_staged) if mC is not None else 0
         aux_a_smem_size = 0
         if const_expr(self.aux_a is not None):
@@ -1293,6 +1306,12 @@ class GemmSm90(GemmTmaBase):
             # Partition global tensor for TiledMMA_A/B/C
             tidx, _, _ = cute.arch.thread_idx()
             warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
+            if const_expr(self.bulk_row_double_buffer):
+                # Each WG retains the same subtile layout within its own full-tile buffer.
+                sD = cute.make_tensor(
+                    sD.iterator + warp_group_idx * cute.cosize(epi_smem_layout),
+                    epi_smem_layout,
+                )
             if const_expr(self.pingpong):
                 tidx = tidx % self.num_threads_per_warp_group
             warp_group_thread_layout = cute.make_layout(
@@ -1664,18 +1683,21 @@ class GemmSm90(GemmTmaBase):
                 )
 
                 if const_expr(self.pingpong):
-                    # With pingpong, 2 WGs write two different output tiles to the same smem,
-                    # so we have to make sure the smem content is done reading before signaling
-                    # the next WG's epilogue.
+                    # Keep epilogues ordered, including their shared named barrier and C state.
+                    # Shared D needs a read drain before handoff; private D defers it until
+                    # this WG reuses its buffer. A wave barrier still requires full completion.
                     if is_tma_warp:
                         if const_expr(self.bulk_row_store):
                             # Every lane issued its own rows and bulk group.
                             # Normally only drain SMEM reads for buffer reuse.
                             # With the wave barrier, drain destination writes too
                             # before reporting completion and handing off to the peer.
-                            cute.arch.cp_async_bulk_wait_group(
-                                0, read=const_expr(wave_store_counter is None)
-                            )
+                            if const_expr(
+                                not self.bulk_row_double_buffer or wave_store_counter is not None
+                            ):
+                                cute.arch.cp_async_bulk_wait_group(
+                                    0, read=const_expr(wave_store_counter is None)
+                                )
                             if const_expr(wave_store_counter is not None):
                                 # Bulk groups are per issuing lane. Collect all
                                 # 32 full completions before publishing ONE CTA

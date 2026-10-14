@@ -80,6 +80,7 @@ class GemmBase:
 
     arch = 0
     bulk_row_store = False
+    bulk_row_double_buffer = False
     # Epilogue mixins that need a reduction over the full accumulator tile
     # BEFORE any subtile is stored (e.g. QK-norm's per-head sum of squares)
     # set this in epi_to_underlying_arguments. The epilogue then runs a
@@ -326,12 +327,13 @@ class GemmBase:
             # A single full-tile buffer survives across all subtiles. Only
             # wait at tile reuse, and only for the async reads of SMEM.
             # All issuing lanes must wait on their own per-thread groups.
-            if const_expr(not self.pingpong):
+            if const_expr(not self.pingpong or self.bulk_row_double_buffer):
                 if is_tma_warp:
                     cute.arch.cp_async_bulk_wait_group(0, read=True)
                 epilogue_barrier.arrive_and_wait()
-            # Pingpong already waited before signaling the incoming WG's epi
-            # barrier, so its handoff supplies the buffer-reuse synchronization.
+            # With private pingpong buffers, this drains the same WG's previous tile
+            # (i-2), not the peer's tile (i-1). Shared-buffer pingpong already drained
+            # before signaling the incoming WG's epi barrier.
 
         epi_tensors = self.epi_begin(
             params,
