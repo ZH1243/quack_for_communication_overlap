@@ -1313,8 +1313,17 @@ class GemmSm90(GemmTmaBase):
             sD_wg = sD
             if const_expr(self.bulk_row_double_buffer):
                 # Each WG retains the same subtile layout within its own full-tile buffer.
+                # Pointer arithmetic with a runtime WG index loses divisibility metadata.
+                # The full-tile stride is a multiple of 16 bytes, as required by STSM
+                # and the bulk stores. Express that guarantee in element units.
+                d_alignment_elements = 128 // self.d_dtype.width
+                assert cute.cosize(epi_smem_layout) % d_alignment_elements == 0
+                d_wg_offset = cute.assume(
+                    warp_group_idx * cute.cosize(epi_smem_layout),
+                    divby=d_alignment_elements,
+                )
                 sD_wg = cute.make_tensor(
-                    sD.iterator + warp_group_idx * cute.cosize(epi_smem_layout),
+                    sD.iterator + d_wg_offset,
                     epi_smem_layout,
                 )
             if const_expr(self.pingpong):
