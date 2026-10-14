@@ -852,7 +852,8 @@ class GemmSm90(GemmTmaBase):
         )
 
         epi_smem_size = cute.cosize(self.epi_smem_layout_staged) if mD is not None else 0
-        if self.bulk_row_double_buffer:
+        # This branch is inside @cute.jit: keep the MemRange extent compile-time.
+        if const_expr(self.bulk_row_double_buffer):
             epi_smem_size *= 2
         epi_c_smem_size = cute.cosize(self.epi_c_smem_layout_staged) if mC is not None else 0
         aux_a_smem_size = 0
