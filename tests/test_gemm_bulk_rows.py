@@ -1004,3 +1004,46 @@ def test_bulk_rows_double_buffer_reuse(mode, out_dtype, k, swizzle):
             single_buffer_output = output.clone()
         else:
             torch.testing.assert_close(output, single_buffer_output, atol=0, rtol=0)
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("mode", ["bulk_rows", "bulk_rows_reduce"])
+@pytest.mark.parametrize("rows", [32, 64, 65, 96, 128])
+def test_bulk_store_rows(mode, rows):
+    """Partial stores restart at each expert and preserve omitted rows, including tails."""
+    torch.manual_seed(17)
+    counts = (0, 137, 259)
+    offsets = (0, 0, 137, 396)
+    k, n = 256, 136
+    a = torch.randn(offsets[-1], k, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(len(counts), k, n, device="cuda", dtype=a.dtype) / math.sqrt(k)
+    cu_seqlens = torch.tensor(offsets, device="cuda", dtype=torch.int32)
+    output = torch.empty(offsets[-1], n, device="cuda", dtype=a.dtype)
+    # Exercise distinct cached row limits on the same tensors, including the default.
+    for limit in (rows, None, rows):
+        output.fill_(0.5)
+        gemm(
+            a, weights.transpose(1, 2), output,
+            tile_M=128, tile_N=128, cluster_M=2, cluster_N=1,
+            pingpong=True, persistent=True, is_dynamic_persistent=False,
+            cu_seqlens_m=cu_seqlens, epilogue_store=mode, bulk_store_rows=limit,
+        )
+        for expert, (start, end) in enumerate(zip(offsets, offsets[1:])):
+            if start == end:
+                continue
+            written = torch.arange(end - start, device="cuda") % 128 < (
+                128 if limit is None else limit
+            )
+            reference = a[start:end].float() @ weights[expert].float()
+            baseline = (a[start:end] @ weights[expert]).float()
+            baseline_error = (baseline - reference).abs().max().item()
+            if mode == "bulk_rows_reduce":
+                reference = (reference.to(a.dtype).float() + 0.5).to(a.dtype).float()
+            actual = output[start:end]
+            torch.testing.assert_close(
+                actual[written].float(), reference[written],
+                atol=2 * baseline_error + 1e-3, rtol=1e-3,
+            )
+            torch.testing.assert_close(
+                actual[~written], torch.full_like(actual[~written], 0.5), atol=0, rtol=0,
+            )

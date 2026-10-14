@@ -173,6 +173,7 @@ class GemmSm90(GemmTmaBase):
         n_tile_major_output: bool = False,
         bulk_row_double_buffer: bool = False,
         bulk_row_swizzle: bool = False,
+        bulk_store_rows: Optional[int] = None,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -200,6 +201,12 @@ class GemmSm90(GemmTmaBase):
             raise ValueError("bulk_row_double_buffer requires pingpong and bulk-row stores")
         if bulk_row_swizzle and epilogue_store not in ("bulk_rows", "bulk_rows_reduce"):
             raise ValueError("bulk_row_swizzle requires bulk-row stores")
+        if bulk_store_rows is not None:
+            if epilogue_store not in ("bulk_rows", "bulk_rows_reduce"):
+                raise ValueError("bulk_store_rows requires bulk-row stores")
+            if not isinstance(bulk_store_rows, int) or not 1 <= bulk_store_rows <= tile_shape_mnk[0]:
+                raise ValueError("bulk_store_rows must be an integer in [1, tile_M]")
+        self.bulk_store_rows = bulk_store_rows
         self.bulk_row_swizzle = bulk_row_swizzle
         self.bulk_row_double_buffer = bulk_row_double_buffer
         self.bulk_row_reduce = epilogue_store == "bulk_rows_reduce"
@@ -1810,9 +1817,11 @@ class GemmSm90(GemmTmaBase):
         col_start = tile_coord[1] * tile_n
         store_bytes = cutlass.min(tile_n, gD.shape[1] - col_start) * (self.d_dtype.width // 8)
         lane = tidx % cute.arch.WARP_SIZE
-        for row_block in cutlass.range_constexpr(cute.ceil_div(tile_m, cute.arch.WARP_SIZE)):
+        # Diagnostic ablation: retain full MMA/R2S staging and only shorten store issuance.
+        rows_to_store = const_expr(tile_m if self.bulk_store_rows is None else self.bulk_store_rows)
+        for row_block in cutlass.range_constexpr(cute.ceil_div(rows_to_store, cute.arch.WARP_SIZE)):
             row = row_block * cute.arch.WARP_SIZE + lane
-            if row < tile_m and row_start + row < len_m and store_bytes > 0:
+            if row < rows_to_store and row_start + row < len_m and store_bytes > 0:
                 dst_row = row_start + row
                 if const_expr(scatter_rows is not None and not self.scatter_addresses):
                     dst_row = scatter_rows[row_block]

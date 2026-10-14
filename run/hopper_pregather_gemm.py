@@ -65,6 +65,16 @@ but stores only wait for SMEM reads before the issuing warp group reuses its
 own buffer. This costs one extra output tile of SMEM and may reduce A/B stages.
 The optional wave store barrier still drains destination writes at every wave.
 
+Diagnostic store ablation: --bulk-store-rows ROWS enables stores of only the
+first ROWS (1..tile-m) of every CTA output tile, restarting at each expert.
+For tile-m=128, compare 32, 64, 96, and 128. Omitting the flag preserves full
+stores. MMA, full-tile R2S staging, SMEM allocation, and synchronization remain
+unchanged; fewer store operations AND fewer bytes/reductions are issued.
+Only ordinary pregather without gather-table, scatter, activation, or down
+projection is supported by this runner. The reference check verifies computed
+rows and exact zeros in omitted rows. Reported TFLOP/s still counts full GEMM
+work and is a diagnostic metric for an intentionally incomplete output.
+
 Both bulk_rows and bulk_rows_reduce require plain GEMM without --activation.
 Output rows must have a 16-byte-multiple width (N divisible by 8 for BF16/FP16).
 Full-tile staging uses more shared memory; use a 128x128 tile to start.
@@ -223,6 +233,14 @@ def add_kernel_arguments(parser: argparse.ArgumentParser, *, prefix: str = "") -
     add_argument("--cluster-m", type=int, default=2)
     add_argument("--max-swizzle-size", type=int, default=8)
     add_argument("--pingpong", action="store_true")
+    add_argument(
+        "--bulk-store-rows",
+        type=int,
+        default=None,
+        help="Enable diagnostic partial stores: write only the first ROWS of each M tile "
+        "(1..tile-m). Full GEMM and R2S staging still execute. Bulk modes only; "
+        "requires ordinary pregather without scatter, activation, or down projection.",
+    )
     add_argument(
         "--bulk-row-swizzle",
         action="store_true",
@@ -455,6 +473,16 @@ def validate_args(args: argparse.Namespace, *, prepacked: bool = False) -> None:
         if args.epilogue_store != "bulk_rows_reduce":
             raise ValueError(
                 "--scatter-table-with-replacement requires --epilogue-store bulk_rows_reduce"
+            )
+    if args.bulk_store_rows is not None:
+        if args.epilogue_store not in ("bulk_rows", "bulk_rows_reduce"):
+            raise ValueError("--bulk-store-rows requires bulk_rows or bulk_rows_reduce")
+        if not 1 <= args.bulk_store_rows <= args.tile_m:
+            raise ValueError("--bulk-store-rows must be in [1, --tile-m]")
+        if args.gather_table or args.scatter_table or args.activation or args.down_projection:
+            raise ValueError(
+                "--bulk-store-rows requires ordinary pregather without gather-table, "
+                "scatter-table, activation, or down-projection"
             )
     if args.bulk_row_swizzle and args.epilogue_store not in ("bulk_rows", "bulk_rows_reduce"):
         raise ValueError("--bulk-row-swizzle requires bulk_rows or bulk_rows_reduce")
@@ -787,6 +815,7 @@ def make_launch(args: argparse.Namespace, inputs: PregatherInputs):
                 epilogue_store=args.epilogue_store,
                 bulk_row_double_buffer=args.bulk_row_double_buffer,
                 bulk_row_swizzle=args.bulk_row_swizzle,
+                bulk_store_rows=args.bulk_store_rows,
                 scatter_table=(
                     inputs.scatter_row_addresses
                     if args.multi_buffer_scatter
@@ -821,6 +850,7 @@ def make_launch(args: argparse.Namespace, inputs: PregatherInputs):
                 epilogue_store=args.epilogue_store,
                 bulk_row_double_buffer=args.bulk_row_double_buffer,
                 bulk_row_swizzle=args.bulk_row_swizzle,
+                bulk_store_rows=args.bulk_store_rows,
             )
 
     return launch
@@ -964,6 +994,8 @@ def check_correctness(
     activation: str | None,
     atol: float,
     rtol: float,
+    bulk_store_rows: int | None = None,
+    tile_m: int = 128,
 ) -> tuple[float, float, float | None, float | None]:
     """Check every enabled GEMM output against per-expert float32 references."""
     if inputs.scatter_with_replacement:
@@ -999,6 +1031,14 @@ def check_correctness(
             if inputs.scatter_table is None
             else up_output[inputs.scatter_table[start:end].long()]
         )
+        if bulk_store_rows is not None:
+            omitted = torch.arange(end - start, device=up_actual.device) % tile_m >= bulk_store_rows
+            up_reference[omitted] = 0
+            up_baseline[omitted] = 0
+            # Require untouched rows to remain exactly zero, independent of GEMM tolerances.
+            torch.testing.assert_close(
+                up_actual[omitted], torch.zeros_like(up_actual[omitted]), atol=0, rtol=0
+            )
         if not torch.isfinite(up_actual).all():
             raise AssertionError(f"expert {expert} up output contains NaN or infinity")
         up_error = (up_actual.float() - up_reference).abs().max().item()
@@ -1137,6 +1177,11 @@ def main() -> None:
             )
     print(f"Fused activation: {args.activation or 'disabled'}")
     print(f"Epilogue store: {args.epilogue_store}, pingpong: {args.pingpong}")
+    if args.bulk_store_rows is not None:
+        print(
+            f"Diagnostic partial stores: first {args.bulk_store_rows}/{args.tile_m} rows per tile; "
+            "remaining rows stay zero. Throughput counts full GEMM FLOPs."
+        )
     if args.bulk_row_swizzle:
         print("Bulk-row swizzle: enabled (TMA-style SMEM, 16-byte bulk stores)")
     if args.bulk_row_double_buffer:
@@ -1203,6 +1248,8 @@ def main() -> None:
             activation=args.activation,
             atol=args.atol,
             rtol=args.rtol,
+            bulk_store_rows=args.bulk_store_rows,
+            tile_m=args.tile_m,
         )
         if max_down_error is not None and max_down_allowed is not None:
             print(
