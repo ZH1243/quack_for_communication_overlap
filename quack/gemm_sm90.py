@@ -172,6 +172,7 @@ class GemmSm90(GemmTmaBase):
         epilogue_store: str = "tma",
         n_tile_major_output: bool = False,
         bulk_row_double_buffer: bool = False,
+        bulk_row_swizzle: bool = False,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -197,6 +198,9 @@ class GemmSm90(GemmTmaBase):
             not pingpong or epilogue_store not in ("bulk_rows", "bulk_rows_reduce")
         ):
             raise ValueError("bulk_row_double_buffer requires pingpong and bulk-row stores")
+        if bulk_row_swizzle and epilogue_store not in ("bulk_rows", "bulk_rows_reduce"):
+            raise ValueError("bulk_row_swizzle requires bulk-row stores")
+        self.bulk_row_swizzle = bulk_row_swizzle
         self.bulk_row_double_buffer = bulk_row_double_buffer
         self.bulk_row_reduce = epilogue_store == "bulk_rows_reduce"
         self.bulk_row_store = epilogue_store in ("bulk_rows", "bulk_rows_reduce")
@@ -560,7 +564,7 @@ class GemmSm90(GemmTmaBase):
             self.c_layout,
             self.epi_c_stage,
         )
-        if self.bulk_row_store:
+        if self.bulk_row_store and not self.bulk_row_swizzle:
             # A full row-major tile, viewed as epilogue subtiles. The last
             # hierarchical mode selects a subtile's *position*, not a ring
             # buffer slot; all pieces remain live until the row copies issue.
@@ -1102,7 +1106,7 @@ class GemmSm90(GemmTmaBase):
             )
         sD = None
         if const_expr(has_D):
-            if const_expr(self.bulk_row_store):
+            if const_expr(self.bulk_row_store and not self.bulk_row_swizzle):
                 sD = storage.sD.get_tensor(epi_smem_layout)
             else:
                 sD = storage.sD.get_tensor(epi_smem_layout.outer, swizzle=epi_smem_layout.inner)
@@ -1324,7 +1328,7 @@ class GemmSm90(GemmTmaBase):
                 )
                 sD_wg = cute.make_tensor(
                     sD.iterator + d_wg_offset,
-                    epi_smem_layout,
+                    sD.layout,
                 )
             if const_expr(self.pingpong):
                 tidx = tidx % self.num_threads_per_warp_group
@@ -1790,8 +1794,10 @@ class GemmSm90(GemmTmaBase):
         """Called by all 32 store-warp lanes after the full-tile R2S fence/barrier.
 
         Linear bulk copies do not apply a tensor descriptor's swizzle or OOB
-        handling. Rows in sD are contiguous; the caller supplies a batch-offset
-        ordinary GMEM tensor, and each lane predicates its sequence-local row.
+        handling. By default rows in sD are contiguous; bulk_row_swizzle instead
+        resolves each 16-byte chunk through the swizzled subtile layout.
+        The caller supplies a batch-offset ordinary GMEM tensor, and each lane
+        predicates its sequence-local row.
         With scatter_rows, gD is the global output base and each lane uses its
         prefetched destination indices, while keeping the same source bounds.
         In address mode these registers instead hold int64 destination-row
@@ -1827,13 +1833,34 @@ class GemmSm90(GemmTmaBase):
                         dst_ptr = dst_ptr + col_start
                 else:
                     dst_ptr = gD.iterator + cute.crd2idx((dst_row, col_start), gD.layout)
-                copy_utils.cpasync_bulk_s2g(
-                    sD.iterator + row * tile_n,
-                    dst_ptr,
-                    store_bytes,
-                    reduction_kind="add" if const_expr(self.bulk_row_reduce) else None,
-                    dtype=self.d_dtype,
-                )
+                if const_expr(self.bulk_row_swizzle):
+                    # Standard TMA swizzles preserve order inside each 16-byte chunk.
+                    # All subtiles remain live, with N-subtile varying fastest.
+                    epi_m, epi_n = self.epi_tile
+                    chunk_elems = const_expr(128 // self.d_dtype.width)
+                    for chunk in cutlass.range(tile_n // chunk_elems):
+                        col = chunk * chunk_elems
+                        if chunk * 16 < store_bytes:
+                            stage = (row // epi_m) * (tile_n // epi_n) + col // epi_n
+                            offset = cute.crd2idx((row % epi_m, col % epi_n, stage), sD.layout)
+                            # Materialize the pointer swizzle before passing a raw address
+                            # to the linear bulk instruction (which cannot unswizzle).
+                            src_ptr = copy_utils.swizzle_ptr(sD.iterator + offset)
+                            copy_utils.cpasync_bulk_s2g(
+                                src_ptr,
+                                dst_ptr + col,
+                                16,
+                                reduction_kind="add" if const_expr(self.bulk_row_reduce) else None,
+                                dtype=self.d_dtype,
+                            )
+                else:
+                    copy_utils.cpasync_bulk_s2g(
+                        sD.iterator + row * tile_n,
+                        dst_ptr,
+                        store_bytes,
+                        reduction_kind="add" if const_expr(self.bulk_row_reduce) else None,
+                        dtype=self.d_dtype,
+                    )
 
     def canonical_a_load(self, tiled_mma, sA, tidx, tCrA):
         """The arch's canonical A-fragment produce (the seam transforms wrap
@@ -2232,7 +2259,7 @@ class GemmSm90(GemmTmaBase):
         # setmaxnreg cap and the split's few extra registers spill to local
         # (measured ~150MB STL, a net loss; same for a mirrored LDS split).
         return (
-            not self.bulk_row_store
+            (not self.bulk_row_store or self.bulk_row_swizzle)
             and self.d_dtype is not None
             and self.d_dtype.width == 32
             and (self.d_layout is None or self.d_layout.is_n_major_c())

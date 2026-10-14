@@ -35,7 +35,8 @@ pytestmark = pytest.mark.skipif(
     ],
     ids=["bf16", "fp16", "fp32_output"],
 )
-def test_bulk_rows_gather(routing, pingpong, double_buffer, mode, n, dtype, out_dtype):
+@pytest.mark.parametrize("swizzle", [False, True], ids=["linear", "swizzled"])
+def test_bulk_rows_gather(routing, pingpong, double_buffer, mode, n, dtype, out_dtype, swizzle):
     """Ragged/empty experts, N tails, padded pitches, persistent reuse and graph replay.
 
     The large final expert has more tiles than resident CTAs on H100/H200,
@@ -97,6 +98,7 @@ def test_bulk_rows_gather(routing, pingpong, double_buffer, mode, n, dtype, out_
             out,
             epilogue_store=mode,
             bulk_row_double_buffer=double_buffer and mode != "tma",
+            bulk_row_swizzle=swizzle and mode != "tma",
             **config,
         )
 
@@ -144,7 +146,8 @@ def test_bulk_rows_gather(routing, pingpong, double_buffer, mode, n, dtype, out_
 @torch.inference_mode()
 @pytest.mark.parametrize("mode", ["bulk_rows", "bulk_rows_reduce"])
 @pytest.mark.parametrize("scatter", [False, True], ids=["ordered", "scatter"])
-def test_table_bulk_rows_output_view(mode, scatter):
+@pytest.mark.parametrize("swizzle", [False, True], ids=["linear", "swizzled"])
+def test_table_bulk_rows_output_view(mode, scatter, swizzle):
     """Table offsets preserve plain D's N mode, row pitch, and partial-row bounds."""
     torch.manual_seed(7)
     routes, n, k = 3, 136, 128
@@ -175,6 +178,7 @@ def test_table_bulk_rows_output_view(mode, scatter):
         A_idx=indices,
         gather_work_table=table,
         epilogue_store=mode,
+        bulk_row_swizzle=swizzle,
         scatter_table=mapping,
     )
     reference = torch.cat(
@@ -198,7 +202,9 @@ def test_table_bulk_rows_output_view(mode, scatter):
 @pytest.mark.parametrize(
     "tile_m,pingpong,double_buffer", [(256, False, False), (128, True, False), (128, True, True)]
 )
-def test_bulk_rows_dense_linear_epilogue(tile_m, pingpong, double_buffer, mode):
+@pytest.mark.parametrize("swizzle", [False, True], ids=["linear", "swizzled"])
+@pytest.mark.parametrize("tile_n", [112, 128])
+def test_bulk_rows_dense_linear_epilogue(tile_m, pingpong, double_buffer, mode, swizzle, tile_n):
     """The full-tile store preserves C, alpha/beta, and batch addressing."""
     torch.manual_seed(7)
     dtype = torch.bfloat16
@@ -212,7 +218,7 @@ def test_bulk_rows_dense_linear_epilogue(tile_m, pingpong, double_buffer, mode):
         C=c,
         tile_count_semaphore=None,
         tile_M=tile_m,
-        tile_N=128,
+        tile_N=tile_n,
         cluster_M=2,
         cluster_N=1,
         pingpong=pingpong,
@@ -227,6 +233,7 @@ def test_bulk_rows_dense_linear_epilogue(tile_m, pingpong, double_buffer, mode):
             out,
             epilogue_store=store_mode,
             bulk_row_double_buffer=double_buffer and store_mode != "tma",
+            bulk_row_swizzle=swizzle and store_mode != "tma",
             **config,
         )
     reference = 0.5 * (a.float() @ b.float().transpose(1, 2)) + 0.25 * c.float()
@@ -236,6 +243,7 @@ def test_bulk_rows_dense_linear_epilogue(tile_m, pingpong, double_buffer, mode):
     torch.testing.assert_close(output.float(), reference, atol=2 * baseline_error + 1e-3, rtol=1e-3)
 
     config["bulk_row_double_buffer"] = double_buffer
+    config["bulk_row_swizzle"] = swizzle
     if mode == "bulk_rows_reduce":
         # A nonzero destination distinguishes a real reduction from a plain copy.
         initial = torch.randn_like(output)
@@ -530,7 +538,8 @@ def test_bulk_rows_scatter(routing, pingpong, mode, dtype):
 @pytest.mark.parametrize("pingpong", [False, True], ids=["cooperative", "pingpong"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 @pytest.mark.parametrize("collision", ["concentrated", "persistent"])
-def test_bulk_rows_scatter_duplicates(routing, pingpong, dtype, collision):
+@pytest.mark.parametrize("swizzle", [False, True], ids=["linear", "swizzled"])
+def test_bulk_rows_scatter_duplicates(routing, pingpong, dtype, collision, swizzle):
     """Exact sums expose lost updates without hiding behind rounding tolerances.
 
     Collisions cross lanes, CTAs, and experts. Concentrated collisions hit seven
@@ -552,6 +561,7 @@ def test_bulk_rows_scatter_duplicates(routing, pingpong, dtype, collision):
     for expert in range(len(counts)):
         weights[expert, 0, :] = expert
     config = dict(
+        bulk_row_swizzle=swizzle,
         C=None,
         tile_count_semaphore=None,
         tile_M=128,
@@ -625,7 +635,8 @@ def test_bulk_rows_scatter_duplicates(routing, pingpong, dtype, collision):
 @pytest.mark.parametrize("tiled", [False, True])
 @pytest.mark.parametrize("n", [136, 256])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-def test_multi_buffer_scatter(routing, pingpong, reduce, tiled, n, dtype):
+@pytest.mark.parametrize("swizzle", [False, True], ids=["linear", "swizzled"])
+def test_multi_buffer_scatter(routing, pingpong, reduce, tiled, n, dtype, swizzle):
     """Separate allocations/pitches, N/M tails, collisions, guards and graph replay."""
     from quack.gemm import build_scatter_row_addresses
     from run.hopper_gather_table_gemm import build_work_table
@@ -649,6 +660,7 @@ def test_multi_buffer_scatter(routing, pingpong, reduce, tiled, n, dtype):
     ids = torch.bucketize(destinations, offsets[1:], right=True)
     mapping = torch.stack((ids, destinations - offsets[ids]), dim=1).int()
     config = dict(
+        bulk_row_swizzle=swizzle,
         C=None, tile_count_semaphore=None, tile_M=128, tile_N=128,
         cluster_M=2, cluster_N=1, pingpong=pingpong, max_swizzle_size=1,
         epilogue_store="bulk_rows_reduce" if reduce else "bulk_rows",
@@ -930,10 +942,12 @@ def test_n_tile_major_runner(monkeypatch, mode, expert_waves):
 @pytest.mark.parametrize("mode", ["bulk_rows", "bulk_rows_reduce"])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("k", [64, 256])
-def test_bulk_rows_double_buffer_reuse(mode, out_dtype, k):
+@pytest.mark.parametrize("swizzle", [False, True], ids=["linear", "swizzled"])
+def test_bulk_rows_double_buffer_reuse(mode, out_dtype, k, swizzle):
     """Many persistent tiles force both WGs to reuse their private D buffers.
 
-    Alternate the flag on identical metadata to exercise both host/JIT cache keys.
+    Alternate swizzling and double buffering on identical metadata to exercise
+    both host/JIT cache keys.
     Tail rows/columns, repeated launches, and nonzero reduction destinations catch
     stale data, incorrect WG offsets, and premature buffer reuse.
     """
@@ -946,6 +960,7 @@ def test_bulk_rows_double_buffer_reuse(mode, out_dtype, k):
     reference = a.float() @ b.float().T
     baseline = (a @ b.T).to(out_dtype).float()
     config = dict(
+        bulk_row_swizzle=swizzle,
         tile_M=128,
         tile_N=128,
         tile_K=64,
@@ -957,7 +972,8 @@ def test_bulk_rows_double_buffer_reuse(mode, out_dtype, k):
         epilogue_store=mode,
     )
     single_buffer_output = None
-    for double_buffer in (False, True, True, False):
+    for double_buffer, use_swizzle in ((False, False), (True, swizzle), (True, False), (False, swizzle)):
+        config["bulk_row_swizzle"] = use_swizzle
         output.copy_(initial)
         gemm(a, b, output, bulk_row_double_buffer=double_buffer, **config)
         expected = reference

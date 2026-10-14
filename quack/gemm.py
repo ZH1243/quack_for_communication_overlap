@@ -100,6 +100,7 @@ def _compile_gemm(
     n_tile_major_output=False,
     has_wave_store_counter=False,
     bulk_row_double_buffer=False,
+    bulk_row_swizzle=False,
 ):
     sm_to_cls = {
         8: GemmDefaultSm80,
@@ -271,6 +272,7 @@ def _compile_gemm(
         gather_table_num_buffers=gather_table_num_buffers,
         epilogue_store=epilogue_store,
         bulk_row_double_buffer=bulk_row_double_buffer,
+        bulk_row_swizzle=bulk_row_swizzle,
         n_tile_major_output=n_tile_major_output,
     )
 
@@ -654,6 +656,8 @@ def gemm(
     n_tile_major_output: bool = False,
     # SM90 bulk-row pingpong: one D staging buffer per WG; epilogues stay ordered.
     bulk_row_double_buffer: bool = False,
+    # SM90 bulk-row stores: TMA-style swizzled subtiles, copied in 16-byte chunks.
+    bulk_row_swizzle: bool = False,
 ) -> _GemmPlan:
     if n_tile_major_output:
         if scatter_table is None or epilogue_store not in ("bulk_rows", "bulk_rows_reduce"):
@@ -764,6 +768,7 @@ def gemm(
         multi_buffer_gather,
         epilogue_store,
         bulk_row_double_buffer,
+        bulk_row_swizzle,
         A_idx is not None,
         batch_idx_permute is not None,
         tile_count_semaphore is not None,
@@ -845,6 +850,7 @@ def gemm(
             SFDCol=SFDCol,
             epilogue_store=epilogue_store,
             bulk_row_double_buffer=bulk_row_double_buffer,
+            bulk_row_swizzle=bulk_row_swizzle,
             scatter_table=scatter_table,
             multi_buffer_scatter=multi_buffer_scatter,
             n_tile_major_output=n_tile_major_output,
@@ -1048,6 +1054,7 @@ def _build_gemm_plan(
     multi_buffer_scatter=False,
     n_tile_major_output=False,
     bulk_row_double_buffer=False,
+    bulk_row_swizzle=False,
 ) -> _GemmPlan:
     if wave_store_counter is not None:
         if (
@@ -1267,6 +1274,8 @@ def _build_gemm_plan(
         assert B.stride(-2) == 1, "varlen_k requires B to be n-major"
 
     device_capacity = get_device_capacity(A.device)
+    if bulk_row_swizzle and epilogue_store not in ("bulk_rows", "bulk_rows_reduce"):
+        raise ValueError("bulk_row_swizzle requires bulk-row stores")
     if bulk_row_double_buffer and (
         not pingpong or epilogue_store not in ("bulk_rows", "bulk_rows_reduce")
     ):
@@ -1505,6 +1514,7 @@ def _build_gemm_plan(
         n_tile_major_output,
         wave_store_counter is not None,
         bulk_row_double_buffer=bulk_row_double_buffer,
+        bulk_row_swizzle=bulk_row_swizzle,
     )
 
     cluster_size = cluster_M * cluster_N * cluster_K

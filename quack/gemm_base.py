@@ -81,6 +81,7 @@ class GemmBase:
     arch = 0
     bulk_row_store = False
     bulk_row_double_buffer = False
+    bulk_row_swizzle = False
     # Epilogue mixins that need a reduction over the full accumulator tile
     # BEFORE any subtile is stored (e.g. QK-norm's per-head sum of squares)
     # set this in epi_to_underlying_arguments. The epilogue then runs a
@@ -480,7 +481,10 @@ class GemmBase:
                 if const_expr(use_tma_epi):
                     epilogue_barrier.arrive_and_wait()
                 iket.range_pop()
-            if const_expr(self.bulk_row_store):
+            if const_expr(self.bulk_row_swizzle):
+                # Retain every TMA-layout subtile, ordered by logical (M, N).
+                epi_buffer = epi_coord[0] * epi_tile_shape[1] + epi_coord[1]
+            elif const_expr(self.bulk_row_store):
                 epi_buffer = epi_coord
             else:
                 epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
