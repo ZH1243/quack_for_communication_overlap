@@ -1307,9 +1307,13 @@ class GemmSm90(GemmTmaBase):
             # Partition global tensor for TiledMMA_A/B/C
             tidx, _, _ = cute.arch.thread_idx()
             warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
+            # Keep this view local to the math-WG branch. Rebinding the outer sD
+            # to a dynamically offset pointer changes its DSL container structure
+            # and would require an incompatible merge with the producer branch.
+            sD_wg = sD
             if const_expr(self.bulk_row_double_buffer):
                 # Each WG retains the same subtile layout within its own full-tile buffer.
-                sD = cute.make_tensor(
+                sD_wg = cute.make_tensor(
                     sD.iterator + warp_group_idx * cute.cosize(epi_smem_layout),
                     epi_smem_layout,
                 )
@@ -1579,7 +1583,7 @@ class GemmSm90(GemmTmaBase):
                     if const_expr(self.bulk_row_store):
                         copy_D = partial(
                             self.epilog_bulk_store_rows,
-                            sD,
+                            sD_wg,
                             d_tensor,
                             d_tile_coord,
                             # Table row coordinates are CTA-local even when
@@ -1596,7 +1600,7 @@ class GemmSm90(GemmTmaBase):
                             d_tensor,
                             self.cta_tile_shape_mnk[:2],
                             self.epi_tile,
-                            sD,
+                            sD_wg,
                             d_tile_coord,
                         )
 
@@ -1623,7 +1627,7 @@ class GemmSm90(GemmTmaBase):
 
                 d_dtype_for_layout = self.d_dtype if self.d_dtype is not None else cutlass.BFloat16
                 tiled_copy_r2s, tRS_rD, tRS_sD = self.epilog_smem_store_and_partition(
-                    tiled_mma, self.d_layout, d_dtype_for_layout, sD, tidx
+                    tiled_mma, self.d_layout, d_dtype_for_layout, sD_wg, tidx
                 )
                 # (R2S, R2S_M, R2S_N, (epi_M, epi_N))
                 tRS_rAcc = self.epi_retile_acc(acc, tRS_rD, tiled_copy_r2s)
