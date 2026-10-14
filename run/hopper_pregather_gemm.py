@@ -114,8 +114,9 @@ prefix and is neither written by GEMM nor cleared by the runner. The tensor's
 allocated shape describes capacity, not the packed data's logical layout.
 
 The correctness check accounts for output-dtype accumulation rounding.
-The bulk_rows_reduce mode adds into the destination, so the runner zeros it
-before every launch, excluding zeroing from the reported GEMM time.
+All epilogue-store modes zero the output before every launch and use one
+event pair per operation, excluding zeroing from the reported GEMM time.
+This gives tma, bulk_rows, and bulk_rows_reduce the same reset/timing protocol.
 
 Fuse a SwiGLU up-projection (the weight uses concatenated [gate | up] columns):
 
@@ -836,7 +837,7 @@ def benchmark(
 ) -> list[float]:
     """Return per-operation milliseconds, excluding optional output resets.
 
-    Reduction timing uses one event pair per launch. External events become
+    With output resets, timing uses one event pair per launch. External events become
     actual record nodes in a CUDA graph, so their timestamps update on replay.
     Zeroing precedes the start event on the same stream, outside the interval.
     Ordinary-launch timing can still include host enqueue gaps; prefer graphs.
@@ -1166,10 +1167,10 @@ def main() -> None:
     print(f"Compiling and warming up the specialized QuACK {compile_target}...")
 
     launch = make_launch(args, inputs)
-    reset_output = inputs.zero_up_output if args.epilogue_store == "bulk_rows_reduce" else None
+    # Match memory preparation and event placement across all epilogue-store modes.
+    reset_output = inputs.zero_up_output
     for _ in range(max(1, args.warmup)):
-        if reset_output is not None:
-            reset_output()
+        reset_output()
         launch()
     torch.cuda.synchronize(device)
 
@@ -1185,12 +1186,10 @@ def main() -> None:
     down_flops = 2 * args.routes * args.output_dim * args.hidden if args.down_projection else 0
     flops = up_flops + down_flops
     tflops = flops / (median_ms * 1e9)
-    timing_kind = "CUDA graph + events" if not args.no_cuda_graph else "batched CUDA events"
-    if reset_output is not None:
-        timing_kind = (
-            "CUDA graph + per-GEMM events" if not args.no_cuda_graph else "per-GEMM CUDA events"
-        )
-        timing_kind += " (output zeroing excluded)"
+    timing_kind = (
+        "CUDA graph + per-GEMM events" if not args.no_cuda_graph else "per-GEMM CUDA events"
+    )
+    timing_kind += " (output zeroing excluded)"
     formatted_samples = ", ".join(f"{value:.4f}" for value in timings_ms)
     print(f"Timing method: {timing_kind}")
     operation_name = "two-GEMM MLP" if args.down_projection else "up GEMM"

@@ -320,6 +320,8 @@ def test_bulk_rows_reduce_benchmark(use_cuda_graph):
     ("runner_variant", "destination_rows"),
     [
         ("gather", None),
+        ("pregather_tma", None),
+        ("pregather_bulk", None),
         ("pregather_scatter", None),
         ("pregather_duplicates", None),
         ("pregather_duplicates", 1),
@@ -327,7 +329,7 @@ def test_bulk_rows_reduce_benchmark(use_cuda_graph):
         ("pregather_duplicates", 258),
     ],
 )
-def test_bulk_rows_reduce_runner_main(
+def test_bulk_rows_runner_main(
     monkeypatch, use_cuda_graph, runner_variant, destination_rows
 ):
     """Enter main outside inference mode, as the CLI does, and check its output."""
@@ -344,7 +346,11 @@ def test_bulk_rows_reduce_runner_main(
         "--warmup 2 --iterations 2 --timing-samples 2 "
         "--epilogue-store bulk_rows_reduce --pingpong"
     ).split()
-    if runner_variant != "gather":
+    if runner_variant in ("pregather_tma", "pregather_bulk"):
+        argv[argv.index("--epilogue-store") + 1] = (
+            "tma" if runner_variant == "pregather_tma" else "bulk_rows"
+        )
+    elif runner_variant != "gather":
         argv.extend(("--gather-table", "--scatter-table"))
     if runner_variant == "pregather_duplicates":
         argv.append("--scatter-table-with-replacement")
@@ -362,6 +368,15 @@ def test_bulk_rows_reduce_runner_main(
         return inputs
 
     monkeypatch.setattr(runner, "prepare_inputs", capture_inputs)
+    benchmark = runner.benchmark
+
+    def benchmark_with_reset(launch, **kwargs):
+        # Every mode must select per-operation events with output resets.
+        # The numerical reference below also checks the captured launches.
+        assert callable(kwargs.get("reset_output"))
+        return benchmark(launch, **kwargs)
+
+    monkeypatch.setattr(runner, "benchmark", benchmark_with_reset)
     # Do not decorate this test with inference_mode: that would hide the bug.
     with torch.inference_mode(False):
         runner.main()
@@ -415,7 +430,7 @@ def test_bulk_rows_reduce_runner_main(
         baseline_error = (baseline - reference).abs().max().item()
         actual = (
             inputs.output[lo:hi]
-            if runner_variant == "gather"
+            if runner_variant in ("gather", "pregather_tma", "pregather_bulk")
             else inputs.output[inputs.scatter_table[lo:hi].long()]
         )
         torch.testing.assert_close(
