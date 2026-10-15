@@ -804,7 +804,7 @@ def make_launch(args: argparse.Namespace, inputs: TableGatherInputs):
     # kernel-side counter resets must be valid even when the caller is not in
     # inference mode (the CLI and CUDA graph capture both use this closure).
     @torch.inference_mode()
-    def launch() -> None:
+    def launch(*, reset_events=None) -> None:
         if inputs.original_X is not None:
             # Benchmark each invocation on identical inputs, including graph replay.
             for buffer, original in zip(inputs.X, inputs.original_X):
@@ -851,7 +851,11 @@ def make_launch(args: argparse.Namespace, inputs: TableGatherInputs):
         if down_launch is not None:
             # A reduction must start fresh on every invocation, including graph replay.
             if inputs.down_args.epilogue_store == "bulk_rows_reduce":
+                if reset_events is not None:
+                    reset_events[0].record()
                 inputs.down_inputs.zero_up_output()
+                if reset_events is not None:
+                    reset_events[1].record()
             down_launch()
         elif args.down_projection:
             assert B_down is not None and inputs.cu_seqlens_m is not None
@@ -881,18 +885,47 @@ def make_launch(args: argparse.Namespace, inputs: TableGatherInputs):
     return launch
 
 
+@dataclass
+class PipelineTimings:
+    including_reset_ms: list[float]
+    reset_ms: list[float]
+    excluding_reset_ms: list[float]
+
+
 @torch.inference_mode()
-def benchmark(launch, *, iterations: int, samples: int, use_cuda_graph: bool) -> list[float]:
+def benchmark(
+    launch, *, iterations: int, samples: int, use_cuda_graph: bool, measure_reset: bool = False
+) -> PipelineTimings:
+    """Time the whole pipeline and subtract its measured output-reset intervals.
+
+    Reset events stay between the up and down GEMMs. External events update on
+    graph replay. Input restoration (if enabled) remains in both pipeline times.
+    Ordinary launches can include host enqueue gaps; prefer CUDA graphs.
+    """
+    reset_events = [
+        (
+            torch.cuda.Event(enable_timing=True, external=use_cuda_graph),
+            torch.cuda.Event(enable_timing=True, external=use_cuda_graph),
+        )
+        for _ in range(iterations)
+    ] if measure_reset else []
+
+    def measured_launches():
+        for i in range(iterations):
+            if measure_reset:
+                launch(reset_events=reset_events[i])
+            else:
+                launch()
+
     graph = None
     if use_cuda_graph:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            for _ in range(iterations):
-                launch()
+            measured_launches()
         graph.replay()
         torch.cuda.synchronize()
 
-    timings_ms = []
+    timings = PipelineTimings([], [], [])
     for _ in range(samples):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
@@ -900,12 +933,15 @@ def benchmark(launch, *, iterations: int, samples: int, use_cuda_graph: bool) ->
         if graph is not None:
             graph.replay()
         else:
-            for _ in range(iterations):
-                launch()
+            measured_launches()
         end.record()
         end.synchronize()
-        timings_ms.append(start.elapsed_time(end) / iterations)
-    return timings_ms
+        total_ms = start.elapsed_time(end) / iterations
+        reset_ms = sum(a.elapsed_time(b) for a, b in reset_events) / iterations
+        timings.including_reset_ms.append(total_ms)
+        timings.reset_ms.append(reset_ms)
+        timings.excluding_reset_ms.append(total_ms - reset_ms)
+    return timings
 
 
 @torch.inference_mode()
@@ -1079,13 +1115,17 @@ def main() -> None:
         launch()
     torch.cuda.synchronize(device)
 
-    timings_ms = benchmark(
+    measure_reset = (
+        inputs.down_inputs is not None and inputs.down_args.epilogue_store == "bulk_rows_reduce"
+    )
+    timings = benchmark(
         launch,
         iterations=args.iterations,
         samples=args.timing_samples,
         use_cuda_graph=not args.no_cuda_graph,
+        measure_reset=measure_reset,
     )
-    median_ms = statistics.median(timings_ms)
+    median_ms = statistics.median(timings.including_reset_ms)
     total_routes = (args.routes if args.indexed_gather else inputs.up_output.shape[0])
     up_flops = 2 * total_routes * args.hidden * inputs.W.shape[-1]
     down_flops = (
@@ -1094,9 +1134,33 @@ def main() -> None:
     )
     tflops = (up_flops + down_flops) / (median_ms * 1e9)
     operation_name = "two-GEMM MLP" if has_down_projection(args) else "up GEMM"
-    print(f"Per-operation samples (ms): {[round(value, 4) for value in timings_ms]}")
-    print(f"Median {operation_name} time: {median_ms:.4f} ms")
-    print(f"Effective throughput: {tflops:.2f} TFLOP/s")
+    if measure_reset:
+        median_without_reset_ms = statistics.median(timings.excluding_reset_ms)
+        for label, values in (
+            ("Output reset", timings.reset_ms),
+            ("Pipeline excluding reset", timings.excluding_reset_ms),
+            ("Pipeline including reset", timings.including_reset_ms),
+        ):
+            print(f"{label} per-operation samples (ms): {[round(v, 4) for v in values]}")
+        print(f"Median output reset time: {statistics.median(timings.reset_ms):.4f} ms")
+        print(
+            f"Median {operation_name} time (excluding reset): {median_without_reset_ms:.4f} ms"
+        )
+        print(f"Median {operation_name} time (including reset): {median_ms:.4f} ms")
+        print(
+            "Effective throughput (excluding reset): "
+            f"{(up_flops + down_flops) / (median_without_reset_ms * 1e9):.2f} TFLOP/s"
+        )
+        print(f"Effective throughput (including reset): {tflops:.2f} TFLOP/s")
+        print("Reset-excluded time subtracts output zeroing from the same pipeline samples.")
+        if inputs.original_X is not None:
+            print("Both throughput measurements include input restoration.")
+    else:
+        print(
+            f"Per-operation samples (ms): {[round(v, 4) for v in timings.including_reset_ms]}"
+        )
+        print(f"Median {operation_name} time: {median_ms:.4f} ms")
+        print(f"Effective throughput: {tflops:.2f} TFLOP/s")
 
     if not args.skip_check:
         max_abs_error, max_allowed_error = check_correctness(
