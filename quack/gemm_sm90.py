@@ -1036,6 +1036,9 @@ class GemmSm90(GemmTmaBase):
         wave_store_counter = (
             tile_sched_params.wave_store_counter if const_expr(self.gather_table) else None
         )
+        wave_ready_prefix = (
+            tile_sched_params.wave_ready_prefix if const_expr(self.gather_table) else None
+        )
         varlen_m = const_expr(varlen_params.cu_seqlens_m is not None or self.gather_table)
         varlen_k = const_expr(varlen_params.cu_seqlens_k is not None)
         assert not (varlen_m and varlen_k)
@@ -1528,6 +1531,24 @@ class GemmSm90(GemmTmaBase):
                                     sem="acquire",
                                     scope="gpu",
                                 )
+                            if const_expr(wave_ready_prefix is not None):
+                                # CTA 0 is present in every wave, including the tail.
+                                # Publish before its epilogue/arrival: the existing
+                                # wave ordering serializes the two pingpong publishers.
+                                bid = cute.arch.block_idx()
+                                if bid[0] == 0 and bid[1] == 0 and bid[2] == 0:
+                                    if store_wave > 0:
+                                        ready = wave_ready_prefix[store_wave - 1]
+                                        previous = Int32(0)
+                                        if store_wave > 1:
+                                            previous = wave_ready_prefix[store_wave - 2]
+                                        if ready > previous:
+                                            cute.arch.store(
+                                                (wave_store_counter.iterator + 1).llvm_ptr,
+                                                ready,
+                                                sem="release",
+                                                scope="gpu",
+                                            )
                     self.epilogue_barrier.arrive_and_wait()
                 iket.range_push("epilogue")
 
@@ -1737,6 +1758,33 @@ class GemmSm90(GemmTmaBase):
                                         sem="release",
                                         scope="gpu",
                                     )
+                                    if const_expr(wave_ready_prefix is not None):
+                                        bid = cute.arch.block_idx()
+                                        if bid[0] == 0 and bid[1] == 0 and bid[2] == 0:
+                                            if store_wave == wave_ready_prefix.shape[0] - 1:
+                                                # Report our own arrival FIRST. No next
+                                                # wave exists to observe the final one.
+                                                # Count actual scheduled CTA tiles, even
+                                                # predicated CTAs, not a rounded-up grid.
+                                                total = (
+                                                    tile_sched_params.work_table.shape[0]
+                                                    * tile_sched_params.group_size_fdd.divisor
+                                                    * cute.size(self.cluster_shape_mnk)
+                                                )
+                                                completed = cute.arch.load(
+                                                    wave_store_counter.iterator.llvm_ptr,
+                                                    Int32, sem="acquire", scope="gpu",
+                                                )
+                                                while completed < total:
+                                                    completed = cute.arch.load(
+                                                        wave_store_counter.iterator.llvm_ptr,
+                                                        Int32, sem="acquire", scope="gpu",
+                                                    )
+                                                cute.arch.store(
+                                                    (wave_store_counter.iterator + 1).llvm_ptr,
+                                                    wave_ready_prefix[store_wave],
+                                                    sem="release", scope="gpu",
+                                                )
                                 cute.arch.sync_warp()
                         else:
                             epi_store_pipeline.producer_tail()

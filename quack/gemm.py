@@ -99,6 +99,7 @@ def _compile_gemm(
     scatter_addresses=False,
     n_tile_major_output=False,
     has_wave_store_counter=False,
+    has_wave_ready_prefix=False,
     bulk_row_double_buffer=False,
     bulk_row_swizzle=False,
     bulk_store_rows=None,
@@ -227,6 +228,7 @@ def _compile_gemm(
         has_gather_table=gather_table,
         has_gather_table_ready=has_gather_table_ready,
         has_wave_store_counter=has_wave_store_counter,
+        has_wave_ready_prefix=has_wave_ready_prefix,
         gather_table_num_buffers=gather_table_num_buffers,
         gather_table_width=gather_table_width,
         multi_buffer_gather=multi_buffer_gather,
@@ -636,6 +638,11 @@ def gemm(
     gather_work_table_ready: Optional[Tensor] = None,
     # Opt-in wave store barrier: private int32[1] workspace, reset on every launch.
     wave_store_counter: Optional[Tensor] = None,
+    # Optional int32[num_waves] ready prefixes for the exact expert-wave work table.
+    # Enables publication to wave_store_counter[1]; workspace must then be int32[2].
+    # Both workspace entries are reset together on every launch. GPU consumers
+    # must acquire-load entry 1. Metadata must remain immutable during the launch.
+    wave_ready_prefix: Optional[Tensor] = None,
     # SM90: stage the full D tile and issue one linear bulk copy/reduction per row.
     # bulk_rows_reduce adds the converted epilogue result to D; callers must
     # initialize D (zero it before every launch for ordinary GEMM semantics).
@@ -767,6 +774,7 @@ def gemm(
         tensor_key(gather_work_table),
         tensor_key(gather_work_table_ready),
         tensor_key(wave_store_counter),
+        tensor_key(wave_ready_prefix),
         tuple(tensor_key(t) for t in A_buffers),
         tuple(tensor_key(t) for t in A_idx_buffers),
         multi_buffer_gather,
@@ -832,6 +840,7 @@ def gemm(
             gather_work_table=gather_work_table,
             gather_work_table_ready=gather_work_table_ready,
             wave_store_counter=wave_store_counter,
+            wave_ready_prefix=wave_ready_prefix,
             multi_buffer_gather_args=multi_buffer_gather_args,
             batch_idx_permute=batch_idx_permute,
             add_to_output=add_to_output,
@@ -881,6 +890,7 @@ def gemm(
         gather_work_table=gather_work_table,
         gather_work_table_ready=gather_work_table_ready,
         wave_store_counter=wave_store_counter,
+        wave_ready_prefix=wave_ready_prefix,
         multi_buffer_gather_args=multi_buffer_gather_args,
         batch_idx_permute=batch_idx_permute,
         SFA=SFA,
@@ -914,6 +924,11 @@ def run_gemm_plan(
     gather_work_table_ready: Optional[Tensor] = None,
     # Opt-in wave store barrier: private int32[1] workspace, reset on every launch.
     wave_store_counter: Optional[Tensor] = None,
+    # Optional int32[num_waves] ready prefixes for the exact expert-wave work table.
+    # Enables publication to wave_store_counter[1]; workspace must then be int32[2].
+    # Both workspace entries are reset together on every launch. GPU consumers
+    # must acquire-load entry 1. Metadata must remain immutable during the launch.
+    wave_ready_prefix: Optional[Tensor] = None,
     multi_buffer_gather_args: Optional[MultiBufferGatherArguments] = None,
     batch_idx_permute: Optional[Tensor] = None,
     SFA: Optional[Tensor] = None,
@@ -986,6 +1001,7 @@ def run_gemm_plan(
         gather_table=gather_work_table,
         gather_table_ready=gather_work_table_ready,
         wave_store_counter=wave_store_counter,
+        wave_ready_prefix=wave_ready_prefix,
         multi_buffer_gather=multi_buffer_gather_args,
     )
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
@@ -1034,6 +1050,7 @@ def _build_gemm_plan(
     gather_work_table,
     gather_work_table_ready,
     wave_store_counter,
+    wave_ready_prefix,
     multi_buffer_gather_args,
     batch_idx_permute,
     add_to_output,
@@ -1063,6 +1080,18 @@ def _build_gemm_plan(
     bulk_row_swizzle=False,
     bulk_store_rows=None,
 ) -> _GemmPlan:
+    if wave_ready_prefix is not None:
+        if wave_store_counter is None:
+            raise ValueError("wave_ready_prefix requires wave_store_counter")
+        if (
+            wave_ready_prefix.ndim != 1
+            or wave_ready_prefix.dtype != torch.int32
+            or not wave_ready_prefix.is_contiguous()
+            or wave_ready_prefix.device != A.device
+        ):
+            raise ValueError(
+                "wave_ready_prefix must be contiguous int32[num_waves] on the input device"
+            )
     if wave_store_counter is not None:
         if (
             gather_work_table is None
@@ -1080,12 +1109,15 @@ def _build_gemm_plan(
                 "single-buffer gather, static persistence, pingpong, and bulk-row stores"
             )
         if (
-            wave_store_counter.shape != (1,)
+            wave_store_counter.shape != ((2,) if wave_ready_prefix is not None else (1,))
             or wave_store_counter.dtype != torch.int32
             or not wave_store_counter.is_contiguous()
             or wave_store_counter.device != A.device
         ):
-            raise ValueError("wave_store_counter must be contiguous int32[1] on the input device")
+            raise ValueError(
+                "wave_store_counter must be contiguous int32[1] (int32[2] with "
+                "wave_ready_prefix) on the input device"
+            )
     if scatter_table is not None:
         if epilogue_store not in ("bulk_rows", "bulk_rows_reduce"):
             raise ValueError("scatter_table requires bulk_rows or bulk_rows_reduce")
@@ -1473,6 +1505,17 @@ def _build_gemm_plan(
     colvec_ndim = colvec_gemm.ndim if colvec_gemm is not None else 0
     sfd_norm_const_mode = 0 if sfd_norm_const is None else scalar_mode(sfd_norm_const)
     tile_shape_mnk = (tile_M, tile_N) if tile_K is None else (tile_M, tile_N, tile_K)
+    cluster_size = cluster_M * cluster_N * cluster_K
+    max_active_clusters = (
+        get_max_active_clusters(cluster_size, device_capacity=device_capacity) if persistent else 0
+    )
+    if wave_ready_prefix is not None:
+        num_work = gather_work_table.shape[0] * work_group_size
+        wave_work_ids = min(max_active_clusters, num_work)
+        num_waves = (num_work + wave_work_ids - 1) // wave_work_ids
+        if wave_ready_prefix.shape != (num_waves,):
+            raise ValueError(f"wave_ready_prefix must have {num_waves} entries for this launch")
+
     compiled_fn = _compile_gemm(
         a_dtype,
         b_dtype,
@@ -1525,15 +1568,12 @@ def _build_gemm_plan(
         multi_buffer_scatter,
         n_tile_major_output,
         wave_store_counter is not None,
+        has_wave_ready_prefix=wave_ready_prefix is not None,
         bulk_row_double_buffer=bulk_row_double_buffer,
         bulk_row_swizzle=bulk_row_swizzle,
         bulk_store_rows=bulk_store_rows,
     )
 
-    cluster_size = cluster_M * cluster_N * cluster_K
-    max_active_clusters = (
-        get_max_active_clusters(cluster_size, device_capacity=device_capacity) if persistent else 0
-    )
     scheduler_uses_semaphore = is_dynamic_persistent and device_capacity[0] <= 9
 
     # SERIAL/PARALLEL split-K passes per-call semaphore/workspace tensors through the

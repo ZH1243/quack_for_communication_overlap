@@ -12,6 +12,7 @@ from run.hopper_gather_table_gemm import (
     build_work_table,
     multi_buffer_route_counts,
 )
+from run.wave_ready import build_wave_ready_prefix
 from run.hopper_stream_gather_table_gemm import (
     build_stream_metadata,
     proxy_command,
@@ -141,13 +142,21 @@ def test_expert_waves_preserve_grouped_gemm_values(
     weights = torch.randn(len(counts), 3, output_dim, dtype=torch.float32)
     output = torch.full((sum(counts), output_dim), float("nan"))
     writes = torch.zeros_like(output, dtype=torch.int32)
-    for expert, start, end, n_base in rows:
+    prefixes = build_wave_ready_prefix(
+        rows, group_size=x, num_groups=output_dim // x, wave_work_ids=wave_work_ids
+    )
+    reference = torch.cat([chunk @ weight for chunk, weight in zip(a.split(counts), weights)])
+    for r, (expert, start, end, n_base) in enumerate(rows):
         for n in range(n_base, min(n_base + x, output_dim)):
             for cta in range(cluster_m):
                 lo = min(start + cta * tile_m, end)
                 hi = min(start + (cta + 1) * tile_m, end)
                 output[lo:hi, n : n + 1] = a[lo:hi] @ weights[expert, :, n : n + 1]
                 writes[lo:hi, n : n + 1] += 1
+        if (r + 1) % rows_per_wave == 0 or r == len(rows) - 1:
+            ready = prefixes[r // rows_per_wave] * x
+            torch.testing.assert_close(output[:, :ready], reference[:, :ready])
+            torch.testing.assert_close(writes[:, :ready], torch.ones_like(writes[:, :ready]))
     reference = torch.cat([chunk @ weight for chunk, weight in zip(a.split(counts), weights)])
     torch.testing.assert_close(output, reference)
     torch.testing.assert_close(writes, torch.ones_like(writes))

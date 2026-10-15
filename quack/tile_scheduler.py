@@ -260,6 +260,8 @@ class TileSchedulerOptions(NamedTuple):
     # buffers 1..b-1. Keeping them in one nested JIT argument makes b a static
     # specialization without imposing a fixed maximum number of buffers.
     multi_buffer_gather: Optional["MultiBufferGatherArguments"] = None
+    # Ready prefixes by completed wave; enables publication to counter[1].
+    wave_ready_prefix: Optional[cute.Tensor] = None
 
 
 @mlir_namedtuple
@@ -1121,6 +1123,7 @@ class GatherTableTileSchedulerArguments:
     multi_buffer_gather: Optional[MultiBufferGatherArguments] = None
     ready_rows: Optional[cute.Tensor] = None
     wave_store_counter: Optional[cute.Tensor] = None
+    wave_ready_prefix: Optional[cute.Tensor] = None
 
 
 class GatherTableTileScheduler(TileScheduler):
@@ -1153,6 +1156,7 @@ class GatherTableTileScheduler(TileScheduler):
         num_split_k: cutlass.Constexpr[int] = 1
         ag: Optional[AgParams] = None
         wave_store_counter: Optional[cute.Tensor] = None
+        wave_ready_prefix: Optional[cute.Tensor] = None
 
         @staticmethod
         @cute.jit
@@ -1175,6 +1179,7 @@ class GatherTableTileScheduler(TileScheduler):
                 args.multi_buffer_gather,
                 args.ready_rows,
                 wave_store_counter=args.wave_store_counter,
+                wave_ready_prefix=args.wave_ready_prefix,
             )
 
     @staticmethod

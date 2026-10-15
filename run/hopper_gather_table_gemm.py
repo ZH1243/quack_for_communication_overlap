@@ -1187,6 +1187,9 @@ def main() -> None:
         print(f"Median {operation_name} time: {median_ms:.4f} ms")
         print(f"Effective throughput: {tflops:.2f} TFLOP/s")
 
+    if inputs.down_inputs is not None and inputs.down_inputs.ready_groups is not None:
+        print(f"Down published ready_groups: {inputs.down_inputs.ready_groups.item()}")
+
     if not args.skip_check:
         max_abs_error, max_allowed_error = check_correctness(
             inputs, activation=args.activation, atol=args.atol, rtol=args.rtol

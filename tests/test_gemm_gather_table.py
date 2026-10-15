@@ -378,7 +378,8 @@ def test_stream_indexed_gather_proxy(proxy_mode, routes, extra_args):
 @pytest.mark.parametrize(
     "mode,multi_input,indexed",
     [("tma", False, False), ("waves", False, True),
-     ("multi_scatter", True, False), ("reduce", False, False)],
+     ("multi_scatter", True, False), ("reduce", False, False),
+     ("publish", True, False)],
 )
 def test_gather_table_down_projection2(mode, multi_input, indexed):
     """Compose activated gather with configurable down GEMM, including graph replay."""
@@ -409,6 +410,13 @@ def test_gather_table_down_projection2(mode, multi_input, indexed):
             "--down-gather-table-wave-barrier", "--down-pingpong",
             "--down-scatter-table", "--down-n-tile-major-output",
             "--down-epilogue-store", "bulk_rows_reduce" if mode == "reduce" else "bulk_rows",
+        ]
+    if mode == "publish":
+        flags += [
+            "--down-gather-table-publish-ready",
+            "--down-multi-buffer-scatter", "--down-scatter-output-buffers", "3",
+            "--down-epilogue-store", "bulk_rows_reduce",
+            "--down-scatter-table-with-replacement",
         ]
     if mode == "multi_scatter":
         flags += [
@@ -566,4 +574,65 @@ def test_down_combine_in_place_original_tokens(tiled):
     for _ in range(2):
         graph.replay()
         torch.cuda.synchronize()
+        verify()
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("cluster_m,single_wave", [(1, True), (1, False), (2, False)])
+def test_wave_ready_publication_tail_and_replay(monkeypatch, cluster_m, single_wave):
+    """Numerical scatter reduction plus final publication/reset on partial waves."""
+    from quack.cute_dsl_utils import get_max_active_clusters
+    from run import hopper_pregather_gemm as runner
+
+    capacity = get_max_active_clusters(cluster_m)
+    tile_m = tile_n = 128
+    # P+1 clusters per N tile gives multiple waves with a partial last wave.
+    # Both experts have M tails; cluster_M=2 includes entirely predicated CTAs.
+    counts = [3, 3] if single_wave else [tile_m * cluster_m * (capacity - 1) + 1, 3]
+    flags = [
+        "hopper_pregather_gemm.py", "--routes", str(sum(counts)),
+        "--tokens", "97", "--experts", "2", "--hidden", "64", "--output-dim", "320",
+        "--tile-m", str(tile_m), "--tile-n", str(tile_n), "--cluster-m", str(cluster_m),
+        "--pingpong", "--gather-table", "--gather-table-expert-waves",
+        "--gather-table-wave-barrier", "--gather-table-publish-ready",
+        "--max-swizzle-size", "1", "--scatter-table", "--multi-buffer-scatter",
+        "--scatter-output-buffers", "3", "--scatter-table-with-replacement",
+        "--n-tile-major-output", "--epilogue-store", "bulk_rows_reduce",
+    ]
+    monkeypatch.setattr("sys.argv", flags)
+    args = runner.parse_args()
+    runner.validate_args(args, prepacked=True)
+    torch.manual_seed(42)
+    a = torch.randn(sum(counts), args.hidden, dtype=torch.bfloat16, device="cuda")
+    weights = torch.randn(2, args.hidden, args.output_dim, dtype=a.dtype, device=a.device) / 8
+    inputs = runner.prepare_grouped_inputs(args, a, weights, counts)
+    launch = runner.make_launch(args, inputs)
+    num_work = inputs.gather_work_table.shape[0]  # x=1
+    if single_wave:
+        assert inputs.wave_ready_prefix.numel() == 1
+    else:
+        assert num_work > inputs.wave_work_ids and num_work % inputs.wave_work_ids != 0
+
+    def invoke():
+        inputs.zero_up_output()
+        launch()
+
+    def verify():
+        torch.cuda.synchronize()
+        runner.check_correctness(inputs, activation=None, atol=args.atol, rtol=args.rtol)
+        assert inputs.ready_groups.item() == 3
+        assert inputs.wave_store_workspace[0].item() == num_work * cluster_m
+
+    for _ in range(2):
+        inputs.wave_store_workspace.fill_(123456)
+        invoke()
+        verify()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        invoke()
+        invoke()
+    for scale in (0.5, -0.75):
+        a.mul_(scale)
+        inputs.wave_store_workspace.fill_(123456)
+        graph.replay()
         verify()

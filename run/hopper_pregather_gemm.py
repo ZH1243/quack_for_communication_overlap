@@ -33,6 +33,13 @@ for every preceding-wave CTA before entering its epilogue. The kernel uses a
 cooperative launch (an oversized grid is rejected by CUDA). The per-call counter
 reset is included in timing and CUDA Graph capture. The persistent cluster count must be
 divisible by the effective swizzle size.
+Add --gather-table-publish-ready to publish fully accumulated output column groups
+to inputs.ready_groups (GPU int32[1]); group width is effective_swizzle_size * tile_n.
+Requires expert waves and the wave barrier. A GPU consumer must acquire-load the
+flag before reading columns [0, ready_groups * group_width) in every output buffer.
+The final partial wave publishes explicitly. Reset is included in each launch and
+graph replay; a workspace must not be shared by concurrent invocations. In the
+two-GEMM runner use --down-gather-table-publish-ready and inputs.down_inputs.ready_groups.
 When ``--down-projection`` is enabled, the activated output is already
 expert-contiguous and feeds a second grouped GEMM using the same cu_seqlens_m.
 The pre-gather operation, compilation, warmup, graph capture, and correctness
@@ -179,6 +186,10 @@ class PregatherInputs:
     n_tile_major_tile_n: int | None = None
     scatter_output_rows: tuple[int, ...] | None = None
     wave_work_ids: int | None = None
+    wave_ready_prefix: torch.Tensor | None = None
+    wave_store_workspace: torch.Tensor | None = None
+    # GPU int32[1] view of workspace[1], reset per invocation. Acquire-load to poll.
+    ready_groups: torch.Tensor | None = None
 
     def output_buffers(self) -> tuple[torch.Tensor, ...]:
         return self.up_output if isinstance(self.up_output, tuple) else (self.up_output,)
@@ -272,6 +283,12 @@ def add_kernel_arguments(parser: argparse.ArgumentParser, *, prefix: str = "") -
             "later N groups until expert exhaustion (requires --gather-table; "
             "takes precedence over --gather-table-n-group-major)"
         ),
+    )
+    add_argument(
+        "--gather-table-publish-ready",
+        action="store_true",
+        help="Publish completed output N-group prefixes to a GPU flag (requires "
+        "--gather-table-expert-waves and --gather-table-wave-barrier)",
     )
     add_argument(
         "--gather-table-wave-barrier",
@@ -499,6 +516,13 @@ def validate_args(args: argparse.Namespace, *, prepacked: bool = False) -> None:
         raise ValueError("--scatter-table requires --epilogue-store bulk_rows or bulk_rows_reduce")
     if args.gather_table_n_group_major and not args.gather_table:
         raise ValueError("--gather-table-n-group-major requires --gather-table")
+    if getattr(args, "gather_table_publish_ready", False) and (
+        not args.gather_table_expert_waves or not args.gather_table_wave_barrier
+    ):
+        raise ValueError(
+            "--gather-table-publish-ready requires --gather-table-expert-waves "
+            "and --gather-table-wave-barrier"
+        )
     if args.gather_table_wave_barrier and (
         not args.gather_table_expert_waves
         or not args.pingpong
@@ -633,6 +657,8 @@ def prepare_grouped_inputs(
                 f"got {wave_work_ids} % {x}; choose a compatible --max-swizzle-size"
             )
     gather_work_table = None
+    wave_ready_prefix = None
+    wave_store_workspace = None
     identity_A_idx = None
     if args.gather_table:
         # Support both direct script execution and python -m run.hopper_pregather_gemm.
@@ -648,10 +674,27 @@ def prepare_grouped_inputs(
             tile_n=args.tile_n,
             cluster_m=args.cluster_m,
             max_swizzle_size=args.max_swizzle_size,
-            device=device,
+            device=torch.device("cpu") if getattr(args, "gather_table_publish_ready", False) else device,
             n_group_major=args.gather_table_n_group_major,
             wave_work_ids=wave_work_ids,
         )
+        if getattr(args, "gather_table_publish_ready", False):
+            if __package__:
+                from .wave_ready import build_wave_ready_prefix
+            else:
+                from wave_ready import build_wave_ready_prefix
+
+            prefixes = build_wave_ready_prefix(
+                gather_work_table.tolist(), group_size=x,
+                num_groups=clusters_n // x, wave_work_ids=wave_work_ids,
+            )
+            wave_ready_prefix = torch.tensor(prefixes, dtype=torch.int32, device=device)
+            # Reset together with the barrier counter; no second reset launch.
+            # This is mutable launch state even when input preparation runs in
+            # inference mode; normal callers may reset it outside inference mode.
+            with torch.inference_mode(False):
+                wave_store_workspace = torch.zeros((2,), dtype=torch.int32, device=device)
+            gather_work_table = gather_work_table.to(device)
         # Preserve the original routing indices separately from the kernel indices.
         identity_A_idx = torch.arange(args.routes, dtype=torch.int32, device=A.device)
     if output_buffers is not None:
@@ -737,6 +780,9 @@ def prepare_grouped_inputs(
         gather_work_table=gather_work_table,
         identity_A_idx=identity_A_idx,
         wave_work_ids=wave_work_ids,
+        wave_ready_prefix=wave_ready_prefix,
+        wave_store_workspace=wave_store_workspace,
+        ready_groups=wave_store_workspace[1:] if wave_store_workspace is not None else None,
     )
 
 
@@ -755,11 +801,18 @@ def make_launch(args: argparse.Namespace, inputs: PregatherInputs):
         up_A_idx = inputs.identity_A_idx
         table_kwargs = dict(gather_work_table=inputs.gather_work_table, multi_buffer_gather=False)
         if args.gather_table_wave_barrier:
-            # Private to this launch closure; quack_gemm resets it on its stream
-            # for every invocation, including invocations captured in a graph.
-            table_kwargs["wave_store_counter"] = torch.empty(
-                (1,), dtype=torch.int32, device=inputs.A.device
-            )
+            # quack_gemm resets the workspace on its stream every invocation,
+            # including graph replay. Publication exposes its second entry via
+            # inputs.ready_groups; these inputs cannot be launched concurrently.
+            if getattr(args, "gather_table_publish_ready", False):
+                assert inputs.wave_store_workspace is not None
+                assert inputs.wave_ready_prefix is not None
+                table_kwargs["wave_store_counter"] = inputs.wave_store_workspace
+                table_kwargs["wave_ready_prefix"] = inputs.wave_ready_prefix
+            else:
+                table_kwargs["wave_store_counter"] = torch.empty(
+                    (1,), dtype=torch.int32, device=inputs.A.device
+                )
 
     if args.activation is not None:
         config = GemmConfig(
@@ -1018,6 +1071,10 @@ def check_correctness(
     tile_m: int = 128,
 ) -> tuple[float, float, float | None, float | None]:
     """Check every enabled GEMM output against per-expert float32 references."""
+    if inputs.ready_groups is not None:
+        expected = inputs.wave_ready_prefix[-1].item()
+        if inputs.ready_groups.item() != expected:
+            raise AssertionError(f"ready_groups did not reach the final prefix {expected}")
     if inputs.scatter_with_replacement:
         assert activation is None and inputs.W_down is None
         return check_scatter_reduction(inputs, atol=atol, rtol=rtol)
@@ -1142,6 +1199,8 @@ def main() -> None:
         allocated_tensors.extend((inputs.W_down, inputs.output))
     if inputs.gather_work_table is not None:
         allocated_tensors.extend((inputs.gather_work_table, inputs.identity_A_idx))
+    if inputs.wave_ready_prefix is not None:
+        allocated_tensors.extend((inputs.wave_ready_prefix, inputs.wave_store_workspace))
     if inputs.scatter_table is not None:
         allocated_tensors.append(inputs.scatter_table)
     if inputs.scatter_row_addresses is not None:
@@ -1210,6 +1269,8 @@ def main() -> None:
         "enabled (cooperative launch)" if args.gather_table_wave_barrier else "disabled"
     )
     print(f"Wave store barrier: {barrier_description}")
+    if inputs.wave_ready_prefix is not None:
+        print(f"Ready-prefix publication: GPU flag, {inputs.wave_ready_prefix.numel()} waves")
     if inputs.scatter_table is not None:
         scatter_description = (
             "random destinations sampled with replacement"
@@ -1271,6 +1332,8 @@ def main() -> None:
     print(f"Median {operation_name} time (including reset): {median_total_ms:.4f} ms")
     print(f"Effective throughput (excluding reset): {tflops:.2f} TFLOP/s")
     print(f"Effective throughput (including reset): {flops / (median_total_ms * 1e9):.2f} TFLOP/s")
+    if inputs.ready_groups is not None:
+        print(f"Published ready_groups: {inputs.ready_groups.item()}")
 
     if not args.skip_check:
         max_up_error, max_up_allowed, max_down_error, max_down_allowed = check_correctness(

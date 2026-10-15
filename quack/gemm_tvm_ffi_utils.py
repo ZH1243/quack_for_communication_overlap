@@ -260,6 +260,7 @@ def make_scheduler_args(
     gather_table_ready=None,
     multi_buffer_gather=None,
     wave_store_counter=None,
+    wave_ready_prefix=None,
 ):
     return TileSchedulerOptions(
         max_active_clusters=Int32(max_active_clusters),
@@ -283,6 +284,7 @@ def make_scheduler_args(
         gather_table=gather_table,
         gather_table_ready=gather_table_ready,
         wave_store_counter=wave_store_counter,
+        wave_ready_prefix=wave_ready_prefix,
         multi_buffer_gather=multi_buffer_gather,
     )
 
@@ -298,6 +300,7 @@ def make_fake_scheduler_args(
     gather_table_width=4,
     multi_buffer_gather=None,
     has_wave_store_counter=False,
+    has_wave_ready_prefix=False,
 ):
     return TileSchedulerOptions(
         max_active_clusters=Int32(1),
@@ -348,8 +351,12 @@ def make_fake_scheduler_args(
             if has_gather_table_ready
             else None
         ),
+        wave_ready_prefix=(
+            fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=1)
+            if has_wave_ready_prefix else None
+        ),
         wave_store_counter=(
-            fake_tensor(Int32, (1,), leading_dim=0, divisibility=1)
+            fake_tensor(Int32, (2 if has_wave_ready_prefix else 1,), leading_dim=0, divisibility=1)
             if has_wave_store_counter
             else None
         ),
@@ -531,6 +538,7 @@ def plan_scheduler_args(
     gather_table_ready=None,
     multi_buffer_gather=None,
     wave_store_counter=None,
+    wave_ready_prefix=None,
 ):
     """Per-call TileSchedulerOptions for a cached plan.
 
@@ -557,6 +565,7 @@ def plan_scheduler_args(
         gather_table=gather_table,
         gather_table_ready=gather_table_ready,
         wave_store_counter=wave_store_counter,
+        wave_ready_prefix=wave_ready_prefix,
         multi_buffer_gather=multi_buffer_gather,
     )
 
