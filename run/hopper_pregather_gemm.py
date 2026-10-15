@@ -124,8 +124,9 @@ prefix and is neither written by GEMM nor cleared by the runner. The tensor's
 allocated shape describes capacity, not the packed data's logical layout.
 
 The correctness check accounts for output-dtype accumulation rounding.
-All epilogue-store modes zero the output before every launch and use one
-event pair per operation, excluding zeroing from the reported GEMM time.
+All epilogue-store modes zero the output before every launch. Three events
+bracket reset and GEMM separately in the same invocation. The runner reports
+reset time and effective throughput both excluding and including the reset.
 This gives tma, bulk_rows, and bulk_rows_reduce the same reset/timing protocol.
 
 Fuse a SwiGLU up-projection (the weight uses concatenated [gate | up] columns):
@@ -217,7 +218,7 @@ def add_kernel_arguments(parser: argparse.ArgumentParser, *, prefix: str = "") -
             kwargs["help"] = kwargs["help"].replace("--", "--" + prefix)
             kwargs["help"] = kwargs["help"].replace("--" + prefix + "routes", "--routes")
             kwargs["help"] = kwargs["help"].replace(
-                "with output zeroing excluded from timing",
+                "with throughput reported both including and excluding output zeroing",
                 "with output zeroing included in pipeline timing",
             )
         parser.add_argument(*(flag.replace("--", "--" + prefix, 1) for flag in flags), **kwargs)
@@ -340,7 +341,8 @@ def add_kernel_arguments(parser: argparse.ArgumentParser, *, prefix: str = "") -
             "Output I/O: tma uses the existing subtile tensor stores; bulk_rows stages "
             "the full tile in SMEM and issues one linear cp.async.bulk per valid row "
             "(plain GEMM only; supports --pingpong). bulk_rows_reduce uses per-row "
-            "reduce-add instead, with output zeroing excluded from timing."
+            "reduce-add instead, with throughput reported both including and excluding "
+            "output zeroing."
         ),
     )
 
@@ -856,6 +858,13 @@ def make_launch(args: argparse.Namespace, inputs: PregatherInputs):
     return launch
 
 
+@dataclass
+class BenchmarkTimings:
+    gemm_ms: list[float]
+    reset_ms: list[float]
+    total_ms: list[float]
+
+
 @torch.inference_mode()
 def benchmark(
     launch,
@@ -864,12 +873,13 @@ def benchmark(
     samples: int,
     use_cuda_graph: bool,
     reset_output=None,
-) -> list[float]:
-    """Return per-operation milliseconds, excluding optional output resets.
+) -> BenchmarkTimings:
+    """Return per-operation GEMM, reset, and reset-inclusive milliseconds.
 
-    With output resets, timing uses one event pair per launch. External events become
-    actual record nodes in a CUDA graph, so their timestamps update on replay.
-    Zeroing precedes the start event on the same stream, outside the interval.
+    With output resets, three events bracket reset and GEMM in each launch.
+    External events become actual record nodes in a CUDA graph, so their
+    timestamps update on replay.
+    All intervals come from the same invocations on the same stream.
     Ordinary-launch timing can still include host enqueue gaps; prefer graphs.
     """
     if reset_output is not None:
@@ -877,12 +887,14 @@ def benchmark(
             (
                 torch.cuda.Event(enable_timing=True, external=use_cuda_graph),
                 torch.cuda.Event(enable_timing=True, external=use_cuda_graph),
+                torch.cuda.Event(enable_timing=True, external=use_cuda_graph),
             )
             for _ in range(iterations)
         ]
 
         def measured_launches():
-            for start, end in events:
+            for reset_start, start, end in events:
+                reset_start.record()
                 reset_output()
                 start.record()
                 launch()
@@ -896,15 +908,23 @@ def benchmark(
             graph.replay()
             torch.cuda.synchronize()
 
-        timings_ms = []
+        timings = BenchmarkTimings([], [], [])
         for _ in range(samples):
             if graph is not None:
                 graph.replay()
             else:
                 measured_launches()
-            events[-1][1].synchronize()
-            timings_ms.append(sum(start.elapsed_time(end) for start, end in events) / iterations)
-        return timings_ms
+            events[-1][2].synchronize()
+            timings.gemm_ms.append(
+                sum(start.elapsed_time(end) for _, start, end in events) / iterations
+            )
+            timings.reset_ms.append(
+                sum(reset.elapsed_time(start) for reset, start, _ in events) / iterations
+            )
+            timings.total_ms.append(
+                sum(reset.elapsed_time(end) for reset, _, end in events) / iterations
+            )
+        return timings
 
     graph = None
     if use_cuda_graph:
@@ -930,7 +950,7 @@ def benchmark(
         end.record()
         end.synchronize()
         timings_ms.append(start.elapsed_time(end) / iterations)
-    return timings_ms
+    return BenchmarkTimings(timings_ms, [0.0] * samples, timings_ms.copy())
 
 
 @torch.inference_mode()
@@ -1219,14 +1239,16 @@ def main() -> None:
         launch()
     torch.cuda.synchronize(device)
 
-    timings_ms = benchmark(
+    timings = benchmark(
         launch,
         iterations=args.iterations,
         samples=args.timing_samples,
         use_cuda_graph=not args.no_cuda_graph,
         reset_output=reset_output,
     )
-    median_ms = statistics.median(timings_ms)
+    median_ms = statistics.median(timings.gemm_ms)
+    median_reset_ms = statistics.median(timings.reset_ms)
+    median_total_ms = statistics.median(timings.total_ms)
     up_flops = 2 * args.routes * args.hidden * inputs.W_up.shape[-1]
     down_flops = 2 * args.routes * args.output_dim * args.hidden if args.down_projection else 0
     flops = up_flops + down_flops
@@ -1234,13 +1256,21 @@ def main() -> None:
     timing_kind = (
         "CUDA graph + per-GEMM events" if not args.no_cuda_graph else "per-GEMM CUDA events"
     )
-    timing_kind += " (output zeroing excluded)"
-    formatted_samples = ", ".join(f"{value:.4f}" for value in timings_ms)
+    timing_kind += " (reset and GEMM measured separately in the same invocation)"
     print(f"Timing method: {timing_kind}")
     operation_name = "two-GEMM MLP" if args.down_projection else "up GEMM"
-    print(f"Per-operation samples (ms): [{formatted_samples}]")
-    print(f"Median {operation_name} time: {median_ms:.4f} ms")
-    print(f"Effective throughput: {tflops:.2f} TFLOP/s")
+    for label, values in (
+        ("Output reset", timings.reset_ms),
+        ("GEMM excluding reset", timings.gemm_ms),
+        ("GEMM including reset", timings.total_ms),
+    ):
+        formatted_samples = ", ".join(f"{value:.4f}" for value in values)
+        print(f"{label} per-operation samples (ms): [{formatted_samples}]")
+    print(f"Median output reset time: {median_reset_ms:.4f} ms")
+    print(f"Median {operation_name} time (excluding reset): {median_ms:.4f} ms")
+    print(f"Median {operation_name} time (including reset): {median_total_ms:.4f} ms")
+    print(f"Effective throughput (excluding reset): {tflops:.2f} TFLOP/s")
+    print(f"Effective throughput (including reset): {flops / (median_total_ms * 1e9):.2f} TFLOP/s")
 
     if not args.skip_check:
         max_up_error, max_up_allowed, max_down_error, max_down_allowed = check_correctness(
