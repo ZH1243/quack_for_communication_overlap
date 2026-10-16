@@ -143,6 +143,18 @@ def parse_args() -> argparse.Namespace:
         default=int(os.environ["LOCAL_RANK"]) if "LOCAL_RANK" in os.environ else None,
         help="Launcher-assigned local rank; overrides --device for the kernel and CPU proxy",
     )
+    parser.add_argument(
+        "--initial-token-exchange", action="store_true",
+        help="Fill input buffers once using CUDA IPC peer copies before warmup (single-node torchrun)",
+    )
+    parser.add_argument(
+        "--source-tokens", type=int,
+        help="Tokens in each GPU's original source buffer; required with --initial-token-exchange",
+    )
+    parser.add_argument(
+        "--token-exchange-timeout", type=float, default=120.0,
+        help="Timeout in seconds for each token-exchange shared-memory barrier (default: 120)",
+    )
     args = parser.parse_args()
     if args.local_rank is not None:
         args.device = args.local_rank
@@ -150,6 +162,25 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_stream_args(args: argparse.Namespace) -> None:
+    if args.initial_token_exchange:
+        world = int(os.environ.get("WORLD_SIZE", "0"))
+        local_world = int(os.environ.get("LOCAL_WORLD_SIZE", "0"))
+        if (world != local_world or world < 2 or args.local_rank is None
+                or not 0 <= args.local_rank < world
+                or int(os.environ.get("RANK", "-1")) != args.local_rank):
+            raise ValueError("--initial-token-exchange requires single-node torchrun with >=2 GPUs")
+        if not args.multi_buffer_gather or args.num_input_buffers != world:
+            raise ValueError("--initial-token-exchange requires --multi-buffer-gather and "
+                             "--num-input-buffers equal to --nproc-per-node")
+        if args.source_tokens is None or args.source_tokens <= 0 or args.source_tokens % world:
+            raise ValueError("--source-tokens must be positive and divisible by --nproc-per-node")
+        tokens = args.tokens_per_buffer if args.tokens_per_buffer is not None else args.tokens
+        if tokens != args.source_tokens // world:
+            raise ValueError("--tokens-per-buffer must equal --source-tokens / --nproc-per-node")
+        if not math.isfinite(args.token_exchange_timeout) or args.token_exchange_timeout <= 0:
+            raise ValueError("--token-exchange-timeout must be finite and positive")
+        if not Path("/dev/shm").is_dir():
+            raise RuntimeError("--initial-token-exchange requires Linux /dev/shm")
     validate_args(args)
     if args.trace_down_ready:
         if args.proxy_mode != "thread":
@@ -904,6 +935,15 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     inputs, ready_rows, ipc_backing = prepare_inputs(args, device)
+    if args.initial_token_exchange:
+        try:
+            from run.token_exchange import exchange_tokens
+        except ModuleNotFoundError as error:
+            if error.name != "run":
+                raise
+            from token_exchange import exchange_tokens
+        with torch.inference_mode():
+            exchange_tokens(args, inputs, export_cuda_ipc_allocation)
     torch.cuda.synchronize(device)
     with ExitStack() as resources:
         ready_trace = None

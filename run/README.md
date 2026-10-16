@@ -477,3 +477,48 @@ The final contents of the input allocations are the combined outputs.
 ```bash
 pytest tests/test_gemm_gather_table.py -k down_combine_in_place_original_tokens -x
 ```
+
+### One-time input token exchange (single-node Hopper stream runner)
+
+`hopper_stream_gather_table_gemm.py` optionally fills its multi-buffer inputs using
+host-issued CUDA memcpy calls before warmup. Enable it with
+`--initial-token-exchange --source-tokens Y`. Without this flag, input generation
+and execution are unchanged.
+
+For `N` torchrun workers, require `Y > 0`, `Y % N == 0`,
+`--num-input-buffers N`, and `--tokens-per-buffer Y/N`. For example, add these
+options to your existing four-GPU command, replacing its input-buffer count:
+
+```bash
+--initial-token-exchange --source-tokens 8192 \
+--multi-buffer-gather --num-input-buffers 4 --tokens-per-buffer 2048
+```
+
+Each GPU generates a rank-specific source tensor `[Y, hidden]`. Source rank `i`
+sends chunk `k` to rank `(i+k+1)%N`, into destination input buffer `i`. Each rank
+issues `N-1` `cudaMemcpyPeerAsync` calls and one local device-to-device
+`cudaMemcpyAsync`, then synchronizes its copy stream before entering a
+shared-memory completion barrier. No custom communication kernel is used.
+The original source tensors are temporary setup buffers; all subsequent warmup
+and measured launches use the received inputs without additional peer transfers.
+
+This requires single-node torchrun with at least two GPUs, identical GPU
+visibility on all workers, Linux `/dev/shm`, and direct CUDA peer access for every
+GPU pair. The runner exchanges CUDA IPC allocation handles and offsets through
+locked shared memory. CUDA IPC-compatible PyTorch allocations are required;
+disable `expandable_segments` if enabled. Each shared-memory barrier has a
+120-second timeout, adjustable with `--token-exchange-timeout`.
+
+With `--down-combine-in-place`, the restore snapshots are refreshed after the
+exchange, so every invocation restores the received tokens. Unless `--skip-check`
+is specified, received inputs are checked exactly against independently
+regenerated source chunks before warmup; the normal GEMM numerical checks still
+run afterward. One-time transfer/barrier latency is printed separately and is
+excluded from the existing GEMM benchmark timings. This feature does not send
+combined outputs back to source GPUs.
+
+A focused numerical exchange/restore check (no GEMM compilation) is available:
+
+```bash
+torchrun --standalone --nnodes=1 --nproc-per-node=4 run/test_initial_token_exchange.py
+```
