@@ -553,9 +553,12 @@ N-tile-major in the receive buffers; no transpose, concatenation, or additional
 reduction is performed. IPC mappings and receive allocations persist across
 iterations and are closed after the proxy stops.
 
-With this flag, reported pipeline time and effective TFLOP/s **include the return
-copies and all-rank completion barrier**. Reset-excluded timing still subtracts
-only down-output zeroing. Initial token exchange remains outside measured time.
+With this flag, reported pipeline time and effective TFLOP/s **exclude return
+copies and the all-rank completion barrier**. The timing endpoint waits only for
+the CUDA event recorded after down GEMM, rather than synchronizing the entire
+device (which could also wait for return DMA). Return completion is still awaited
+before the next iteration. Reset-excluded timing additionally subtracts only
+down-output zeroing. Initial token exchange remains outside measured time.
 Unless `--skip-check` is set, final returned buffers are compared byte-for-byte
 against the corresponding peer outputs, alongside the existing PyTorch numerical
 GEMM reference checks. Run a small regression covering repeated iterations and

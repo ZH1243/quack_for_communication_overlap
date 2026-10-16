@@ -683,14 +683,16 @@ def run_stream_once(
         return_exchange.record_down_done()
     start_ns = time.perf_counter_ns()
     proxy.go()
-    torch.cuda.synchronize(device)
     if return_exchange is not None:
-        # Includes CPU-triggered DMA and the all-rank completion barrier. A device
-        # synchronize alone can finish before the proxy has even enqueued its DMA.
-        proxy.wait()
+        # Wait only for the event recorded after down GEMM. A device-wide wait
+        # could include return DMA submitted concurrently by the proxy worker.
+        return_exchange.down_done.synchronize()
+    else:
+        torch.cuda.synchronize(device)
     elapsed_ms = (time.perf_counter_ns() - start_ns) / 1e6
-    if return_exchange is None:
-        proxy.wait()
+    # Return DMA and the rank barrier must finish before buffer reuse, but are
+    # outside the interval used for effective throughput.
+    proxy.wait()
     return elapsed_ms
 
 
@@ -1075,8 +1077,8 @@ def main() -> None:
                 with torch.inference_mode():
                     return_exchange = ReturnExchange(args, inputs, proxy, export_cuda_ipc_allocation)
                 proxy.return_exchange = return_exchange
-                print("Return copies enabled: pipeline timing includes all-rank return completion; "
-                      "received buffers are indexed by computing GPU rank.")
+                print("Return copies enabled: throughput timing excludes return copies and the "
+                      "rank barrier; received buffers are indexed by computing GPU rank.")
             for _ in range(max(1, args.warmup)):
                 run_stream_once(
                     proxy, launch, inputs.work_table, ready_rows, device, reset_events=reset_events
@@ -1119,7 +1121,7 @@ def main() -> None:
                 else "proxy-flush + up GEMM"
             )
             if return_exchange is not None:
-                operation_name += " + return copies + rank barrier"
+                operation_name += " (return copies and rank barrier excluded)"
             if measure_reset:
                 median_without_reset_ms = statistics.median(excluding_reset_ms)
                 for label, values in (
