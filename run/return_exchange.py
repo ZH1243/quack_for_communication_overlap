@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import os
 
 import torch
@@ -35,7 +36,8 @@ class ReturnExchange:
             signature = [list(self.outputs[0].shape), str(self.outputs[0].dtype),
                          args.down_n_tile_major_output, args.down_tile_n,
                          os.environ.get("CUDA_VISIBLE_DEVICES"), args.warmup,
-                         args.iterations, args.timing_samples, args.skip_check]
+                         args.iterations, args.timing_samples, args.skip_check,
+                         args.return_token_results_per_group, args.down_max_swizzle_size]
             signatures = self.control.gather("configuration", signature)
             if any(value != signature for value in signatures):
                 raise ValueError("Return exchange requires matching output layouts on all ranks")
@@ -77,6 +79,24 @@ class ReturnExchange:
             )
             if result:
                 raise RuntimeError(error.value.decode(errors="replace"))
+            if args.return_token_results_per_group:
+                # Physical shape is [N tiles, tokens * tile_n], with no padding for
+                # in-place combine. A column group consists of adjacent N tiles.
+                down = inputs.down_args
+                group_tiles = min(down.max_swizzle_size, math.ceil(down.output_dim / down.tile_n))
+                group_bytes = (group_tiles * self.outputs[0].shape[1]
+                               * self.outputs[0].element_size())
+                try:
+                    configure_groups = proxy.library.stream_gather_thread_proxy_set_return_groups
+                except AttributeError as error:
+                    raise RuntimeError(
+                        "Rebuild run/cpu_proxy to enable --return-token-results-per-group"
+                    ) from error
+                configure_groups.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
+                                             ctypes.POINTER(ctypes.c_char), ctypes.c_size_t]
+                configure_groups.restype = ctypes.c_int
+                if configure_groups(proxy.handle, group_bytes, error, len(error)):
+                    raise RuntimeError(error.value.decode(errors="replace"))
             self.control.gather("configured")
         except BaseException as error:
             self.control.state("error", str(error))

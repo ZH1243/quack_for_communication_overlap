@@ -567,3 +567,34 @@ both output layouts with:
 ```bash
 torchrun --standalone --nnodes=1 --nproc-per-node=4 run/test_return_token_results.py
 ```
+
+### Stream returned column groups while down GEMM is still running
+
+Add `--return-token-results-per-group` together with `--return-token-results` and
+`--down-n-tile-major-output` to enable this mode. It is disabled by default;
+without it, return copies still wait for the complete down GEMM. Rebuild
+`run/cpu_proxy` using the commands above after updating the code.
+
+The proxy submits N copies for each newly completed column group (N-1 peer copies
+and one local copy). If the observed ready prefix jumps over several groups, it
+submits every group in that interval exactly once. Each transfer uses the same
+byte offset in its source output and destination receive buffer, preserving the
+N-tile-major physical layout. Group width is the scheduler's swizzle group size
+multiplied by `--down-tile-n`; with swizzle size 1, each group is one N tile.
+
+The system-release ready publication, which follows completion of all output
+writes/reductions for that prefix, orders these copies. This mode does not wait
+on the whole-GEMM event before copying. Copies use the existing nonblocking stream
+and there is no per-group synchronization. After all groups are submitted, the
+proxy waits for the copy stream and the existing all-rank completion barrier
+before buffers can be reused. Receive buffers are available to consumers only
+after that final completion barrier.
+
+Throughput timing still ends at down-GEMM completion and excludes the subsequent
+return-completion wait. Concurrent DMA can affect GEMM execution time through
+memory-bandwidth contention; this effect remains reflected in measured throughput.
+The original input exchange remains a one-time operation before warmup.
+
+`run/test_return_token_results.py` also exercises this mode with one and two N
+tiles per group, repeated iterations, exact returned-buffer comparisons, and the
+runner's PyTorch numerical GEMM references.

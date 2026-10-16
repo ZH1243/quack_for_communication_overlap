@@ -606,7 +606,8 @@ struct ReadyTrace {
     cancelled.store(false, std::memory_order_relaxed);
     __atomic_store_n(host, 0, __ATOMIC_RELEASE);
   }
-  void poll() {
+  template <typename OnReady>
+  void poll(OnReady on_ready) {
     const auto start = std::chrono::steady_clock::now();
     int previous = 0;
     while (previous < final_groups) {
@@ -620,6 +621,7 @@ struct ReadyTrace {
       if (ready > previous) {
         observations.emplace_back(
             ready, std::chrono::duration<double, std::micro>(now - start).count());
+        on_ready(previous, ready);
         previous = ready;
       }
       if (now - start > std::chrono::seconds(30))
@@ -627,6 +629,7 @@ struct ReadyTrace {
       std::atomic_signal_fence(std::memory_order_seq_cst);
     }
   }
+  void poll() { poll([](int, int) {}); }
 };
 
 // Configured once while the worker is idle. Pointers/events are owned by Python.
@@ -634,6 +637,7 @@ struct ReturnCopies {
   int device;
   std::vector<std::uintptr_t> sources, destinations;
   std::size_t bytes;
+  std::size_t group_bytes = 0;  // Zero preserves whole-buffer return after kernel exit.
   cudaEvent_t down_done;
   cudaStream_t stream = nullptr;
   std::uint64_t* completions;
@@ -650,20 +654,40 @@ struct ReturnCopies {
   }
   ~ReturnCopies() { if (stream) cudaStreamDestroy(stream); }
 
-  void run(ReadyTrace* trace) {
-    // The CPU ready flag triggers submission; the event orders actual DMA after kernel exit.
-    check_cuda(cudaStreamWaitEvent(stream, down_done, 0), "cudaStreamWaitEvent(down done)");
+  void submit(std::size_t offset, std::size_t count) {
     for (int peer = 0; peer < static_cast<int>(sources.size()); ++peer) {
-      auto* dst = reinterpret_cast<void*>(destinations[peer]);
-      auto* src = reinterpret_cast<const void*>(sources[peer]);
+      auto* dst = reinterpret_cast<void*>(destinations[peer] + offset);
+      auto* src = reinterpret_cast<const void*>(sources[peer] + offset);
       if (peer == device) {
-        check_cuda(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream),
+        check_cuda(cudaMemcpyAsync(dst, src, count, cudaMemcpyDeviceToDevice, stream),
                    "cudaMemcpyAsync(return local)");
       } else {
-        check_cuda(cudaMemcpyPeerAsync(dst, peer, src, device, bytes, stream),
+        check_cuda(cudaMemcpyPeerAsync(dst, peer, src, device, count, stream),
                    "cudaMemcpyPeerAsync(return peer)");
       }
     }
+  }
+
+  void run(ReadyTrace* trace) {
+    // Whole-buffer mode is called only after the existing final-prefix poll.
+    check_cuda(cudaStreamWaitEvent(stream, down_done, 0), "cudaStreamWaitEvent(down done)");
+    submit(0, bytes);
+    finish(trace);
+  }
+
+  void run_streaming(ReadyTrace* trace) {
+    // The system-release ready prefix replaces the whole-kernel event dependency.
+    // Each group is immutable after publication, including all reduction contributors.
+    trace->poll([this](int previous, int ready) {
+      for (int group = previous; group < ready; ++group) {
+        submit(static_cast<std::size_t>(group) * group_bytes, group_bytes);
+      }
+    });
+    // No per-group synchronization: continue polling/submitting while DMA runs.
+    finish(trace);
+  }
+
+  void finish(ReadyTrace* trace) {
     check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize(return copies)");
     ++generation;
     __atomic_store_n(completions + device, generation, __ATOMIC_RELEASE);
@@ -755,8 +779,12 @@ struct ThreadProxyState {
       try {
         check_cuda(cudaSetDevice(device), "cudaSetDevice(worker thread)");
         proxy->run_once();
-        if (ready_trace) ready_trace->poll();
-        if (return_copies) return_copies->run(ready_trace);
+        if (return_copies && return_copies->group_bytes) {
+          return_copies->run_streaming(ready_trace);
+        } else {
+          if (ready_trace) ready_trace->poll();
+          if (return_copies) return_copies->run(ready_trace);
+        }
       } catch (const std::exception& exception) {
         error = exception.what();
       } catch (...) {
@@ -865,6 +893,25 @@ extern "C" int stream_gather_thread_proxy_set_return_copies(
     check_cuda(cudaSetDevice(state->device), "cudaSetDevice(return setup)");
     state->return_copies = std::make_unique<ReturnCopies>(
         state->device, count, sources, destinations, bytes, event, counters, timeout);
+    return 0;
+  } catch (const std::exception& exception) {
+    write_error(error, capacity, exception.what());
+    return 1;
+  }
+}
+
+// Separate entry point keeps the existing whole-buffer configuration ABI unchanged.
+extern "C" int stream_gather_thread_proxy_set_return_groups(
+    void* handle, std::size_t group_bytes, char* error, std::size_t capacity) {
+  try {
+    auto* state = static_cast<ThreadProxyState*>(handle);
+    if (!state || !state->ready_trace || !state->return_copies || state->outstanding)
+      throw std::runtime_error("configure return groups after return copies, with worker idle");
+    const auto bytes = state->return_copies->bytes;
+    if (!group_bytes || bytes % group_bytes ||
+        bytes / group_bytes != static_cast<std::size_t>(state->ready_trace->final_groups))
+      throw std::runtime_error("return groups must exactly cover each physical output buffer");
+    state->return_copies->group_bytes = group_bytes;
     return 0;
   } catch (const std::exception& exception) {
     write_error(error, capacity, exception.what());

@@ -160,6 +160,11 @@ def parse_args() -> argparse.Namespace:
         "--return-token-results", action="store_true",
         help="After each down GEMM, have the thread proxy copy results back to source GPUs",
     )
+    parser.add_argument(
+        "--return-token-results-per-group", action="store_true",
+        help="Return each completed down column group while later groups compute; requires "
+             "--return-token-results and --down-n-tile-major-output",
+    )
     args = parser.parse_args()
     if args.local_rank is not None:
         args.device = args.local_rank
@@ -167,6 +172,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_stream_args(args: argparse.Namespace) -> None:
+    if args.return_token_results_per_group and (
+        not args.return_token_results or not args.down_n_tile_major_output
+    ):
+        raise ValueError("--return-token-results-per-group requires --return-token-results "
+                         "and --down-n-tile-major-output")
     if args.return_token_results and (
         not args.initial_token_exchange or not args.down_combine_in_place
         or not args.down_projection2 or args.proxy_mode != "thread"
@@ -1077,6 +1087,9 @@ def main() -> None:
                 with torch.inference_mode():
                     return_exchange = ReturnExchange(args, inputs, proxy, export_cuda_ipc_allocation)
                 proxy.return_exchange = return_exchange
+                if args.return_token_results_per_group:
+                    print("Streaming return copies: each ready column group is submitted "
+                          "while down GEMM continues; overlap may affect GEMM throughput.")
                 print("Return copies enabled: throughput timing excludes return copies and the "
                       "rank barrier; received buffers are indexed by computing GPU rank.")
             for _ in range(max(1, args.warmup)):
