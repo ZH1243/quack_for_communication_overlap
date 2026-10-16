@@ -1039,6 +1039,9 @@ class GemmSm90(GemmTmaBase):
         wave_ready_prefix = (
             tile_sched_params.wave_ready_prefix if const_expr(self.gather_table) else None
         )
+        wave_ready_host_address = (
+            tile_sched_params.wave_ready_host_address if const_expr(self.gather_table) else None
+        )
         varlen_m = const_expr(varlen_params.cu_seqlens_m is not None or self.gather_table)
         varlen_k = const_expr(varlen_params.cu_seqlens_k is not None)
         assert not (varlen_m and varlen_k)
@@ -1549,6 +1552,15 @@ class GemmSm90(GemmTmaBase):
                                                 sem="release",
                                                 scope="gpu",
                                             )
+                                            if const_expr(wave_ready_host_address is not None):
+                                                host_ptr = cute.make_ptr(
+                                                    Int32, wave_ready_host_address[0],
+                                                    cute.AddressSpace.gmem, assumed_align=4,
+                                                )
+                                                cute.arch.store(
+                                                    host_ptr.llvm_ptr, ready,
+                                                    sem="release", scope="sys",
+                                                )
                     self.epilogue_barrier.arrive_and_wait()
                 iket.range_push("epilogue")
 
@@ -1785,6 +1797,16 @@ class GemmSm90(GemmTmaBase):
                                                     wave_ready_prefix[store_wave],
                                                     sem="release", scope="gpu",
                                                 )
+                                                if const_expr(wave_ready_host_address is not None):
+                                                    host_ptr = cute.make_ptr(
+                                                        Int32, wave_ready_host_address[0],
+                                                        cute.AddressSpace.gmem, assumed_align=4,
+                                                    )
+                                                    cute.arch.store(
+                                                        host_ptr.llvm_ptr,
+                                                        wave_ready_prefix[store_wave],
+                                                        sem="release", scope="sys",
+                                                    )
                                 cute.arch.sync_warp()
                         else:
                             epi_store_pipeline.producer_tail()

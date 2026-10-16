@@ -2,6 +2,7 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -577,6 +578,57 @@ void run(const Options& options) {
   check_cuda(cudaIpcCloseMemHandle(allocation), "cudaIpcCloseMemHandle");
 }
 
+// One GPU publisher, one CPU reader. Keep the hot GPU wave counter in HBM.
+struct ReadyTrace {
+  std::int32_t* host = nullptr;
+  void* device_pointer = nullptr;
+  int final_groups;
+  std::atomic<bool> cancelled{false};
+  std::vector<std::pair<int, double>> observations;
+
+  explicit ReadyTrace(int groups) : final_groups(groups) {
+    if (groups <= 0) throw std::runtime_error("ready trace requires positive group count");
+    observations.reserve(groups);
+    check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&host), sizeof(*host),
+                             cudaHostAllocMapped), "cudaHostAlloc(ready trace)");
+    try {
+      check_cuda(cudaHostGetDevicePointer(&device_pointer, host, 0),
+                 "cudaHostGetDevicePointer(ready trace)");
+    } catch (...) {
+      cudaFreeHost(host);
+      throw;
+    }
+    reset();
+  }
+  ~ReadyTrace() { cudaFreeHost(host); }
+  void reset() {
+    observations.clear();
+    cancelled.store(false, std::memory_order_relaxed);
+    __atomic_store_n(host, 0, __ATOMIC_RELEASE);
+  }
+  void poll() {
+    const auto start = std::chrono::steady_clock::now();
+    int previous = 0;
+    while (previous < final_groups) {
+      if (cancelled.load(std::memory_order_relaxed))
+        throw std::runtime_error("ready trace cancelled");
+      // Matches the kernel's aligned st.release.sys.global.u32 publication.
+      const int ready = __atomic_load_n(host, __ATOMIC_ACQUIRE);
+      const auto now = std::chrono::steady_clock::now();
+      if (ready < previous || ready > final_groups)
+        throw std::runtime_error("invalid ready trace prefix");
+      if (ready > previous) {
+        observations.emplace_back(
+            ready, std::chrono::duration<double, std::micro>(now - start).count());
+        previous = ready;
+      }
+      if (now - start > std::chrono::seconds(30))
+        throw std::runtime_error("timed out polling down-GEMM readiness");
+      std::atomic_signal_fence(std::memory_order_seq_cst);
+    }
+  }
+};
+
 struct ThreadProxyState {
   int device = 0;
   std::unique_ptr<FlushProxy> proxy;
@@ -587,6 +639,7 @@ struct ThreadProxyState {
   bool completed = false;
   bool stopping = false;
   std::string worker_error;
+  ReadyTrace* ready_trace = nullptr;  // Owned by the caller until worker shutdown.
   std::thread worker;
 
   ThreadProxyState(int device_value, std::unique_ptr<FlushProxy> proxy_value)
@@ -597,6 +650,7 @@ struct ThreadProxyState {
   ThreadProxyState& operator=(const ThreadProxyState&) = delete;
 
   ~ThreadProxyState() {
+    if (ready_trace) ready_trace->cancelled.store(true, std::memory_order_relaxed);
     {
       std::lock_guard<std::mutex> lock(mutex);
       stopping = true;
@@ -647,6 +701,7 @@ struct ThreadProxyState {
       try {
         check_cuda(cudaSetDevice(device), "cudaSetDevice(worker thread)");
         proxy->run_once();
+        if (ready_trace) ready_trace->poll();
       } catch (const std::exception& exception) {
         error = exception.what();
       } catch (...) {
@@ -708,6 +763,40 @@ Options make_thread_options(int device, int table_rows, int table_width, int exp
 }  // namespace
 
 #ifdef QUACK_STREAM_GATHER_PROXY_LIBRARY
+extern "C" void* stream_gather_ready_trace_create(
+    int device, int groups, std::uintptr_t* device_pointer, char* error, std::size_t capacity) {
+  try {
+    check_cuda(cudaSetDevice(device), "cudaSetDevice(ready trace)");
+    auto trace = std::make_unique<ReadyTrace>(groups);
+    *device_pointer = reinterpret_cast<std::uintptr_t>(trace->device_pointer);
+    return trace.release();
+  } catch (const std::exception& exception) {
+    write_error(error, capacity, exception.what());
+    return nullptr;
+  }
+}
+
+// Called only with the worker idle and the preceding GPU invocation completed.
+extern "C" void stream_gather_ready_trace_reset(void* handle) {
+  static_cast<ReadyTrace*>(handle)->reset();
+}
+extern "C" int stream_gather_ready_trace_read(
+    void* handle, int* groups, double* times_us, int capacity) {
+  const auto& entries = static_cast<ReadyTrace*>(handle)->observations;
+  const int count = std::min(capacity, static_cast<int>(entries.size()));
+  for (int i = 0; i < count; ++i) {
+    groups[i] = entries[i].first;
+    times_us[i] = entries[i].second;
+  }
+  return count;
+}
+extern "C" void stream_gather_ready_trace_destroy(void* handle) {
+  delete static_cast<ReadyTrace*>(handle);
+}
+extern "C" void stream_gather_thread_proxy_set_ready_trace(void* handle, void* trace) {
+  static_cast<ThreadProxyState*>(handle)->ready_trace = static_cast<ReadyTrace*>(trace);
+}
+
 extern "C" void* stream_gather_thread_proxy_create(
     int device, std::uintptr_t device_table, std::uintptr_t device_ready, int table_rows,
     int table_width, int experts, int routes_per_buffer, int num_input_buffers, int output_dim,

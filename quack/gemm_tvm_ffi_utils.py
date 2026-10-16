@@ -6,7 +6,7 @@ from functools import partial
 import torch
 
 import cutlass.cute as cute
-from cutlass import Int32, Float32, Float4E2M1FN
+from cutlass import Int64, Int32, Float32, Float4E2M1FN
 from cutlass.cute.runtime import make_ptr
 
 from quack.compile_utils import make_fake_tensor as fake_tensor
@@ -261,6 +261,7 @@ def make_scheduler_args(
     multi_buffer_gather=None,
     wave_store_counter=None,
     wave_ready_prefix=None,
+    wave_ready_host_address=None,
 ):
     return TileSchedulerOptions(
         max_active_clusters=Int32(max_active_clusters),
@@ -285,6 +286,7 @@ def make_scheduler_args(
         gather_table_ready=gather_table_ready,
         wave_store_counter=wave_store_counter,
         wave_ready_prefix=wave_ready_prefix,
+        wave_ready_host_address=wave_ready_host_address,
         multi_buffer_gather=multi_buffer_gather,
     )
 
@@ -301,6 +303,7 @@ def make_fake_scheduler_args(
     multi_buffer_gather=None,
     has_wave_store_counter=False,
     has_wave_ready_prefix=False,
+    has_wave_ready_host_address=False,
 ):
     return TileSchedulerOptions(
         max_active_clusters=Int32(1),
@@ -354,6 +357,10 @@ def make_fake_scheduler_args(
         wave_ready_prefix=(
             fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=1)
             if has_wave_ready_prefix else None
+        ),
+        wave_ready_host_address=(
+            fake_tensor(Int64, (1,), leading_dim=0, divisibility=1)
+            if has_wave_ready_host_address else None
         ),
         wave_store_counter=(
             fake_tensor(Int32, (2 if has_wave_ready_prefix else 1,), leading_dim=0, divisibility=1)
@@ -539,6 +546,7 @@ def plan_scheduler_args(
     multi_buffer_gather=None,
     wave_store_counter=None,
     wave_ready_prefix=None,
+    wave_ready_host_address=None,
 ):
     """Per-call TileSchedulerOptions for a cached plan.
 
@@ -566,6 +574,7 @@ def plan_scheduler_args(
         gather_table_ready=gather_table_ready,
         wave_store_counter=wave_store_counter,
         wave_ready_prefix=wave_ready_prefix,
+        wave_ready_host_address=wave_ready_host_address,
         multi_buffer_gather=multi_buffer_gather,
     )
 

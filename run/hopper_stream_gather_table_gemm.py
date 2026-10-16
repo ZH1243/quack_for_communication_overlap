@@ -28,6 +28,7 @@ import selectors
 import statistics
 import subprocess
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -131,11 +132,22 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_THREAD_PROXY,
         help="Path to the in-process proxy shared library",
     )
+    parser.add_argument(
+        "--trace-down-ready", action="store_true",
+        help="Have the thread proxy timestamp down-output column-prefix changes in mapped "
+             "pinned host memory (requires --down-gather-table-publish-ready)",
+    )
     return parser.parse_args()
 
 
 def validate_stream_args(args: argparse.Namespace) -> None:
     validate_args(args)
+    if args.trace_down_ready:
+        if args.proxy_mode != "thread":
+            raise ValueError("--trace-down-ready requires --proxy-mode thread")
+        if not args.down_projection2 or not args.down_gather_table_publish_ready:
+            raise ValueError("--trace-down-ready requires --down-projection2 and "
+                             "--down-gather-table-publish-ready")
     if args.flush_entries <= 0:
         raise ValueError(f"flush-entries must be positive, got {args.flush_entries}")
     if args.flush_interval_us < 0:
@@ -604,6 +616,9 @@ def run_stream_once(
     work_table.fill_(-1)
     ready_rows.zero_()
     torch.cuda.synchronize(device)
+    trace = getattr(proxy, "ready_trace", None)
+    if trace is not None:
+        trace.reset()
     # Queue the persistent kernel while every table row is still poisoned
     # and ready_rows is zero. Its scheduler warp starts by polling row 0.
     if reset_events is None:
@@ -670,6 +685,66 @@ class ProcessProxy:
         stop_proxy(self.process)
 
 
+class ReadyTrace:
+    """Own a mapped host flag; read C++ observations only after proxy.wait()."""
+
+    def __init__(self, library_path: Path, device: int, groups: int):
+        self.library = ctypes.CDLL(str(library_path.resolve()))
+        self.groups = groups
+        self.handle = None
+        try:
+            create = self.library.stream_gather_ready_trace_create
+            self.reset_fn = self.library.stream_gather_ready_trace_reset
+            self.read_fn = self.library.stream_gather_ready_trace_read
+            self.destroy_fn = self.library.stream_gather_ready_trace_destroy
+        except AttributeError as error:
+            raise RuntimeError("rebuild run/cpu_proxy to enable --trace-down-ready") from error
+        create.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_uint64),
+                           ctypes.POINTER(ctypes.c_char), ctypes.c_size_t]
+        create.restype = ctypes.c_void_p
+        self.reset_fn.argtypes = [ctypes.c_void_p]
+        self.reset_fn.restype = None
+        self.read_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
+                                ctypes.POINTER(ctypes.c_double), ctypes.c_int]
+        self.read_fn.restype = ctypes.c_int
+        self.destroy_fn.argtypes = [ctypes.c_void_p]
+        self.destroy_fn.restype = None
+        address = ctypes.c_uint64()
+        error = ctypes.create_string_buffer(4096)
+        self.handle = create(device, groups, ctypes.byref(address), error, len(error))
+        if not self.handle:
+            raise RuntimeError(error.value.decode(errors="replace"))
+        self.device_address = address.value
+
+    def reset(self) -> None:
+        self.reset_fn(self.handle)
+
+    def observations(self) -> list[tuple[int, float]]:
+        groups = (ctypes.c_int * self.groups)()
+        times = (ctypes.c_double * self.groups)()
+        count = self.read_fn(self.handle, groups, times, self.groups)
+        return [(groups[i], times[i]) for i in range(count)]
+
+    def close(self) -> None:
+        if self.handle:
+            self.destroy_fn(self.handle)
+            self.handle = None
+
+
+def print_ready_traces(traces: list[list[tuple[int, float]]], group_width: int) -> None:
+    print(f"CPU down-ready trace: group width={group_width} columns; warmup excluded.")
+    print("Times are CPU detections after polling starts, not GPU completion timestamps.")
+    print("Ranges are group IDs [start,end); a jump is one observation for the entire range.")
+    for launch_id, observations in enumerate(traces, 1):
+        previous_group, previous_us = 0, None
+        entries = []
+        for group, detected_us in observations:
+            gap = "first" if previous_us is None else f"gap={detected_us - previous_us:.3f} us"
+            entries.append(f"[{previous_group},{group}) at {detected_us:.3f} us ({gap})")
+            previous_group, previous_us = group, detected_us
+        print(f"CPU down-ready launch {launch_id}: " + "; ".join(entries))
+
+
 class ThreadProxy:
     """Run the C++ producer on one native worker thread in this process."""
 
@@ -681,6 +756,7 @@ class ThreadProxy:
         args: argparse.Namespace,
         inputs: TableGatherInputs,
         ready_rows: torch.Tensor,
+        ready_trace: ReadyTrace | None = None,
     ):
         self.library = ctypes.CDLL(str(library_path.resolve()))
         char_pointer = ctypes.POINTER(ctypes.c_char)
@@ -762,6 +838,12 @@ class ThreadProxy:
             raise RuntimeError(f"thread proxy initialization failed: {message}")
         self.handle = ctypes.c_void_p(handle)
         self.in_flight = False
+        self.ready_trace = ready_trace
+        if ready_trace is not None:
+            attach = self.library.stream_gather_thread_proxy_set_ready_trace
+            attach.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            attach.restype = None
+            attach(self.handle, ready_trace.handle)
 
     def go(self) -> None:
         if self.in_flight:
@@ -807,180 +889,197 @@ def main() -> None:
     torch.manual_seed(args.seed)
     inputs, ready_rows, ipc_backing = prepare_inputs(args, device)
     torch.cuda.synchronize(device)
-    launch, precompile_down = make_launch(args, inputs, ready_rows)
+    with ExitStack() as resources:
+        ready_trace = None
+        if args.trace_down_ready:
+            groups = int(inputs.down_inputs.wave_ready_prefix[-1].item())
+            ready_trace = ReadyTrace(args.thread_proxy_library, args.device, groups)
+            resources.callback(ready_trace.close)
+            inputs.down_inputs.wave_ready_host_address = torch.tensor(
+                [ready_trace.device_address], dtype=torch.int64, device=device
+            )
+        launch, precompile_down = make_launch(args, inputs, ready_rows)
 
-    counts = [
-        [b - a for a, b in zip(offsets[:-1], offsets[1:])]
-        for offsets in inputs.route_offsets
-    ]
-    print(f"Device: {torch.cuda.get_device_name(device)} (SM{capability[0]}{capability[1]})")
-    X_buffers = inputs.X if isinstance(inputs.X, tuple) else (inputs.X,)
-    print(
-        f"X buffers: {len(X_buffers)} x {tuple(X_buffers[0].shape)}, "
-        f"W_up: {tuple(inputs.W.shape)}, dtype: {X_buffers[0].dtype}, "
-        f"multi-buffer={args.multi_buffer_gather}, indexed-gather={args.indexed_gather}"
-    )
-    if inputs.W_down is not None:
-        assert inputs.up_output is not None
-        output_shapes = (
-            [tuple(t.shape) for t in inputs.down_inputs.output_buffers()]
-            if inputs.down_inputs is not None else [tuple(inputs.output.shape)]
+        counts = [
+            [b - a for a, b in zip(offsets[:-1], offsets[1:])]
+            for offsets in inputs.route_offsets
+        ]
+        print(f"Device: {torch.cuda.get_device_name(device)} (SM{capability[0]}{capability[1]})")
+        X_buffers = inputs.X if isinstance(inputs.X, tuple) else (inputs.X,)
+        print(
+            f"X buffers: {len(X_buffers)} x {tuple(X_buffers[0].shape)}, "
+            f"W_up: {tuple(inputs.W.shape)}, dtype: {X_buffers[0].dtype}, "
+            f"multi-buffer={args.multi_buffer_gather}, indexed-gather={args.indexed_gather}"
+        )
+        if inputs.W_down is not None:
+            assert inputs.up_output is not None
+            output_shapes = (
+                [tuple(t.shape) for t in inputs.down_inputs.output_buffers()]
+                if inputs.down_inputs is not None else [tuple(inputs.output.shape)]
+            )
+            print(
+                f"W_down: {tuple(inputs.W_down.shape)}, up output: {tuple(inputs.up_output.shape)}, "
+                f"final output buffers: {output_shapes}"
+            )
+        else:
+            print(f"Output: {tuple(inputs.output.shape)}, down projection: disabled")
+        if inputs.down_args is not None:
+            down_options = {k: v for k, v in vars(args).items() if k.startswith("down_")}
+            print(f"Down-projection2 options: {down_options}")
+            if inputs.down_inputs.gather_work_table is not None:
+                print("Down gather table is prepared before launch; only the up table is streamed.")
+            if inputs.down_args.epilogue_store == "bulk_rows_reduce":
+                print("Pipeline timing includes down-output zeroing before each reduction.")
+        print(f"Routes per expert by buffer: {counts}")
+        print(
+            f"Work table: {tuple(inputs.work_table.shape)}, x={inputs.work_group_size}, "
+            f"expanded work IDs={inputs.work_table.shape[0] * inputs.work_group_size}"
         )
         print(
-            f"W_down: {tuple(inputs.W_down.shape)}, up output: {tuple(inputs.up_output.shape)}, "
-            f"final output buffers: {output_shapes}"
+            f"Streaming: {args.flush_entries} rows/batch, {args.flush_interval_us} us interval, "
+            f"flag={args.flag_update_mode}, proxy={args.proxy_mode}, "
+            f"DMA-kick={args.dma_kick_bytes} bytes; balanced-buffers="
+            f"{args.balanced_multi_buffer_gather}, round-robin-m-clusters="
+            f"{args.round_robin_m_clusters}"
         )
-    else:
-        print(f"Output: {tuple(inputs.output.shape)}, down projection: disabled")
-    if inputs.down_args is not None:
-        down_options = {k: v for k, v in vars(args).items() if k.startswith("down_")}
-        print(f"Down-projection2 options: {down_options}")
-        if inputs.down_inputs.gather_work_table is not None:
-            print("Down gather table is prepared before launch; only the up table is streamed.")
-        if inputs.down_args.epilogue_store == "bulk_rows_reduce":
-            print("Pipeline timing includes down-output zeroing before each reduction.")
-    print(f"Routes per expert by buffer: {counts}")
-    print(
-        f"Work table: {tuple(inputs.work_table.shape)}, x={inputs.work_group_size}, "
-        f"expanded work IDs={inputs.work_table.shape[0] * inputs.work_group_size}"
-    )
-    print(
-        f"Streaming: {args.flush_entries} rows/batch, {args.flush_interval_us} us interval, "
-        f"flag={args.flag_update_mode}, proxy={args.proxy_mode}, "
-        f"DMA-kick={args.dma_kick_bytes} bytes; balanced-buffers="
-        f"{args.balanced_multi_buffer_gather}, round-robin-m-clusters="
-        f"{args.round_robin_m_clusters}"
-    )
-    print(f"Fused activation: {args.activation or 'disabled'}")
-    if not args.no_cuda_graph:
-        print("CUDA graph capture is disabled for externally produced streaming table data.")
-    compile_target = "up and down kernels" if has_down_projection(args) else "kernel"
-    print(f"Compiling and warming up the readiness-gated QuACK {compile_target}...")
+        print(f"Fused activation: {args.activation or 'disabled'}")
+        if not args.no_cuda_graph:
+            print("CUDA graph capture is disabled for externally produced streaming table data.")
+        compile_target = "up and down kernels" if has_down_projection(args) else "kernel"
+        print(f"Compiling and warming up the readiness-gated QuACK {compile_target}...")
 
-    # Compile the down kernel before any readiness-gated up kernel is queued.
-    # Otherwise its first host-side compilation would delay proxy.go() while
-    # the already-launched up kernel spins waiting for table row zero.
-    if precompile_down is not None:
-        assert inputs.up_output is not None
-        with torch.inference_mode():
-            inputs.up_output.zero_()
-            precompile_down()
-        torch.cuda.synchronize(device)
+        # Compile the down kernel before any readiness-gated up kernel is queued.
+        # Otherwise its first host-side compilation would delay proxy.go() while
+        # the already-launched up kernel spins waiting for table row zero.
+        if precompile_down is not None:
+            assert inputs.up_output is not None
+            with torch.inference_mode():
+                inputs.up_output.zero_()
+                precompile_down()
+            torch.cuda.synchronize(device)
 
-    measure_reset = (
-        inputs.down_inputs is not None and inputs.down_args.epilogue_store == "bulk_rows_reduce"
-    )
-    reset_events = None
-    if measure_reset:
-        reset_events = tuple(torch.cuda.Event(enable_timing=True) for _ in range(2))
-        # Materialize lazy CUDA events before queuing a kernel that waits for the proxy.
-        for event in reset_events:
-            event.record()
-        torch.cuda.synchronize(device)
+        measure_reset = (
+            inputs.down_inputs is not None and inputs.down_args.epilogue_store == "bulk_rows_reduce"
+        )
+        reset_events = None
+        if measure_reset:
+            reset_events = tuple(torch.cuda.Event(enable_timing=True) for _ in range(2))
+            # Materialize lazy CUDA events before queuing a kernel that waits for the proxy.
+            for event in reset_events:
+                event.record()
+            torch.cuda.synchronize(device)
 
-    proxy = None
-    ipc_export = None
-    try:
-        if args.proxy_mode == "process":
-            ipc_export = export_cuda_ipc_allocation(ipc_backing)
-            command = proxy_command(
-                args,
-                inputs,
-                ipc_export.handle_hex,
-                ipc_export.allocation_offset_bytes,
-            )
-            proxy = ProcessProxy(command)
-        else:
-            proxy = ThreadProxy(args.thread_proxy_library, args, inputs, ready_rows)
-        for _ in range(max(1, args.warmup)):
-            run_stream_once(
-                proxy, launch, inputs.work_table, ready_rows, device, reset_events=reset_events
-            )
-
-        timings_ms = []
-        reset_timings_ms = []
-        excluding_reset_ms = []
-        for _ in range(args.timing_samples):
-            launches_ms = []
-            resets_ms = []
-            for _ in range(args.iterations):
-                elapsed_ms = run_stream_once(
+        proxy = None
+        ipc_export = None
+        try:
+            if args.proxy_mode == "process":
+                ipc_export = export_cuda_ipc_allocation(ipc_backing)
+                command = proxy_command(
+                    args,
+                    inputs,
+                    ipc_export.handle_hex,
+                    ipc_export.allocation_offset_bytes,
+                )
+                proxy = ProcessProxy(command)
+            else:
+                proxy = ThreadProxy(args.thread_proxy_library, args, inputs, ready_rows, ready_trace)
+            for _ in range(max(1, args.warmup)):
+                run_stream_once(
                     proxy, launch, inputs.work_table, ready_rows, device, reset_events=reset_events
                 )
-                launches_ms.append(elapsed_ms)
-                if measure_reset:
-                    # run_stream_once synchronizes before these events are read or reused.
-                    resets_ms.append(reset_events[0].elapsed_time(reset_events[1]))
-            timings_ms.append(statistics.mean(launches_ms))
-            if measure_reset:
-                reset_timings_ms.append(statistics.mean(resets_ms))
-                excluding_reset_ms.append(statistics.mean(
-                    elapsed - reset for elapsed, reset in zip(launches_ms, resets_ms)
-                ))
-        median_ms = statistics.median(timings_ms)
-        total_routes = args.routes if args.indexed_gather else inputs.up_output.shape[0]
-        up_flops = 2 * total_routes * args.hidden * inputs.W.shape[-1]
-        down_flops = (
-            2 * total_routes * args.output_dim * args.hidden
-            if has_down_projection(args) else 0
-        )
-        tflops = (up_flops + down_flops) / (median_ms * 1e9)
-        operation_name = (
-            "proxy-flush + two-GEMM MLP"
-            if has_down_projection(args)
-            else "proxy-flush + up GEMM"
-        )
-        if measure_reset:
-            median_without_reset_ms = statistics.median(excluding_reset_ms)
-            for label, values in (
-                ("Output reset", reset_timings_ms),
-                ("Pipeline excluding reset", excluding_reset_ms),
-                ("Pipeline including reset", timings_ms),
-            ):
-                print(f"{label} per-launch samples (ms): {[round(v, 4) for v in values]}")
-            print(f"Median output reset time: {statistics.median(reset_timings_ms):.4f} ms")
-            print(
-                f"Median {operation_name} time (excluding reset): {median_without_reset_ms:.4f} ms"
-            )
-            print(f"Median {operation_name} time (including reset): {median_ms:.4f} ms")
-            print(
-                "Effective throughput (excluding reset): "
-                f"{(up_flops + down_flops) / (median_without_reset_ms * 1e9):.2f} TFLOP/s"
-            )
-            print(f"Effective throughput (including reset): {tflops:.2f} TFLOP/s")
-            print("Reset-excluded time subtracts GPU output zeroing from the same "
-                  "end-to-end samples; proxy streaming and host overhead remain included.")
-        else:
-            print(f"Per-launch end-to-end samples (ms): {[round(v, 4) for v in timings_ms]}")
-            print(f"Median {operation_name} time: {median_ms:.4f} ms")
-            print(f"Effective throughput: {tflops:.2f} TFLOP/s")
 
-        if not args.skip_check:
-            max_abs_error, max_allowed_error = check_correctness(
-                inputs, activation=args.activation, atol=args.atol, rtol=args.rtol
+            ready_traces = []
+            timings_ms = []
+            reset_timings_ms = []
+            excluding_reset_ms = []
+            for _ in range(args.timing_samples):
+                launches_ms = []
+                resets_ms = []
+                for _ in range(args.iterations):
+                    elapsed_ms = run_stream_once(
+                        proxy, launch, inputs.work_table, ready_rows, device, reset_events=reset_events
+                    )
+                    if ready_trace is not None:
+                        ready_traces.append(ready_trace.observations())
+                    launches_ms.append(elapsed_ms)
+                    if measure_reset:
+                        # run_stream_once synchronizes before these events are read or reused.
+                        resets_ms.append(reset_events[0].elapsed_time(reset_events[1]))
+                timings_ms.append(statistics.mean(launches_ms))
+                if measure_reset:
+                    reset_timings_ms.append(statistics.mean(resets_ms))
+                    excluding_reset_ms.append(statistics.mean(
+                        elapsed - reset for elapsed, reset in zip(launches_ms, resets_ms)
+                    ))
+            median_ms = statistics.median(timings_ms)
+            total_routes = args.routes if args.indexed_gather else inputs.up_output.shape[0]
+            up_flops = 2 * total_routes * args.hidden * inputs.W.shape[-1]
+            down_flops = (
+                2 * total_routes * args.output_dim * args.hidden
+                if has_down_projection(args) else 0
             )
-            if has_down_projection(args):
-                down_error, down_allowed = check_down_correctness(
-                    inputs, atol=args.atol, rtol=args.rtol
-                )
+            tflops = (up_flops + down_flops) / (median_ms * 1e9)
+            operation_name = (
+                "proxy-flush + two-GEMM MLP"
+                if has_down_projection(args)
+                else "proxy-flush + up GEMM"
+            )
+            if measure_reset:
+                median_without_reset_ms = statistics.median(excluding_reset_ms)
+                for label, values in (
+                    ("Output reset", reset_timings_ms),
+                    ("Pipeline excluding reset", excluding_reset_ms),
+                    ("Pipeline including reset", timings_ms),
+                ):
+                    print(f"{label} per-launch samples (ms): {[round(v, 4) for v in values]}")
+                print(f"Median output reset time: {statistics.median(reset_timings_ms):.4f} ms")
                 print(
-                    "Reference check: PASSED "
-                    f"(up max error {max_abs_error:.6g}, permitted {max_allowed_error:.6g}; "
-                    f"down max error {down_error:.6g}, permitted {down_allowed:.6g})"
+                    f"Median {operation_name} time (excluding reset): {median_without_reset_ms:.4f} ms"
                 )
+                print(f"Median {operation_name} time (including reset): {median_ms:.4f} ms")
+                print(
+                    "Effective throughput (excluding reset): "
+                    f"{(up_flops + down_flops) / (median_without_reset_ms * 1e9):.2f} TFLOP/s"
+                )
+                print(f"Effective throughput (including reset): {tflops:.2f} TFLOP/s")
+                print("Reset-excluded time subtracts GPU output zeroing from the same "
+                      "end-to-end samples; proxy streaming and host overhead remain included.")
             else:
-                print(
-                    "Reference check: PASSED "
-                    f"(max absolute error {max_abs_error:.6g}, "
-                    f"permitted bound {max_allowed_error:.6g})"
+                print(f"Per-launch end-to-end samples (ms): {[round(v, 4) for v in timings_ms]}")
+                print(f"Median {operation_name} time: {median_ms:.4f} ms")
+                print(f"Effective throughput: {tflops:.2f} TFLOP/s")
+
+            if ready_trace is not None:
+                group_width = min(inputs.down_args.max_swizzle_size,
+                                  math.ceil(inputs.down_args.output_dim / inputs.down_args.tile_n))
+                print_ready_traces(ready_traces, group_width * inputs.down_args.tile_n)
+
+            if not args.skip_check:
+                max_abs_error, max_allowed_error = check_correctness(
+                    inputs, activation=args.activation, atol=args.atol, rtol=args.rtol
                 )
-    finally:
-        try:
-            if proxy is not None:
-                proxy.close()
+                if has_down_projection(args):
+                    down_error, down_allowed = check_down_correctness(
+                        inputs, atol=args.atol, rtol=args.rtol
+                    )
+                    print(
+                        "Reference check: PASSED "
+                        f"(up max error {max_abs_error:.6g}, permitted {max_allowed_error:.6g}; "
+                        f"down max error {down_error:.6g}, permitted {down_allowed:.6g})"
+                    )
+                else:
+                    print(
+                        "Reference check: PASSED "
+                        f"(max absolute error {max_abs_error:.6g}, "
+                        f"permitted bound {max_allowed_error:.6g})"
+                    )
         finally:
-            if ipc_export is not None:
-                ipc_export.release()
+            try:
+                if proxy is not None:
+                    proxy.close()
+            finally:
+                if ipc_export is not None:
+                    ipc_export.release()
 
 
 if __name__ == "__main__":

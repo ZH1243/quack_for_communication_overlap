@@ -374,9 +374,13 @@ def test_stream_indexed_gather_proxy(proxy_mode, routes, extra_args):
     assert "Reference check: PASSED" in result.stdout
 
 
-@pytest.mark.parametrize("proxy_mode", ["thread", "process"])
-@pytest.mark.parametrize("down_mode", ["tma", "waves_reduce", "combine"])
-def test_stream_down_projection2_proxy(proxy_mode, down_mode):
+@pytest.mark.parametrize(
+    "proxy_mode,down_mode,trace_ready",
+    [(proxy, mode, False) for proxy in ("thread", "process")
+     for mode in ("tma", "waves_reduce", "combine")]
+    + [("thread", "waves_reduce", True), ("thread", "combine", True)],
+)
+def test_stream_down_projection2_proxy(proxy_mode, down_mode, trace_ready):
     """Check both GEMMs numerically after repeated streaming launches and resets."""
     from pathlib import Path
     import subprocess
@@ -411,6 +415,10 @@ def test_stream_down_projection2_proxy(proxy_mode, down_mode):
             flags += ["--down-combine-in-place"]
         else:
             flags += ["--down-scatter-table-with-replacement"]
+    if trace_ready:
+        # Multiple waves and a partial tail; keep both numerical reference checks.
+        flags += ["--trace-down-ready", "--down-gather-table-publish-ready",
+                  "--hidden", "512", "--routes-per-buffer", "4097"]
     result = subprocess.run(
         [
             sys.executable, str(root / "run/hopper_stream_gather_table_gemm.py"),
@@ -425,6 +433,23 @@ def test_stream_down_projection2_proxy(proxy_mode, down_mode):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Reference check: PASSED (up max error" in result.stdout
     assert "down max error" in result.stdout
+    if trace_ready:
+        import re
+
+        lines = [line for line in result.stdout.splitlines()
+                 if line.startswith("CPU down-ready launch ")]
+        assert len(lines) == 2, result.stdout  # Excludes warmup and compilation.
+        for line in lines:
+            observations = re.findall(r"\[(\d+),(\d+)\) at ([0-9.]+) us", line)
+            assert observations, line
+            previous, previous_time = 0, 0.0
+            for start, end, timestamp in observations:
+                assert int(start) == previous < int(end) <= 8
+                assert float(timestamp) >= previous_time
+                previous, previous_time = int(end), float(timestamp)
+            assert previous == 8  # hidden=512, down tile_n=64; includes final publication.
+    else:
+        assert "CPU down-ready launch " not in result.stdout
     if down_mode != "tma":
         import re
 

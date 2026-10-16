@@ -186,6 +186,7 @@ class PregatherInputs:
     n_tile_major_tile_n: int | None = None
     scatter_output_rows: tuple[int, ...] | None = None
     wave_work_ids: int | None = None
+    wave_ready_host_address: torch.Tensor | None = None
     wave_ready_prefix: torch.Tensor | None = None
     wave_store_workspace: torch.Tensor | None = None
     # GPU int32[1] view of workspace[1], reset per invocation. Acquire-load to poll.
@@ -809,6 +810,8 @@ def make_launch(args: argparse.Namespace, inputs: PregatherInputs):
                 assert inputs.wave_ready_prefix is not None
                 table_kwargs["wave_store_counter"] = inputs.wave_store_workspace
                 table_kwargs["wave_ready_prefix"] = inputs.wave_ready_prefix
+                if inputs.wave_ready_host_address is not None:
+                    table_kwargs["wave_ready_host_address"] = inputs.wave_ready_host_address
             else:
                 table_kwargs["wave_store_counter"] = torch.empty(
                     (1,), dtype=torch.int32, device=inputs.A.device

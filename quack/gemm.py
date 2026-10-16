@@ -100,6 +100,7 @@ def _compile_gemm(
     n_tile_major_output=False,
     has_wave_store_counter=False,
     has_wave_ready_prefix=False,
+    has_wave_ready_host_address=False,
     bulk_row_double_buffer=False,
     bulk_row_swizzle=False,
     bulk_store_rows=None,
@@ -229,6 +230,7 @@ def _compile_gemm(
         has_gather_table_ready=has_gather_table_ready,
         has_wave_store_counter=has_wave_store_counter,
         has_wave_ready_prefix=has_wave_ready_prefix,
+        has_wave_ready_host_address=has_wave_ready_host_address,
         gather_table_num_buffers=gather_table_num_buffers,
         gather_table_width=gather_table_width,
         multi_buffer_gather=multi_buffer_gather,
@@ -643,6 +645,9 @@ def gemm(
     # Both workspace entries are reset together on every launch. GPU consumers
     # must acquire-load entry 1. Metadata must remain immutable during the launch.
     wave_ready_prefix: Optional[Tensor] = None,
+    # CUDA int64[1] containing a mapped host int32 pointer. Caller owns its lifetime
+    # and resets it before launch. Publication uses system-scope release stores.
+    wave_ready_host_address: Optional[Tensor] = None,
     # SM90: stage the full D tile and issue one linear bulk copy/reduction per row.
     # bulk_rows_reduce adds the converted epilogue result to D; callers must
     # initialize D (zero it before every launch for ordinary GEMM semantics).
@@ -775,6 +780,7 @@ def gemm(
         tensor_key(gather_work_table_ready),
         tensor_key(wave_store_counter),
         tensor_key(wave_ready_prefix),
+        tensor_key(wave_ready_host_address),
         tuple(tensor_key(t) for t in A_buffers),
         tuple(tensor_key(t) for t in A_idx_buffers),
         multi_buffer_gather,
@@ -841,6 +847,7 @@ def gemm(
             gather_work_table_ready=gather_work_table_ready,
             wave_store_counter=wave_store_counter,
             wave_ready_prefix=wave_ready_prefix,
+            wave_ready_host_address=wave_ready_host_address,
             multi_buffer_gather_args=multi_buffer_gather_args,
             batch_idx_permute=batch_idx_permute,
             add_to_output=add_to_output,
@@ -891,6 +898,7 @@ def gemm(
         gather_work_table_ready=gather_work_table_ready,
         wave_store_counter=wave_store_counter,
         wave_ready_prefix=wave_ready_prefix,
+        wave_ready_host_address=wave_ready_host_address,
         multi_buffer_gather_args=multi_buffer_gather_args,
         batch_idx_permute=batch_idx_permute,
         SFA=SFA,
@@ -929,6 +937,9 @@ def run_gemm_plan(
     # Both workspace entries are reset together on every launch. GPU consumers
     # must acquire-load entry 1. Metadata must remain immutable during the launch.
     wave_ready_prefix: Optional[Tensor] = None,
+    # CUDA int64[1] containing a mapped host int32 pointer. Caller owns its lifetime
+    # and resets it before launch. Publication uses system-scope release stores.
+    wave_ready_host_address: Optional[Tensor] = None,
     multi_buffer_gather_args: Optional[MultiBufferGatherArguments] = None,
     batch_idx_permute: Optional[Tensor] = None,
     SFA: Optional[Tensor] = None,
@@ -1002,6 +1013,7 @@ def run_gemm_plan(
         gather_table_ready=gather_work_table_ready,
         wave_store_counter=wave_store_counter,
         wave_ready_prefix=wave_ready_prefix,
+        wave_ready_host_address=wave_ready_host_address,
         multi_buffer_gather=multi_buffer_gather_args,
     )
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
@@ -1051,6 +1063,7 @@ def _build_gemm_plan(
     gather_work_table_ready,
     wave_store_counter,
     wave_ready_prefix,
+    wave_ready_host_address,
     multi_buffer_gather_args,
     batch_idx_permute,
     add_to_output,
@@ -1080,6 +1093,16 @@ def _build_gemm_plan(
     bulk_row_swizzle=False,
     bulk_store_rows=None,
 ) -> _GemmPlan:
+    if wave_ready_host_address is not None:
+        if wave_ready_prefix is None:
+            raise ValueError("host readiness publication requires wave_ready_prefix")
+        if (
+            wave_ready_host_address.shape != (1,)
+            or wave_ready_host_address.dtype != torch.int64
+            or wave_ready_host_address.device != A.device
+            or not wave_ready_host_address.is_contiguous()
+        ):
+            raise ValueError("wave_ready_host_address must be CUDA int64[1] on the input device")
     if wave_ready_prefix is not None:
         if wave_store_counter is None:
             raise ValueError("wave_ready_prefix requires wave_store_counter")
@@ -1569,6 +1592,7 @@ def _build_gemm_plan(
         n_tile_major_output,
         wave_store_counter is not None,
         has_wave_ready_prefix=wave_ready_prefix is not None,
+        has_wave_ready_host_address=wave_ready_host_address is not None,
         bulk_row_double_buffer=bulk_row_double_buffer,
         bulk_row_swizzle=bulk_row_swizzle,
         bulk_store_rows=bulk_store_rows,

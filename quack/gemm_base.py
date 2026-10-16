@@ -842,6 +842,7 @@ class GemmBase:
                 ready_rows=scheduler_args.gather_table_ready,
                 wave_store_counter=scheduler_args.wave_store_counter,
                 wave_ready_prefix=scheduler_args.wave_ready_prefix,
+                wave_ready_host_address=scheduler_args.wave_ready_host_address,
             )
         elif const_expr(varlen_args.mCuSeqlensM is None):
             num_problems = (
