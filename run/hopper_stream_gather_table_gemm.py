@@ -735,14 +735,16 @@ def print_ready_traces(traces: list[list[tuple[int, float]]], group_width: int) 
     print(f"CPU down-ready trace: group width={group_width} columns; warmup excluded.")
     print("Times are CPU detections after polling starts, not GPU completion timestamps.")
     print("Ranges are group IDs [start,end); a jump is one observation for the entire range.")
-    for launch_id, observations in enumerate(traces, 1):
-        previous_group, previous_us = 0, None
-        entries = []
-        for group, detected_us in observations:
-            gap = "first" if previous_us is None else f"gap={detected_us - previous_us:.3f} us"
-            entries.append(f"[{previous_group},{group}) at {detected_us:.3f} us ({gap})")
-            previous_group, previous_us = group, detected_us
-        print(f"CPU down-ready launch {launch_id}: " + "; ".join(entries))
+    if not traces:
+        return
+    launch_id, observations = len(traces), traces[-1]
+    previous_group, previous_us = 0, None
+    entries = []
+    for group, detected_us in observations:
+        gap = "first" if previous_us is None else f"gap={detected_us - previous_us:.3f} us"
+        entries.append(f"[{previous_group},{group}) at {detected_us:.3f} us ({gap})")
+        previous_group, previous_us = group, detected_us
+    print(f"CPU down-ready launch {launch_id}: " + "; ".join(entries))
 
 
 class ThreadProxy:

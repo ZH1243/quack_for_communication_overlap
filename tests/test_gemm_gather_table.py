@@ -438,7 +438,8 @@ def test_stream_down_projection2_proxy(proxy_mode, down_mode, trace_ready):
 
         lines = [line for line in result.stdout.splitlines()
                  if line.startswith("CPU down-ready launch ")]
-        assert len(lines) == 2, result.stdout  # Excludes warmup and compilation.
+        assert len(lines) == 1, result.stdout  # Only the final measured launch.
+        assert lines[0].startswith("CPU down-ready launch 2:"), result.stdout
         for line in lines:
             observations = re.findall(r"\[(\d+),(\d+)\) at ([0-9.]+) us", line)
             assert observations, line

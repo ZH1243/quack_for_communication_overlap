@@ -66,8 +66,8 @@ the same proxy worker acquire-polls the host flag and records timestamps using
 The host flag is reset before each launch, after the previous worker and GPU have
 finished. A 30-second polling timeout reports a missing final publication.
 
-At the end, each measured invocation prints its observations and the gaps between
-them in microseconds; warmup is excluded. For example (illustrative numbers):
+At the end, only the last measured invocation prints its observations and the gaps
+between them in microseconds; warmup is excluded. For example (illustrative numbers):
 
 ```text
 CPU down-ready launch 1: [0,1) at 12.300 us (first); [1,3) at 19.500 us (gap=7.200 us)
