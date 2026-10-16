@@ -522,3 +522,45 @@ A focused numerical exchange/restore check (no GEMM compilation) is available:
 ```bash
 torchrun --standalone --nnodes=1 --nproc-per-node=4 run/test_initial_token_exchange.py
 ```
+
+### Return down-projection results to the original source GPUs
+
+Add `--return-token-results` to the initial-exchange command to return results
+**after every warmup and measured launch**. This requires
+`--initial-token-exchange --down-projection2 --down-combine-in-place`,
+`--proxy-mode thread`, `--down-gather-table-publish-ready`, and
+`--trace-down-ready` (and the normal prerequisites for ready publication).
+Without the new flag, the existing execution and timing path is unchanged.
+
+Rebuild the thread proxy after updating this checkout:
+
+```bash
+cmake -S run/cpu_proxy -B run/cpu_proxy/build
+cmake --build run/cpu_proxy/build -j
+```
+
+Each GPU allocates N receive buffers once. Computing GPU `d` returns its output
+buffer `i` to original source GPU `i`, receive buffer `d`. Thus receive buffer `d`
+on GPU `i` corresponds to original source chunk `(d-i-1)%N`. Each proxy submits
+N-1 peer memcpy calls and one local memcpy after observing the full ready prefix.
+A CUDA event orders the return stream after down-GEMM completion. The worker waits
+for its copies and an all-rank shared-memory generation barrier before reporting
+completion, protecting in-place outputs from the next launch's input restoration.
+The barrier timeout uses `--token-exchange-timeout`.
+
+Whole contiguous physical buffers are copied. `--down-n-tile-major-output` remains
+N-tile-major in the receive buffers; no transpose, concatenation, or additional
+reduction is performed. IPC mappings and receive allocations persist across
+iterations and are closed after the proxy stops.
+
+With this flag, reported pipeline time and effective TFLOP/s **include the return
+copies and all-rank completion barrier**. Reset-excluded timing still subtracts
+only down-output zeroing. Initial token exchange remains outside measured time.
+Unless `--skip-check` is set, final returned buffers are compared byte-for-byte
+against the corresponding peer outputs, alongside the existing PyTorch numerical
+GEMM reference checks. Run a small regression covering repeated iterations and
+both output layouts with:
+
+```bash
+torchrun --standalone --nnodes=1 --nproc-per-node=4 run/test_return_token_results.py
+```

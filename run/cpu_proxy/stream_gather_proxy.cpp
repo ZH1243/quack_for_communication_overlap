@@ -629,6 +629,59 @@ struct ReadyTrace {
   }
 };
 
+// Configured once while the worker is idle. Pointers/events are owned by Python.
+struct ReturnCopies {
+  int device;
+  std::vector<std::uintptr_t> sources, destinations;
+  std::size_t bytes;
+  cudaEvent_t down_done;
+  cudaStream_t stream = nullptr;
+  std::uint64_t* completions;
+  std::uint64_t generation = 0;
+  double timeout_seconds;
+
+  ReturnCopies(int rank, int count, const std::uintptr_t* src, const std::uintptr_t* dst,
+               std::size_t size, std::uintptr_t event, std::uintptr_t counters, double timeout)
+      : device(rank), sources(src, src + count), destinations(dst, dst + count), bytes(size),
+        down_done(reinterpret_cast<cudaEvent_t>(event)),
+        completions(reinterpret_cast<std::uint64_t*>(counters)), timeout_seconds(timeout) {
+    check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+               "cudaStreamCreate(return copies)");
+  }
+  ~ReturnCopies() { if (stream) cudaStreamDestroy(stream); }
+
+  void run(ReadyTrace* trace) {
+    // The CPU ready flag triggers submission; the event orders actual DMA after kernel exit.
+    check_cuda(cudaStreamWaitEvent(stream, down_done, 0), "cudaStreamWaitEvent(down done)");
+    for (int peer = 0; peer < static_cast<int>(sources.size()); ++peer) {
+      auto* dst = reinterpret_cast<void*>(destinations[peer]);
+      auto* src = reinterpret_cast<const void*>(sources[peer]);
+      if (peer == device) {
+        check_cuda(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream),
+                   "cudaMemcpyAsync(return local)");
+      } else {
+        check_cuda(cudaMemcpyPeerAsync(dst, peer, src, device, bytes, stream),
+                   "cudaMemcpyPeerAsync(return peer)");
+      }
+    }
+    check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize(return copies)");
+    ++generation;
+    __atomic_store_n(completions + device, generation, __ATOMIC_RELEASE);
+    const auto start = std::chrono::steady_clock::now();
+    for (int peer = 0; peer < static_cast<int>(sources.size()); ++peer) {
+      while (__atomic_load_n(completions + peer, __ATOMIC_ACQUIRE) < generation) {
+        if (trace->cancelled.load(std::memory_order_relaxed))
+          throw std::runtime_error("return-copy barrier cancelled");
+        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count()
+            > timeout_seconds)
+          throw std::runtime_error("timed out waiting for return copies from rank " +
+                                   std::to_string(peer));
+        std::this_thread::yield();
+      }
+    }
+  }
+};
+
 struct ThreadProxyState {
   int device = 0;
   std::unique_ptr<FlushProxy> proxy;
@@ -640,6 +693,7 @@ struct ThreadProxyState {
   bool stopping = false;
   std::string worker_error;
   ReadyTrace* ready_trace = nullptr;  // Owned by the caller until worker shutdown.
+  std::unique_ptr<ReturnCopies> return_copies;
   std::thread worker;
 
   ThreadProxyState(int device_value, std::unique_ptr<FlushProxy> proxy_value)
@@ -702,6 +756,7 @@ struct ThreadProxyState {
         check_cuda(cudaSetDevice(device), "cudaSetDevice(worker thread)");
         proxy->run_once();
         if (ready_trace) ready_trace->poll();
+        if (return_copies) return_copies->run(ready_trace);
       } catch (const std::exception& exception) {
         error = exception.what();
       } catch (...) {
@@ -795,6 +850,26 @@ extern "C" void stream_gather_ready_trace_destroy(void* handle) {
 }
 extern "C" void stream_gather_thread_proxy_set_ready_trace(void* handle, void* trace) {
   static_cast<ThreadProxyState*>(handle)->ready_trace = static_cast<ReadyTrace*>(trace);
+}
+
+extern "C" int stream_gather_thread_proxy_set_return_copies(
+    void* handle, int count, const std::uintptr_t* sources, const std::uintptr_t* destinations,
+    std::size_t bytes, std::uintptr_t event, std::uintptr_t counters, double timeout,
+    char* error, std::size_t capacity) {
+  try {
+    auto* state = static_cast<ThreadProxyState*>(handle);
+    if (!state || !state->ready_trace || count < 2 || state->device >= count ||
+        !sources || !destinations || !bytes || !event || !counters || timeout <= 0)
+      throw std::runtime_error("invalid return-copy configuration");
+    if (state->outstanding) throw std::runtime_error("configure return copies with worker idle");
+    check_cuda(cudaSetDevice(state->device), "cudaSetDevice(return setup)");
+    state->return_copies = std::make_unique<ReturnCopies>(
+        state->device, count, sources, destinations, bytes, event, counters, timeout);
+    return 0;
+  } catch (const std::exception& exception) {
+    write_error(error, capacity, exception.what());
+    return 1;
+  }
 }
 
 extern "C" void* stream_gather_thread_proxy_create(

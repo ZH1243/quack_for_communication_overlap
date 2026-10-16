@@ -28,6 +28,7 @@ import os
 import selectors
 import statistics
 import subprocess
+import sys
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -155,6 +156,10 @@ def parse_args() -> argparse.Namespace:
         "--token-exchange-timeout", type=float, default=120.0,
         help="Timeout in seconds for each token-exchange shared-memory barrier (default: 120)",
     )
+    parser.add_argument(
+        "--return-token-results", action="store_true",
+        help="After each down GEMM, have the thread proxy copy results back to source GPUs",
+    )
     args = parser.parse_args()
     if args.local_rank is not None:
         args.device = args.local_rank
@@ -162,6 +167,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_stream_args(args: argparse.Namespace) -> None:
+    if args.return_token_results and (
+        not args.initial_token_exchange or not args.down_combine_in_place
+        or not args.down_projection2 or args.proxy_mode != "thread"
+        or not args.trace_down_ready or not args.down_gather_table_publish_ready
+    ):
+        raise ValueError("--return-token-results requires --initial-token-exchange, "
+                         "--down-projection2, --down-combine-in-place, --proxy-mode thread, "
+                         "--down-gather-table-publish-ready and --trace-down-ready")
     if args.initial_token_exchange:
         world = int(os.environ.get("WORLD_SIZE", "0"))
         local_world = int(os.environ.get("LOCAL_WORLD_SIZE", "0"))
@@ -665,11 +678,19 @@ def run_stream_once(
         launch()
     else:
         launch(reset_events=reset_events)
+    return_exchange = getattr(proxy, "return_exchange", None)
+    if return_exchange is not None:
+        return_exchange.record_down_done()
     start_ns = time.perf_counter_ns()
     proxy.go()
     torch.cuda.synchronize(device)
+    if return_exchange is not None:
+        # Includes CPU-triggered DMA and the all-rank completion barrier. A device
+        # synchronize alone can finish before the proxy has even enqueued its DMA.
+        proxy.wait()
     elapsed_ms = (time.perf_counter_ns() - start_ns) / 1e6
-    proxy.wait()
+    if return_exchange is None:
+        proxy.wait()
     return elapsed_ms
 
 
@@ -1030,6 +1051,7 @@ def main() -> None:
             torch.cuda.synchronize(device)
 
         proxy = None
+        return_exchange = None
         ipc_export = None
         try:
             if args.proxy_mode == "process":
@@ -1043,6 +1065,18 @@ def main() -> None:
                 proxy = ProcessProxy(command)
             else:
                 proxy = ThreadProxy(args.thread_proxy_library, args, inputs, ready_rows, ready_trace)
+            if args.return_token_results:
+                try:
+                    from run.return_exchange import ReturnExchange
+                except ModuleNotFoundError as error:
+                    if error.name != "run":
+                        raise
+                    from return_exchange import ReturnExchange
+                with torch.inference_mode():
+                    return_exchange = ReturnExchange(args, inputs, proxy, export_cuda_ipc_allocation)
+                proxy.return_exchange = return_exchange
+                print("Return copies enabled: pipeline timing includes all-rank return completion; "
+                      "received buffers are indexed by computing GPU rank.")
             for _ in range(max(1, args.warmup)):
                 run_stream_once(
                     proxy, launch, inputs.work_table, ready_rows, device, reset_events=reset_events
@@ -1084,6 +1118,8 @@ def main() -> None:
                 if has_down_projection(args)
                 else "proxy-flush + up GEMM"
             )
+            if return_exchange is not None:
+                operation_name += " + return copies + rank barrier"
             if measure_reset:
                 median_without_reset_ms = statistics.median(excluding_reset_ms)
                 for label, values in (
@@ -1115,6 +1151,8 @@ def main() -> None:
                 print_ready_traces(ready_traces, group_width * inputs.down_args.tile_n)
 
             if not args.skip_check:
+                if return_exchange is not None:
+                    return_exchange.check()
                 max_abs_error, max_allowed_error = check_correctness(
                     inputs, activation=args.activation, atol=args.atol, rtol=args.rtol
                 )
@@ -1134,12 +1172,17 @@ def main() -> None:
                         f"permitted bound {max_allowed_error:.6g})"
                     )
         finally:
+            success = sys.exc_info()[0] is None
             try:
                 if proxy is not None:
                     proxy.close()
             finally:
-                if ipc_export is not None:
-                    ipc_export.release()
+                try:
+                    if return_exchange is not None:
+                        return_exchange.close(success=success and sys.exc_info()[0] is None)
+                finally:
+                    if ipc_export is not None:
+                        ipc_export.release()
 
 
 if __name__ == "__main__":

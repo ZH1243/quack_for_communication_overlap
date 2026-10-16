@@ -14,7 +14,7 @@ from pathlib import Path
 class SharedExchange:
     """Small /dev/shm control plane protected by a process-shared file lock."""
 
-    def __init__(self, rank, world, timeout):
+    def __init__(self, rank, world, timeout, namespace="tokens"):
         import fcntl
 
         self.fcntl = fcntl
@@ -22,7 +22,7 @@ class SharedExchange:
         identity = (os.getuid(), os.environ.get("TORCHELASTIC_RUN_ID"),
                     os.environ.get("MASTER_ADDR"), os.environ.get("MASTER_PORT"))
         digest = hashlib.sha256(repr(identity).encode()).hexdigest()[:24]
-        self.path = Path("/dev/shm") / f"quack-tokens-{digest}"
+        self.path = Path("/dev/shm") / f"quack-{namespace}-{digest}"
         size = max(1048576, world * world * 1024)
         deadline = time.monotonic() + timeout
         if rank == 0:
@@ -52,7 +52,7 @@ class SharedExchange:
             if key is not None:
                 state.setdefault(key, {})[str(self.rank)] = value
                 data = json.dumps(state).encode()
-                if len(data) + 8 > len(self.memory):
+                if len(data) + 8 > len(self.memory) - self.world * 8:
                     raise RuntimeError("Token exchange control metadata exceeds shared memory")
                 self.memory[8:8 + len(data)] = data
                 self.memory[:8] = len(data).to_bytes(8, "little")
