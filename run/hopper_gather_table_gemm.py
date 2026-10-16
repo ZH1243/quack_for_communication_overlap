@@ -733,24 +733,35 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> TableGathe
     )
 
     if getattr(args, "down_projection2", False):
-        down_args = down_projection_args(args, total_routes)
-        inputs.down_args = down_args
-        output_buffers = None
-        scatter_mapping = None
-        if getattr(args, "down_combine_in_place", False):
-            inputs.original_X = tuple(buffer.clone() for buffer in X)
-            output_buffers = tuple(
-                buffer.view(args.hidden // down_args.tile_n, -1)
-                if down_args.n_tile_major_output else buffer
-                for buffer in X
-            )
-            scatter_mapping = build_original_token_mapping(inputs)
-        inputs.down_inputs = pregather.prepare_grouped_inputs(
-            down_args, up_output, W_down, down_counts,
-            output_buffers=output_buffers, scatter_mapping=scatter_mapping,
-        )
-        inputs.output = inputs.down_inputs.output
+        prepare_down_projection2(args, inputs, down_counts)
     return inputs
+
+
+@torch.inference_mode()
+def prepare_down_projection2(
+    args: argparse.Namespace, inputs: TableGatherInputs, down_counts: list[int]
+) -> None:
+    """Prepare the configurable down GEMM around the allocated up output."""
+    up_output = inputs.up_output
+    assert up_output is not None and inputs.W_down is not None
+    down_args = down_projection_args(args, up_output.shape[0])
+    inputs.down_args = down_args
+    output_buffers = None
+    scatter_mapping = None
+    if getattr(args, "down_combine_in_place", False):
+        assert isinstance(inputs.X, tuple)
+        inputs.original_X = tuple(buffer.clone() for buffer in inputs.X)
+        output_buffers = tuple(
+            buffer.view(args.hidden // down_args.tile_n, -1)
+            if down_args.n_tile_major_output else buffer
+            for buffer in inputs.X
+        )
+        scatter_mapping = build_original_token_mapping(inputs)
+    inputs.down_inputs = pregather.prepare_grouped_inputs(
+        down_args, up_output, inputs.W_down, down_counts,
+        output_buffers=output_buffers, scatter_mapping=scatter_mapping,
+    )
+    inputs.output = inputs.down_inputs.output
 
 
 def build_original_token_mapping(inputs: TableGatherInputs) -> torch.Tensor:

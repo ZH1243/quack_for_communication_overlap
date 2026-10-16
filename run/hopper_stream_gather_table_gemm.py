@@ -7,6 +7,11 @@ as a separate CUDA-IPC process or as a worker thread sharing PyTorch's CUDA
 context. The persistent scheduler warp waits for the prefix before reading a
 row.
 
+All --down-projection2 options from hopper_gather_table_gemm.py are supported.
+The down table and identity indices are prepared before either GEMM launches;
+only the up table is streamed. The down GEMM consumes the activated up output
+on the same CUDA stream. Output reduction resets are included in timing.
+
 Fuse a SwiGLU up-projection while streaming the 2N-wide work table:
 
     python run/hopper_stream_gather_table_gemm.py --multi-buffer-gather \
@@ -36,7 +41,10 @@ try:
         balanced_buffer_allocations,
         check_correctness,
         check_down_correctness,
+        has_down_projection,
         make_arg_parser,
+        pregather,
+        prepare_down_projection2,
         multi_buffer_route_counts,
         sequential_buffer_allocations,
         validate_args,
@@ -51,7 +59,10 @@ except ModuleNotFoundError as error:
         balanced_buffer_allocations,
         check_correctness,
         check_down_correctness,
+        has_down_projection,
         make_arg_parser,
+        pregather,
+        prepare_down_projection2,
         multi_buffer_route_counts,
         sequential_buffer_allocations,
         validate_args,
@@ -67,6 +78,7 @@ def parse_args() -> argparse.Namespace:
         "Benchmark QuACK's SM90 single- or multi-buffer GroupedGEMM while a CPU proxy streams "
         "its gather table into HBM.",
         include_down_projection=True,
+        include_down_projection2=True,
     )
     parser.add_argument(
         "--indexed-gather",
@@ -235,7 +247,7 @@ def prepare_inputs(
         )
     W.mul_(1.0 / math.sqrt(args.hidden))
     W_down = None
-    if args.down_projection:
+    if has_down_projection(args):
         W_down = torch.randn(
             (args.experts, args.output_dim, args.hidden), dtype=dtype, device=device
         )
@@ -285,7 +297,7 @@ def prepare_inputs(
         else up_output
     )
     cu_seqlens_m = None
-    if args.down_projection:
+    if has_down_projection(args):
         cumulative_routes = [0]
         for expert in range(args.experts):
             count = sum(offsets[expert + 1] - offsets[expert] for offsets in route_offsets)
@@ -305,6 +317,12 @@ def prepare_inputs(
         up_output=up_output,
         cu_seqlens_m=cu_seqlens_m,
     )
+    if getattr(args, "down_projection2", False):
+        down_counts = [
+            sum(counts[expert] for counts in counts_by_buffer)
+            for expert in range(args.experts)
+        ]
+        prepare_down_projection2(args, inputs, down_counts)
     return inputs, ready_rows, ipc_backing
 
 
@@ -334,7 +352,18 @@ def make_launch(
             use_tma_gather=False,
         )
 
+    configurable_down = (
+        pregather.make_launch(inputs.down_args, inputs.down_inputs)
+        if inputs.down_inputs is not None else None
+    )
+
+    @torch.inference_mode()
     def launch_down() -> None:
+        if configurable_down is not None:
+            if inputs.down_args.epilogue_store == "bulk_rows_reduce":
+                inputs.down_inputs.zero_up_output()
+            configurable_down()
+            return
         assert B_down is not None and inputs.cu_seqlens_m is not None
         quack_gemm(
             up_output,
@@ -357,7 +386,11 @@ def make_launch(
             use_tma_gather=False,
         )
 
+    @torch.inference_mode()
     def launch() -> None:
+        if inputs.original_X is not None:
+            for buffer, original in zip(inputs.X, inputs.original_X):
+                buffer.copy_(original)
         if args.activation is not None:
             gemm_act(
                 inputs.X,
@@ -399,12 +432,12 @@ def make_launch(
                 use_tma_gather=False,
             )
 
-        if args.down_projection:
+        if has_down_projection(args):
             # This launch is ordered after the readiness-gated up GEMM on the
             # same stream and consumes its expert-contiguous activated output.
             launch_down()
 
-    return launch, launch_down if args.down_projection else None
+    return launch, launch_down if has_down_projection(args) else None
 
 
 @dataclass
@@ -780,12 +813,23 @@ def main() -> None:
     )
     if inputs.W_down is not None:
         assert inputs.up_output is not None
+        output_shapes = (
+            [tuple(t.shape) for t in inputs.down_inputs.output_buffers()]
+            if inputs.down_inputs is not None else [tuple(inputs.output.shape)]
+        )
         print(
             f"W_down: {tuple(inputs.W_down.shape)}, up output: {tuple(inputs.up_output.shape)}, "
-            f"final output: {tuple(inputs.output.shape)}"
+            f"final output buffers: {output_shapes}"
         )
     else:
         print(f"Output: {tuple(inputs.output.shape)}, down projection: disabled")
+    if inputs.down_args is not None:
+        down_options = {k: v for k, v in vars(args).items() if k.startswith("down_")}
+        print(f"Down-projection2 options: {down_options}")
+        if inputs.down_inputs.gather_work_table is not None:
+            print("Down gather table is prepared before launch; only the up table is streamed.")
+        if inputs.down_args.epilogue_store == "bulk_rows_reduce":
+            print("Pipeline timing includes down-output zeroing before each reduction.")
     print(f"Routes per expert by buffer: {counts}")
     print(
         f"Work table: {tuple(inputs.work_table.shape)}, x={inputs.work_group_size}, "
@@ -801,7 +845,7 @@ def main() -> None:
     print(f"Fused activation: {args.activation or 'disabled'}")
     if not args.no_cuda_graph:
         print("CUDA graph capture is disabled for externally produced streaming table data.")
-    compile_target = "up and down kernels" if args.down_projection else "kernel"
+    compile_target = "up and down kernels" if has_down_projection(args) else "kernel"
     print(f"Compiling and warming up the readiness-gated QuACK {compile_target}...")
 
     # Compile the down kernel before any readiness-gated up kernel is queued.
@@ -839,16 +883,16 @@ def main() -> None:
             ]
             timings_ms.append(statistics.mean(launches_ms))
         median_ms = statistics.median(timings_ms)
-        total_routes = args.routes if args.indexed_gather else inputs.output.shape[0]
+        total_routes = args.routes if args.indexed_gather else inputs.up_output.shape[0]
         up_flops = 2 * total_routes * args.hidden * inputs.W.shape[-1]
         down_flops = (
-            2 * inputs.output.shape[0] * args.output_dim * args.hidden
-            if args.down_projection else 0
+            2 * total_routes * args.output_dim * args.hidden
+            if has_down_projection(args) else 0
         )
         tflops = (up_flops + down_flops) / (median_ms * 1e9)
         operation_name = (
             "proxy-flush + two-GEMM MLP"
-            if args.down_projection
+            if has_down_projection(args)
             else "proxy-flush + up GEMM"
         )
         print(f"Per-launch end-to-end samples (ms): {[round(value, 4) for value in timings_ms]}")
@@ -859,7 +903,7 @@ def main() -> None:
             max_abs_error, max_allowed_error = check_correctness(
                 inputs, activation=args.activation, atol=args.atol, rtol=args.rtol
             )
-            if args.down_projection:
+            if has_down_projection(args):
                 down_error, down_allowed = check_down_correctness(
                     inputs, atol=args.atol, rtol=args.rtol
                 )

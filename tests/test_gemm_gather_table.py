@@ -374,6 +374,59 @@ def test_stream_indexed_gather_proxy(proxy_mode, routes, extra_args):
     assert "Reference check: PASSED" in result.stdout
 
 
+@pytest.mark.parametrize("proxy_mode", ["thread", "process"])
+@pytest.mark.parametrize("down_mode", ["tma", "waves_reduce", "combine"])
+def test_stream_down_projection2_proxy(proxy_mode, down_mode):
+    """Check both GEMMs numerically after repeated streaming launches and resets."""
+    from pathlib import Path
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parents[1]
+    artifact = root / "run/cpu_proxy/build" / (
+        "libstream_gather_proxy_thread.so" if proxy_mode == "thread" else "stream_gather_proxy"
+    )
+    if not artifact.is_file():
+        pytest.skip("build run/cpu_proxy on Hopper before running proxy integration tests")
+    flags = [
+        "--down-projection2", "--activation", "swiglu", "--pingpong",
+        "--multi-buffer-gather", "--balanced-multi-buffer-gather",
+        "--round-robin-m-clusters", "--num-input-buffers", "2",
+        "--tokens-per-buffer", "97", "--routes-per-buffer", "421",
+        "--routing-with-replacement", "--experts", "3",
+        "--hidden", "128", "--output-dim", "256",
+        "--tile-m", "64", "--tile-n", "128", "--max-swizzle-size", "1",
+        "--down-tile-m", "64", "--down-tile-n", "64", "--down-cluster-m", "1",
+        "--down-max-swizzle-size", "1",
+    ]
+    if down_mode != "tma":
+        flags += [
+            "--down-gather-table", "--down-gather-table-expert-waves",
+            "--down-gather-table-wave-barrier", "--down-pingpong",
+            "--down-scatter-table", "--down-n-tile-major-output",
+            "--down-multi-buffer-scatter", "--down-scatter-output-buffers", "2",
+            "--down-epilogue-store", "bulk_rows_reduce",
+        ]
+        if down_mode == "combine":
+            flags += ["--down-combine-in-place"]
+        else:
+            flags += ["--down-scatter-table-with-replacement"]
+    result = subprocess.run(
+        [
+            sys.executable, str(root / "run/hopper_stream_gather_table_gemm.py"),
+            "--proxy-mode", proxy_mode, "--warmup", "1", "--iterations", "2",
+            "--timing-samples", "1", "--flush-entries", "2", "--flush-interval-us", "5",
+            *flags,
+        ],
+        cwd=root, capture_output=True, text=True, timeout=300,
+    )
+    # The CLI compares up and down values with float32 and same-dtype references.
+    # Repeated launches catch omitted reduction resets and in-place input restores.
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Reference check: PASSED (up max error" in result.stdout
+    assert "down max error" in result.stdout
+
+
 @torch.inference_mode()
 @pytest.mark.parametrize(
     "mode,multi_input,indexed",
