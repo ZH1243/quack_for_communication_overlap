@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import math
+import os
 import selectors
 import statistics
 import subprocess
@@ -137,7 +138,15 @@ def parse_args() -> argparse.Namespace:
         help="Have the thread proxy timestamp down-output column-prefix changes in mapped "
              "pinned host memory (requires --down-gather-table-publish-ready)",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--local-rank", "--local_rank", type=int,
+        default=int(os.environ["LOCAL_RANK"]) if "LOCAL_RANK" in os.environ else None,
+        help="Launcher-assigned local rank; overrides --device for the kernel and CPU proxy",
+    )
+    args = parser.parse_args()
+    if args.local_rank is not None:
+        args.device = args.local_rank
+    return args
 
 
 def validate_stream_args(args: argparse.Namespace) -> None:
@@ -882,6 +891,11 @@ def main() -> None:
     validate_stream_args(args)
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
+    if not 0 <= args.device < torch.cuda.device_count():
+        raise ValueError(
+            f"CUDA device {args.device} is outside the visible device range "
+            f"[0, {torch.cuda.device_count()}); launch at most one worker per visible GPU"
+        )
     torch.cuda.set_device(args.device)
     device = torch.device("cuda", args.device)
     capability = torch.cuda.get_device_capability(device)
@@ -906,7 +920,11 @@ def main() -> None:
             [b - a for a, b in zip(offsets[:-1], offsets[1:])]
             for offsets in inputs.route_offsets
         ]
-        print(f"Device: {torch.cuda.get_device_name(device)} (SM{capability[0]}{capability[1]})")
+        print(
+            f"Device: {device}, {torch.cuda.get_device_name(device)} "
+            f"(SM{capability[0]}{capability[1]}), PID={os.getpid()}, "
+            f"local_rank={args.local_rank}"
+        )
         X_buffers = inputs.X if isinstance(inputs.X, tuple) else (inputs.X,)
         print(
             f"X buffers: {len(X_buffers)} x {tuple(X_buffers[0].shape)}, "

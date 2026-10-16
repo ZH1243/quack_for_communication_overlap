@@ -71,6 +71,35 @@ every copy batch. Before reading row `i`, lane 0 of the scheduler warp waits for
 `ready_rows[0] >= i + 1`; it then broadcasts the row through the existing
 scheduler path. All GEMM, gather, and epilogue behavior is otherwise unchanged.
 
+To run an independent copy on each of eight local GPUs, use `torchrun`:
+
+```bash
+torchrun --standalone --nnodes=1 --nproc-per-node=8 \
+    --log-dir logs/stream_gather --tee 3 \
+    run/hopper_stream_gather_table_gemm.py --proxy-mode thread \
+    --multi-buffer-gather --balanced-multi-buffer-gather --round-robin-m-clusters \
+    --num-input-buffers 16 --tokens-per-buffer 2048 --routes-per-buffer 4096 \
+    --hidden 4096 --output-dim 1024 --tile-m 128 --tile-n 128 --experts 8 \
+    --warmup 5 --iterations 10 --timing-samples 5 --pingpong --activation swiglu \
+    --flush-entries 1000 --flush-interval-us 5 --flag-update-mode memcpy \
+    --down-projection2 --down-combine-in-place --down-n-tile-major-output \
+    --down-tile-m 128 --down-tile-n 128 --down-pingpong \
+    --down-gather-table --down-gather-table-expert-waves --down-max-swizzle-size 1 \
+    --down-gather-table-wave-barrier --down-gather-table-publish-ready --trace-down-ready
+```
+
+The launcher's `LOCAL_RANK` selects the CUDA device for both the kernel and its
+proxy, overriding `--device`. Plain `python` launches still use `--device` (default
+0). Device indices refer to the `CUDA_VISIBLE_DEVICES` ordering; set that variable
+and reduce `--nproc-per-node` to run on a subset. `--tee 3` labels console output
+by worker and saves each worker's stdout/stderr under the log directory.
+
+With `--proxy-mode thread`, this creates eight Python worker processes, each with
+its own CPU proxy thread, GPU buffers, correctness checks, and timing results.
+All dimensions and the expert count apply **per GPU**. No process group, inter-GPU
+data exchange, or iteration barriers are used; workers progress independently,
+so the results are not a synchronized eight-GPU throughput measurement.
+
 Build the C++ proxy first:
 
 ```bash
