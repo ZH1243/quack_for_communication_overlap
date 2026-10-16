@@ -358,10 +358,14 @@ def make_launch(
     )
 
     @torch.inference_mode()
-    def launch_down() -> None:
+    def launch_down(*, reset_events=None) -> None:
         if configurable_down is not None:
             if inputs.down_args.epilogue_store == "bulk_rows_reduce":
+                if reset_events is not None:
+                    reset_events[0].record()
                 inputs.down_inputs.zero_up_output()
+                if reset_events is not None:
+                    reset_events[1].record()
             configurable_down()
             return
         assert B_down is not None and inputs.cu_seqlens_m is not None
@@ -387,7 +391,7 @@ def make_launch(
         )
 
     @torch.inference_mode()
-    def launch() -> None:
+    def launch(*, reset_events=None) -> None:
         if inputs.original_X is not None:
             for buffer, original in zip(inputs.X, inputs.original_X):
                 buffer.copy_(original)
@@ -435,7 +439,7 @@ def make_launch(
         if has_down_projection(args):
             # This launch is ordered after the readiness-gated up GEMM on the
             # same stream and consumes its expert-contiguous activated output.
-            launch_down()
+            launch_down(reset_events=reset_events)
 
     return launch, launch_down if has_down_projection(args) else None
 
@@ -594,13 +598,18 @@ def run_stream_once(
     work_table: torch.Tensor,
     ready_rows: torch.Tensor,
     device: torch.device,
+    *,
+    reset_events=None,
 ) -> float:
     work_table.fill_(-1)
     ready_rows.zero_()
     torch.cuda.synchronize(device)
     # Queue the persistent kernel while every table row is still poisoned
     # and ready_rows is zero. Its scheduler warp starts by polling row 0.
-    launch()
+    if reset_events is None:
+        launch()
+    else:
+        launch(reset_events=reset_events)
     start_ns = time.perf_counter_ns()
     proxy.go()
     torch.cuda.synchronize(device)
@@ -858,6 +867,17 @@ def main() -> None:
             precompile_down()
         torch.cuda.synchronize(device)
 
+    measure_reset = (
+        inputs.down_inputs is not None and inputs.down_args.epilogue_store == "bulk_rows_reduce"
+    )
+    reset_events = None
+    if measure_reset:
+        reset_events = tuple(torch.cuda.Event(enable_timing=True) for _ in range(2))
+        # Materialize lazy CUDA events before queuing a kernel that waits for the proxy.
+        for event in reset_events:
+            event.record()
+        torch.cuda.synchronize(device)
+
     proxy = None
     ipc_export = None
     try:
@@ -873,15 +893,30 @@ def main() -> None:
         else:
             proxy = ThreadProxy(args.thread_proxy_library, args, inputs, ready_rows)
         for _ in range(max(1, args.warmup)):
-            run_stream_once(proxy, launch, inputs.work_table, ready_rows, device)
+            run_stream_once(
+                proxy, launch, inputs.work_table, ready_rows, device, reset_events=reset_events
+            )
 
         timings_ms = []
+        reset_timings_ms = []
+        excluding_reset_ms = []
         for _ in range(args.timing_samples):
-            launches_ms = [
-                run_stream_once(proxy, launch, inputs.work_table, ready_rows, device)
-                for _ in range(args.iterations)
-            ]
+            launches_ms = []
+            resets_ms = []
+            for _ in range(args.iterations):
+                elapsed_ms = run_stream_once(
+                    proxy, launch, inputs.work_table, ready_rows, device, reset_events=reset_events
+                )
+                launches_ms.append(elapsed_ms)
+                if measure_reset:
+                    # run_stream_once synchronizes before these events are read or reused.
+                    resets_ms.append(reset_events[0].elapsed_time(reset_events[1]))
             timings_ms.append(statistics.mean(launches_ms))
+            if measure_reset:
+                reset_timings_ms.append(statistics.mean(resets_ms))
+                excluding_reset_ms.append(statistics.mean(
+                    elapsed - reset for elapsed, reset in zip(launches_ms, resets_ms)
+                ))
         median_ms = statistics.median(timings_ms)
         total_routes = args.routes if args.indexed_gather else inputs.up_output.shape[0]
         up_flops = 2 * total_routes * args.hidden * inputs.W.shape[-1]
@@ -895,9 +930,30 @@ def main() -> None:
             if has_down_projection(args)
             else "proxy-flush + up GEMM"
         )
-        print(f"Per-launch end-to-end samples (ms): {[round(value, 4) for value in timings_ms]}")
-        print(f"Median {operation_name} time: {median_ms:.4f} ms")
-        print(f"Effective throughput: {tflops:.2f} TFLOP/s")
+        if measure_reset:
+            median_without_reset_ms = statistics.median(excluding_reset_ms)
+            for label, values in (
+                ("Output reset", reset_timings_ms),
+                ("Pipeline excluding reset", excluding_reset_ms),
+                ("Pipeline including reset", timings_ms),
+            ):
+                print(f"{label} per-launch samples (ms): {[round(v, 4) for v in values]}")
+            print(f"Median output reset time: {statistics.median(reset_timings_ms):.4f} ms")
+            print(
+                f"Median {operation_name} time (excluding reset): {median_without_reset_ms:.4f} ms"
+            )
+            print(f"Median {operation_name} time (including reset): {median_ms:.4f} ms")
+            print(
+                "Effective throughput (excluding reset): "
+                f"{(up_flops + down_flops) / (median_without_reset_ms * 1e9):.2f} TFLOP/s"
+            )
+            print(f"Effective throughput (including reset): {tflops:.2f} TFLOP/s")
+            print("Reset-excluded time subtracts GPU output zeroing from the same "
+                  "end-to-end samples; proxy streaming and host overhead remain included.")
+        else:
+            print(f"Per-launch end-to-end samples (ms): {[round(v, 4) for v in timings_ms]}")
+            print(f"Median {operation_name} time: {median_ms:.4f} ms")
+            print(f"Effective throughput: {tflops:.2f} TFLOP/s")
 
         if not args.skip_check:
             max_abs_error, max_allowed_error = check_correctness(

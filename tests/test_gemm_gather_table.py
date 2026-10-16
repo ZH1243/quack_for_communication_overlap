@@ -425,6 +425,19 @@ def test_stream_down_projection2_proxy(proxy_mode, down_mode):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Reference check: PASSED (up max error" in result.stdout
     assert "down max error" in result.stdout
+    if down_mode != "tma":
+        import re
+
+        throughputs = {}
+        for label in ("excluding", "including"):
+            match = re.search(
+                rf"Effective throughput \({label} reset\): ([0-9.]+) TFLOP/s", result.stdout
+            )
+            assert match is not None, result.stdout
+            throughputs[label] = float(match.group(1))
+        assert throughputs["excluding"] >= throughputs["including"] > 0
+    else:
+        assert "Effective throughput:" in result.stdout
 
 
 @torch.inference_mode()
