@@ -46,6 +46,7 @@ struct Options {
   int table_width = 0;
   int experts = 0;
   int routes_per_buffer = 0;
+  std::vector<int> route_counts; // Optional buffer-major expert quotas.
   int num_input_buffers = 0;
   int output_dim = 0;
   int tile_m = 0;
@@ -287,7 +288,9 @@ PinnedTable build_table(const Options& options,
     for (int expert = 0; expert < options.experts; ++expert) {
       const int rotated =
           (expert - (buffer % options.experts) + options.experts) % options.experts;
-      counts[buffer][expert] = base + static_cast<int>(rotated < remainder);
+      counts[buffer][expert] = options.route_counts.empty()
+          ? base + static_cast<int>(rotated < remainder)
+          : options.route_counts[buffer * options.experts + expert];
       offsets[buffer][expert + 1] = offsets[buffer][expert] + counts[buffer][expert];
     }
   }
@@ -343,7 +346,7 @@ PinnedTable build_table(const Options& options,
   table.rows = options.table_rows;
   table.width = options.table_width;
   check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&table.data),
-                           row_count * table.width * sizeof(std::int32_t),
+                           std::max<std::size_t>(1, row_count * table.width) * sizeof(std::int32_t),
                            cudaHostAllocDefault),
              "cudaHostAlloc(table)");
 
@@ -465,7 +468,7 @@ class FlushProxy {
     batches_ = (table_.rows + options_.entries_per_flush - 1) / options_.entries_per_flush;
     if (options_.flag_mode == "memcpy") {
       check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&ready_values_),
-                               batches_ * sizeof(std::int32_t), cudaHostAllocDefault),
+                               std::max(1, batches_) * sizeof(std::int32_t), cudaHostAllocDefault),
                  "cudaHostAlloc(readiness values)");
       for (int batch = 0; batch < batches_; ++batch) {
         ready_values_[batch] =
@@ -637,6 +640,8 @@ struct ReturnCopies {
   int device;
   std::vector<std::uintptr_t> sources, destinations;
   std::size_t bytes;
+  std::vector<std::size_t> peer_bytes;
+  int num_groups = 0;
   std::size_t group_bytes = 0;  // Zero preserves whole-buffer return after kernel exit.
   cudaEvent_t down_done;
   cudaStream_t stream = nullptr;
@@ -646,7 +651,7 @@ struct ReturnCopies {
 
   ReturnCopies(int rank, int count, const std::uintptr_t* src, const std::uintptr_t* dst,
                std::size_t size, std::uintptr_t event, std::uintptr_t counters, double timeout)
-      : device(rank), sources(src, src + count), destinations(dst, dst + count), bytes(size),
+      : device(rank), sources(src, src + count), destinations(dst, dst + count), bytes(size), peer_bytes(count, size),
         down_done(reinterpret_cast<cudaEvent_t>(event)),
         completions(reinterpret_cast<std::uint64_t*>(counters)), timeout_seconds(timeout) {
     check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
@@ -654,8 +659,11 @@ struct ReturnCopies {
   }
   ~ReturnCopies() { if (stream) cudaStreamDestroy(stream); }
 
-  void submit(std::size_t offset, std::size_t count) {
+  void submit(int group = -1) {
     for (int peer = 0; peer < static_cast<int>(sources.size()); ++peer) {
+      const auto count = group < 0 ? peer_bytes[peer] : peer_bytes[peer] / num_groups;
+      if (!count) continue;
+      const auto offset = group < 0 ? 0 : static_cast<std::size_t>(group) * count;
       auto* dst = reinterpret_cast<void*>(destinations[peer] + offset);
       auto* src = reinterpret_cast<const void*>(sources[peer] + offset);
       if (peer == device) {
@@ -671,7 +679,7 @@ struct ReturnCopies {
   void run(ReadyTrace* trace) {
     // Whole-buffer mode is called only after the existing final-prefix poll.
     check_cuda(cudaStreamWaitEvent(stream, down_done, 0), "cudaStreamWaitEvent(down done)");
-    submit(0, bytes);
+    submit();
     finish(trace);
   }
 
@@ -680,7 +688,7 @@ struct ReturnCopies {
     // Each group is immutable after publication, including all reduction contributors.
     trace->poll([this](int previous, int ready) {
       for (int group = previous; group < ready; ++group) {
-        submit(static_cast<std::size_t>(group) * group_bytes, group_bytes);
+        submit(group);
       }
     });
     // No per-group synchronization: continue polling/submitting while DMA runs.
@@ -912,6 +920,80 @@ extern "C" int stream_gather_thread_proxy_set_return_groups(
         bytes / group_bytes != static_cast<std::size_t>(state->ready_trace->final_groups))
       throw std::runtime_error("return groups must exactly cover each physical output buffer");
     state->return_copies->group_bytes = group_bytes;
+    state->return_copies->num_groups = state->ready_trace->final_groups;
+    return 0;
+  } catch (const std::exception& exception) {
+    write_error(error, capacity, exception.what());
+    return 1;
+  }
+}
+
+// Variable-size return setup keeps the legacy APIs and fixed-size behavior intact.
+extern "C" int stream_gather_thread_proxy_set_return_sizes(
+    void* handle, int count, const std::size_t* sizes, int streaming,
+    char* error, std::size_t capacity) {
+  try {
+    auto* state = static_cast<ThreadProxyState*>(handle);
+    if (!state || state->outstanding || !state->return_copies || !sizes ||
+        count != static_cast<int>(state->return_copies->sources.size()))
+      throw std::runtime_error("invalid variable return sizes");
+    auto& copies = *state->return_copies;
+    copies.peer_bytes.assign(sizes, sizes + count);
+    copies.num_groups = streaming ? state->ready_trace->final_groups : 0;
+    copies.group_bytes = streaming ? 1 : 0;
+    for (auto size : copies.peer_bytes)
+      if (streaming && size % copies.num_groups)
+        throw std::runtime_error("column groups must partition each output buffer");
+    return 0;
+  } catch (const std::exception& exception) {
+    write_error(error, capacity, exception.what());
+    return 1;
+  }
+}
+
+extern "C" void stream_gather_ready_trace_publish_idle(void* handle) {
+  auto* trace = static_cast<ReadyTrace*>(handle);
+  __atomic_store_n(trace->host, trace->final_groups, __ATOMIC_RELEASE);
+}
+
+// One batch per destination; rows have disjoint destinations and may share sources.
+extern "C" int stream_gather_copy_token_batch(
+    std::uintptr_t destination, std::uintptr_t source, const std::int64_t* indices,
+    std::size_t count, std::size_t row_bytes, std::uintptr_t stream,
+    char* error, std::size_t capacity) {
+  try {
+#if CUDART_VERSION >= 12090
+    if (!count) return 0;
+#if CUDART_VERSION >= 13000
+    std::vector<const void*> src(count), dst(count);
+#else
+    std::vector<void*> src(count), dst(count);
+#endif
+    std::vector<std::size_t> sizes(count, row_bytes);
+    for (std::size_t i = 0; i < count; ++i) {
+      src[i] = reinterpret_cast<void*>(source + indices[i] * row_bytes);
+      dst[i] = reinterpret_cast<void*>(destination + i * row_bytes);
+    }
+    cudaMemcpyAttributes attributes{};
+    attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
+    std::size_t first = 0;
+#if CUDART_VERSION >= 13000
+    check_cuda(cudaMemcpyBatchAsync(dst.data(), src.data(), sizes.data(), count,
+                                    &attributes, &first, 1,
+                                    reinterpret_cast<cudaStream_t>(stream)),
+               "cudaMemcpyBatchAsync(tokens)");
+#else
+    std::size_t failed = 0;
+    check_cuda(cudaMemcpyBatchAsync(dst.data(), src.data(), sizes.data(), count,
+                                    &attributes, &first, 1, &failed,
+                                    reinterpret_cast<cudaStream_t>(stream)),
+               "cudaMemcpyBatchAsync(tokens)");
+#endif
+#else
+    (void)destination; (void)source; (void)indices; (void)count;
+    (void)row_bytes; (void)stream;
+    throw std::runtime_error("bitmask exchange requires rebuilding with CUDA >=12.9");
+#endif
     return 0;
   } catch (const std::exception& exception) {
     write_error(error, capacity, exception.what());
@@ -933,6 +1015,37 @@ extern "C" void* stream_gather_thread_proxy_create(
         device, table_rows, table_width, experts, routes_per_buffer, num_input_buffers,
         output_dim, tile_m, tile_n, cluster_m, max_swizzle_size, entries_per_flush, interval_us,
         dma_kick_bytes, balanced, round_robin, flag_mode);
+    initialize_cuda(device);
+    auto proxy = std::make_unique<FlushProxy>(
+        options, reinterpret_cast<std::int32_t*>(device_table),
+        reinterpret_cast<std::int32_t*>(device_ready));
+    proxy->initialize();
+    auto state = std::make_unique<ThreadProxyState>(device, std::move(proxy));
+    return state.release();
+  } catch (const std::exception& exception) {
+    write_error(error, error_capacity, exception.what());
+    return nullptr;
+  }
+}
+
+extern "C" void* stream_gather_thread_proxy_create_variable(
+    int device, std::uintptr_t device_table, std::uintptr_t device_ready, int table_rows,
+    int table_width, int experts, int routes_per_buffer, int num_input_buffers, int output_dim,
+    int tile_m, int tile_n, int cluster_m, int max_swizzle_size, int entries_per_flush,
+    int interval_us, std::size_t dma_kick_bytes, int balanced, int round_robin, int flag_mode,
+    const int* counts, char* error, std::size_t error_capacity) {
+  try {
+    if ((!device_table && table_rows) || device_ready == 0 || !counts || table_rows < 0) {
+      throw std::runtime_error("thread proxy device pointers must be non-null");
+    }
+    auto options = make_thread_options(
+        device, std::max(1, table_rows), table_width, experts, std::max(1, routes_per_buffer), num_input_buffers,
+        output_dim, tile_m, tile_n, cluster_m, max_swizzle_size, entries_per_flush, interval_us,
+        dma_kick_bytes, balanced, round_robin, flag_mode);
+    options.table_rows = table_rows;
+    options.route_counts.assign(counts, counts + experts * num_input_buffers);
+    for (int count : options.route_counts)
+      if (count < 0) throw std::runtime_error("negative expert route count");
     initialize_cuda(device);
     auto proxy = std::make_unique<FlushProxy>(
         options, reinterpret_cast<std::int32_t*>(device_table),

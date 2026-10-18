@@ -45,6 +45,7 @@ try:
         check_correctness,
         check_down_correctness,
         covered_token_routes,
+        down_projection_args,
         has_down_projection,
         make_arg_parser,
         pregather,
@@ -64,6 +65,7 @@ except ModuleNotFoundError as error:
         check_correctness,
         check_down_correctness,
         covered_token_routes,
+        down_projection_args,
         has_down_projection,
         make_arg_parser,
         pregather,
@@ -167,6 +169,14 @@ def parse_args() -> argparse.Namespace:
         help="Return each completed down column group while later groups compute; requires "
              "--return-token-results and --down-n-tile-major-output",
     )
+    parser.add_argument(
+        "--bitmask-token-routing", action="store_true",
+        help="Use random destination bits for initial exchange (thread proxy, at most 8 GPUs)",
+    )
+    parser.add_argument("--token-route-probability", type=float, default=0.25,
+                        help="Independent probability for each destination bit (default: 0.25)")
+    parser.add_argument("--local-routes-per-token", type=int, default=2,
+                        help="Routes per received token on average in bitmask mode (default: 2)")
     args = parser.parse_args()
     if args.local_rank is not None:
         args.device = args.local_rank
@@ -174,6 +184,18 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_stream_args(args: argparse.Namespace) -> None:
+    if args.bitmask_token_routing:
+        if not args.initial_token_exchange or args.proxy_mode != "thread":
+            raise ValueError("--bitmask-token-routing requires --initial-token-exchange "
+                             "and --proxy-mode thread")
+        if not 0 <= args.token_route_probability <= 1:
+            raise ValueError("--token-route-probability must be in [0, 1]")
+        if args.local_routes_per_token < 1:
+            raise ValueError("--local-routes-per-token must be positive")
+        if not args.routing_with_replacement and args.local_routes_per_token > args.experts:
+            raise ValueError("local routes per token cannot exceed experts without replacement")
+        if int(os.environ.get("WORLD_SIZE", "0")) > 8:
+            raise ValueError("one-byte routing supports at most 8 GPUs")
     if args.return_token_results_per_group and (
         not args.return_token_results or not args.down_n_tile_major_output
     ):
@@ -197,16 +219,22 @@ def validate_stream_args(args: argparse.Namespace) -> None:
         if not args.multi_buffer_gather or args.num_input_buffers != world:
             raise ValueError("--initial-token-exchange requires --multi-buffer-gather and "
                              "--num-input-buffers equal to --nproc-per-node")
-        if args.source_tokens is None or args.source_tokens <= 0 or args.source_tokens % world:
+        if (args.source_tokens is None or args.source_tokens <= 0
+                or (not args.bitmask_token_routing and args.source_tokens % world)):
             raise ValueError("--source-tokens must be positive and divisible by --nproc-per-node")
         tokens = args.tokens_per_buffer if args.tokens_per_buffer is not None else args.tokens
-        if tokens != args.source_tokens // world:
+        if not args.bitmask_token_routing and tokens != args.source_tokens // world:
             raise ValueError("--tokens-per-buffer must equal --source-tokens / --nproc-per-node")
         if not math.isfinite(args.token_exchange_timeout) or args.token_exchange_timeout <= 0:
             raise ValueError("--token-exchange-timeout must be finite and positive")
         if not Path("/dev/shm").is_dir():
             raise RuntimeError("--initial-token-exchange requires Linux /dev/shm")
-    validate_args(args)
+    validation_args = argparse.Namespace(**vars(args))
+    if args.bitmask_token_routing:
+        # Legacy fixed buffer flags do not determine sizes in this mode.
+        validation_args.tokens_per_buffer = 1
+        validation_args.routes_per_buffer = args.local_routes_per_token
+    validate_args(validation_args)
     if args.trace_down_ready:
         if args.proxy_mode != "thread":
             raise ValueError("--trace-down-ready requires --proxy-mode thread")
@@ -292,7 +320,7 @@ def build_stream_metadata(
 
 @torch.inference_mode()
 def prepare_inputs(
-    args: argparse.Namespace, device: torch.device
+    args: argparse.Namespace, device: torch.device, routing_plan=None
 ) -> tuple[TableGatherInputs, torch.Tensor, torch.Tensor]:
     """Prepare operands and empty HBM table storage; the proxy owns table contents."""
     dtype = DTYPES[args.dtype]
@@ -302,6 +330,14 @@ def prepare_inputs(
     counts_by_buffer = multi_buffer_route_counts(
         routes, args.experts, num_buffers
     )
+    token_counts = [tokens] * num_buffers
+    if routing_plan is not None:
+        token_counts = routing_plan.incoming_counts
+        counts_by_buffer = [
+            multi_buffer_route_counts(count * args.local_routes_per_token, args.experts,
+                                      num_buffers)[buffer]
+            for buffer, count in enumerate(token_counts)
+        ]
     gated = args.activation in GATED_ACTIVATIONS
     gemm_output_dim = args.output_dim * (2 if gated else 1)
     route_offsets, output_segments, group_size, table_rows = build_stream_metadata(
@@ -330,14 +366,14 @@ def prepare_inputs(
         )
         W_down.mul_(1.0 / math.sqrt(args.output_dim))
     X = tuple(
-        torch.randn((tokens, args.hidden), dtype=dtype, device=device)
-        for _ in range(num_buffers)
+        torch.randn((count, args.hidden), dtype=dtype, device=device)
+        for count in token_counts
     )
     A_idx = tuple(
         covered_token_routes(
-            tokens, counts, replacement=args.routing_with_replacement, device=device
-        )
-        for counts in counts_by_buffer
+            count, counts, replacement=args.routing_with_replacement, device=device
+        ) if count else torch.empty(0, dtype=torch.int32, device=device)
+        for count, counts in zip(token_counts, counts_by_buffer)
     )
 
     cluster_rows = args.tile_m * args.cluster_m
@@ -354,7 +390,7 @@ def prepare_inputs(
     work_table = ipc_backing[:table_elements].view(table_rows, table_width)
     ready_rows = ipc_backing[table_elements : table_elements + 1]
     ready_rows.zero_()
-    total_routes = num_buffers * routes
+    total_routes = sum(sum(counts) for counts in counts_by_buffer)
     if args.indexed_gather:
         ipc_backing[table_elements + 1 :].copy_(A_idx[0])
     allocate_up = torch.zeros if args.indexed_gather else torch.empty
@@ -392,13 +428,44 @@ def prepare_inputs(
             sum(counts[expert] for counts in counts_by_buffer)
             for expert in range(args.experts)
         ]
-        prepare_down_projection2(args, inputs, down_counts)
+        if total_routes:
+            prepare_down_projection2(args, inputs, down_counts)
+        else:
+            prepare_idle_down(args, inputs)
+    inputs.routing_plan = routing_plan
     return inputs, ready_rows, ipc_backing
+
+
+def prepare_idle_down(args, inputs):
+    """An empty rank owns no work but must participate in result-return barriers."""
+    from types import SimpleNamespace
+
+    down = down_projection_args(args, args.num_input_buffers)
+    down.routes = 0
+    inputs.down_args = down
+    inputs.original_X = tuple(buffer.clone() for buffer in inputs.X)
+    outputs = tuple(
+        buffer.view(args.hidden // down.tile_n, 0) if down.n_tile_major_output else buffer
+        for buffer in inputs.X
+    )
+    groups = math.ceil(down.output_dim / down.tile_n)
+    groups //= min(down.max_swizzle_size, groups)
+    inputs.down_inputs = SimpleNamespace(
+        output_buffers=lambda: outputs, zero_up_output=lambda: None,
+        gather_work_table=None, wave_ready_prefix=torch.tensor([groups], device=inputs.W.device),
+    )
+    inputs.output = outputs
 
 
 def make_launch(
     args: argparse.Namespace, inputs: TableGatherInputs, ready_rows: torch.Tensor
 ):
+    if inputs.up_output.shape[0] == 0:
+        def idle_launch(*, reset_events=None):
+            if reset_events is not None:
+                for event in reset_events:
+                    event.record()
+        return idle_launch, None
     from quack.gemm import gemm as quack_gemm
     from quack.gemm_config import GemmConfig
     from quack.gemm_interface import gemm_act
@@ -686,6 +753,11 @@ def run_stream_once(
     return_exchange = getattr(proxy, "return_exchange", None)
     if return_exchange is not None:
         return_exchange.record_down_done()
+    if work_table.shape[0] == 0 and trace is not None:
+        publish = trace.library.stream_gather_ready_trace_publish_idle
+        publish.argtypes = [ctypes.c_void_p]
+        publish.restype = None
+        publish(trace.handle)
     start_ns = time.perf_counter_ns()
     proxy.go()
     if return_exchange is not None:
@@ -862,6 +934,18 @@ class ThreadProxy:
             char_pointer,
             ctypes.c_size_t,
         ]
+        variable_counts = None
+        if args.bitmask_token_routing:
+            old_argtypes = create.argtypes
+            try:
+                create = self.library.stream_gather_thread_proxy_create_variable
+            except AttributeError as error:
+                raise RuntimeError("Rebuild run/cpu_proxy for bitmask token routing") from error
+            create.argtypes = old_argtypes[:-2] + [ctypes.POINTER(ctypes.c_int)] + old_argtypes[-2:]
+            variable_counts = (ctypes.c_int * (args.experts * len(inputs.route_offsets)))(*[
+                b - a for offsets in inputs.route_offsets
+                for a, b in zip(offsets[:-1], offsets[1:])
+            ])
         create.restype = ctypes.c_void_p
         start.argtypes = [
             ctypes.c_void_p,
@@ -900,6 +984,7 @@ class ThreadProxy:
             int(args.balanced_multi_buffer_gather),
             int(args.round_robin_m_clusters),
             int(args.flag_update_mode == "stream-write"),
+            *([variable_counts] if variable_counts is not None else []),
             error,
             len(error),
         )
@@ -962,7 +1047,16 @@ def main() -> None:
         raise RuntimeError(f"this runner requires Hopper SM90, got capability {capability}")
 
     torch.manual_seed(args.seed)
-    inputs, ready_rows, ipc_backing = prepare_inputs(args, device)
+    routing_plan = None
+    if args.bitmask_token_routing:
+        try:
+            from run.bitmask_exchange import BitmaskRoutingPlan
+        except ModuleNotFoundError as error:
+            if error.name != "run":
+                raise
+            from bitmask_exchange import BitmaskRoutingPlan
+        routing_plan = BitmaskRoutingPlan(args, device)
+    inputs, ready_rows, ipc_backing = prepare_inputs(args, device, routing_plan)
     if args.initial_token_exchange:
         try:
             from run.token_exchange import exchange_tokens
@@ -971,7 +1065,10 @@ def main() -> None:
                 raise
             from token_exchange import exchange_tokens
         with torch.inference_mode():
-            exchange_tokens(args, inputs, export_cuda_ipc_allocation)
+            if routing_plan is None:
+                exchange_tokens(args, inputs, export_cuda_ipc_allocation)
+            else:
+                routing_plan.exchange(args, inputs, export_cuda_ipc_allocation)
     torch.cuda.synchronize(device)
     with ExitStack() as resources:
         ready_trace = None
@@ -995,7 +1092,7 @@ def main() -> None:
         )
         X_buffers = inputs.X if isinstance(inputs.X, tuple) else (inputs.X,)
         print(
-            f"X buffers: {len(X_buffers)} x {tuple(X_buffers[0].shape)}, "
+            f"X buffers: {[tuple(buffer.shape) for buffer in X_buffers]}, "
             f"W_up: {tuple(inputs.W.shape)}, dtype: {X_buffers[0].dtype}, "
             f"multi-buffer={args.multi_buffer_gather}, indexed-gather={args.indexed_gather}"
         )
@@ -1166,7 +1263,7 @@ def main() -> None:
                 max_abs_error, max_allowed_error = check_correctness(
                     inputs, activation=args.activation, atol=args.atol, rtol=args.rtol
                 )
-                if has_down_projection(args):
+                if has_down_projection(args) and inputs.up_output.shape[0]:
                     down_error, down_allowed = check_down_correctness(
                         inputs, atol=args.atol, rtol=args.rtol
                     )

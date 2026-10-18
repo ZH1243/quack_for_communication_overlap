@@ -110,6 +110,7 @@ class TableGatherInputs:
     down_inputs: pregather.PregatherInputs | None = None
     down_args: argparse.Namespace | None = None
     original_X: tuple[torch.Tensor, ...] | None = None
+    routing_plan: object | None = None  # Optional variable-size initial token exchange
 
 
 def make_arg_parser(
@@ -746,7 +747,7 @@ def prepare_down_projection2(
         assert isinstance(inputs.X, tuple)
         inputs.original_X = tuple(buffer.clone() for buffer in inputs.X)
         output_buffers = tuple(
-            buffer.view(args.hidden // down_args.tile_n, -1)
+            buffer.view(args.hidden // down_args.tile_n, buffer.shape[0] * down_args.tile_n)
             if down_args.n_tile_major_output else buffer
             for buffer in inputs.X
         )

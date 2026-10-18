@@ -201,9 +201,9 @@ class PregatherInputs:
             tile_n, n = self.n_tile_major_tile_n, self.W_up.shape[-1]
             outputs = [
                 buffer.view(-1)[:math.ceil(n / tile_n) * rows * tile_n]
-                .view(-1, rows, tile_n)
+                .view(math.ceil(n / tile_n), rows, tile_n)
                 .permute(1, 0, 2)
-                .reshape(rows, -1)[:, :n]
+                .reshape(rows, math.ceil(n / tile_n) * tile_n)[:, :n]
                 for buffer, rows in zip(
                     self.output_buffers(),
                     self.scatter_output_rows
@@ -474,9 +474,12 @@ def validate_args(args: argparse.Namespace, *, prepacked: bool = False) -> None:
     if args.multi_buffer_scatter:
         if not args.scatter_table:
             raise ValueError("--multi-buffer-scatter requires --scatter-table")
-        if not 2 <= args.scatter_output_buffers <= args.routes:
+        if (args.scatter_output_buffers < 2
+                or (args.scatter_output_buffers > args.routes
+                    and not getattr(args, "bitmask_token_routing", False))):
             raise ValueError("--scatter-output-buffers must be between 2 and routes")
-        scatter_output_sizes(args)
+        if not getattr(args, "bitmask_token_routing", False):
+            scatter_output_sizes(args)
     if args.scatter_output_rows is not None or args.scatter_output_capacity_rows is not None:
         if not args.multi_buffer_scatter or not args.n_tile_major_output:
             raise ValueError("scatter output row options require multi-buffer N-tile-major output")

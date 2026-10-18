@@ -33,6 +33,7 @@ from quack.gemm_tvm_ffi_utils import (
     make_fake_scheduler_args,
     make_fake_varlen_args,
     make_fake_gemm_tensors,
+    make_fake_multi_buffer_gather,
     make_fake_sf_tensor,
     compile_gemm_kernel,
     resolve_blockscaled_formats,
@@ -211,15 +212,8 @@ def _compile_gemm(
     varlen_args = make_fake_varlen_args(
         varlen_m, varlen_k, gather_A, aidx_len, gather_table=gather_table
     )
-    multi_buffer_gather = (
-        MultiBufferGatherArguments(
-            x_buffers=tuple(mA for _ in range(gather_table_num_buffers - 1)),
-            a_idx_buffers=tuple(
-                varlen_args.mAIdx for _ in range(gather_table_num_buffers - 1)
-            ),
-        )
-        if gather_table_num_buffers > 1
-        else None
+    multi_buffer_gather = make_fake_multi_buffer_gather(
+        a_dtype, a_major, k, gather_table_num_buffers
     )
     scheduler_args = make_fake_scheduler_args(
         (is_dynamic_persistent and device_capacity[0] <= 9),
@@ -457,27 +451,25 @@ def _validate_scatter_buffers(
                 tile_n is not None
                 and (
                     buffer.shape[0] != first.shape[0]
-                    or buffer.shape[1] == 0
                     or buffer.shape[1] % tile_n
                     or not buffer.is_contiguous()
                 )
             )
-            or buffer.shape[0] == 0
             or buffer.stride(1) != 1
             or buffer.stride(0) < buffer.shape[1]
             or buffer.data_ptr() % 16
-            or buffer.stride(0) * buffer.element_size() % 16
+            or (buffer.numel() and buffer.stride(0) * buffer.element_size() % 16)
             or buffer.shape[1] * buffer.element_size() % 16
         ):
             if tile_n is not None:
                 raise ValueError(
                     "N-tile-major scatter outputs must share device, dtype and tile count, "
                     "with contiguous [num_n_tiles, rows_in_buffer*tile_n] storage, "
-                    "positive row counts and 16-byte-aligned bases"
+                    "nonnegative row counts and 16-byte-aligned bases"
                 )
             raise ValueError(
-                "scatter outputs must share device, dtype and column count, with nonempty "
-                "rows, contiguous columns and 16-byte-aligned bases, row strides and widths"
+                "scatter outputs must share device, dtype and column count, with "
+                "contiguous columns and 16-byte-aligned bases, row strides and widths"
             )
 
 
@@ -502,7 +494,7 @@ def build_scatter_row_addresses(
     Pass this metadata with multi_buffer_scatter=True and n_tile_major_output=True.
     used_rows optionally sets each buffer's logical row count (requires tile_n).
     Tile strides use these counts, packing all tiles into a contiguous prefix of
-    each allocation. Counts must be positive and no larger than allocated capacity.
+    each allocation. Counts must be nonnegative and no larger than allocated capacity.
     Rebuild metadata when counts change; allocation shape remains capacity metadata.
     """
     _validate_scatter_buffers(buffers, tile_n=tile_n)
@@ -511,10 +503,10 @@ def build_scatter_row_addresses(
         if tile_n is None:
             raise ValueError("used_rows requires N-tile-major scatter (tile_n)")
         if len(used_rows) != len(buffers) or any(
-            not isinstance(rows, int) or isinstance(rows, bool) or not 0 < rows <= capacity
+            not isinstance(rows, int) or isinstance(rows, bool) or not 0 <= rows <= capacity
             for rows, capacity in zip(used_rows, capacities)
         ):
-            raise ValueError("used_rows must contain one positive count per buffer within capacity")
+            raise ValueError("used_rows must contain one nonnegative count per buffer within capacity")
     if (
         mapping.ndim != 2
         or mapping.shape[1] != 2
@@ -1263,24 +1255,24 @@ def _build_gemm_plan(
                 if not isinstance(A_extra, Tensor) or not isinstance(A_idx_extra, Tensor):
                     raise ValueError("multi_buffer_gather entries must be torch tensors")
                 if (
-                    A_extra.shape != A.shape
+                    A_extra.ndim != A.ndim
+                    or A_extra.shape[1:] != A.shape[1:]
                     or A_extra.stride() != A.stride()
                     or A_extra.dtype != A.dtype
                     or A_extra.device != A.device
                 ):
                     raise ValueError(
-                        f"A buffer {buffer_idx} must match buffer 0's shape, stride, dtype, "
+                        f"A buffer {buffer_idx} must match buffer 0's column shape, stride, dtype, "
                         "and device"
                     )
                 if (
                     A_idx_extra.ndim != 1
-                    or A_idx_extra.shape != A_idx.shape
                     or A_idx_extra.stride() != A_idx.stride()
                     or A_idx_extra.dtype != torch.int32
                     or A_idx_extra.device != A.device
                 ):
                     raise ValueError(
-                        f"A_idx buffer {buffer_idx} must match buffer 0's shape and stride "
+                        f"A_idx buffer {buffer_idx} must match buffer 0's stride "
                         f"and be int32 on {A.device}"
                     )
                 total_routes += A_idx_extra.shape[0]

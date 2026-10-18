@@ -27,13 +27,23 @@ class ReturnExchange:
         self.cuda = CudaCopies()
         self.closed = False
         self.outputs = inputs.down_inputs.output_buffers()
-        self.received = tuple(torch.empty_like(buffer) for buffer in self.outputs)
+        plan = getattr(inputs, "routing_plan", None)
+        if plan is None:
+            self.received = tuple(torch.empty_like(buffer) for buffer in self.outputs)
+        else:
+            self.received = tuple(torch.empty(
+                (args.hidden // args.down_tile_n, count * args.down_tile_n)
+                if args.down_n_tile_major_output else (count, args.hidden),
+                dtype=self.outputs[0].dtype, device=self.outputs[0].device,
+            ) for count in plan.outgoing_counts)
+        self.source_token_indices = plan.indices if plan is not None else None
         self.down_done = torch.cuda.Event()
         # Materialize the event before passing its handle to the native worker.
         self.down_done.record()
         torch.cuda.synchronize()
         try:
-            signature = [list(self.outputs[0].shape), str(self.outputs[0].dtype),
+            signature = [args.hidden if plan is not None else list(self.outputs[0].shape),
+                         plan is not None, str(self.outputs[0].dtype),
                          args.down_n_tile_major_output, args.down_tile_n,
                          os.environ.get("CUDA_VISIBLE_DEVICES"), args.warmup,
                          args.iterations, args.timing_samples, args.skip_check,
@@ -42,14 +52,18 @@ class ReturnExchange:
             if any(value != signature for value in signatures):
                 raise ValueError("Return exchange requires matching output layouts on all ranks")
             for buffer in (*self.received, *self.outputs):
-                if not buffer.is_contiguous() or buffer.numel() != self.outputs[0].numel():
+                if not buffer.is_contiguous() or (
+                    plan is None and buffer.numel() != self.outputs[0].numel()
+                ):
                     raise ValueError("Return exchange requires equal-sized contiguous buffers")
-                self.exports.append(export_allocation(buffer))
+                self.exports.append(export_allocation(buffer) if buffer.numel() else None)
             metadata = self.control.gather("allocations", [
-                [item.handle_hex, item.allocation_offset_bytes] for item in self.exports
+                [item.handle_hex, item.allocation_offset_bytes] if item else None
+                for item in self.exports
             ])
             self.metadata = metadata
             destinations = [
+                0 if not self.outputs[peer].numel() else
                 self.received[self.rank].data_ptr() if peer == self.rank else
                 self.cuda.peer_pointer(metadata[peer][self.rank], self.rank, peer)
                 for peer in range(self.world)
@@ -73,13 +87,25 @@ class ReturnExchange:
                 proxy.handle, self.world,
                 pointer_array(*(buffer.data_ptr() for buffer in self.outputs)),
                 pointer_array(*destinations),
-                self.outputs[0].numel() * self.outputs[0].element_size(),
+                max(1, self.outputs[0].numel() * self.outputs[0].element_size()),
                 self.down_done.cuda_event, ctypes.addressof(self.counter_view),
                 args.token_exchange_timeout, error, len(error),
             )
             if result:
                 raise RuntimeError(error.value.decode(errors="replace"))
-            if args.return_token_results_per_group:
+            if plan is not None:
+                configure_sizes = proxy.library.stream_gather_thread_proxy_set_return_sizes
+                configure_sizes.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                           ctypes.POINTER(ctypes.c_size_t), ctypes.c_int,
+                                           ctypes.POINTER(ctypes.c_char), ctypes.c_size_t]
+                configure_sizes.restype = ctypes.c_int
+                sizes = (ctypes.c_size_t * self.world)(*[
+                    buffer.numel() * buffer.element_size() for buffer in self.outputs
+                ])
+                if configure_sizes(proxy.handle, self.world, sizes,
+                                   int(args.return_token_results_per_group), error, len(error)):
+                    raise RuntimeError(error.value.decode(errors="replace"))
+            elif args.return_token_results_per_group:
                 # Physical shape is [N tiles, tokens * tile_n], with no padding for
                 # in-place combine. A column group consists of adjacent N tiles.
                 down = inputs.down_args
@@ -110,10 +136,12 @@ class ReturnExchange:
     def check(self):
         """Compare every returned physical buffer with its computing GPU's output."""
         self.control.gather("check_start")
-        expected = torch.empty_like(self.received[0])
         stream = torch.cuda.current_stream().cuda_stream
-        size = expected.numel() * expected.element_size()
         for sender, actual in enumerate(self.received):
+            if not actual.numel():
+                continue
+            expected = torch.empty_like(actual)
+            size = expected.numel() * expected.element_size()
             if sender == self.rank:
                 expected.copy_(self.outputs[self.rank])
             else:
@@ -140,7 +168,8 @@ class ReturnExchange:
                 self.cuda.close()
                 self.control.gather("imports_closed")
                 for item in self.exports:
-                    item.release()
+                    if item:
+                        item.release()
             else:
                 self.control.state("error", "return exchange aborted")
         finally:

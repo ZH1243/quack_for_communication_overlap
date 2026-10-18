@@ -13,7 +13,11 @@ from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.compile_utils import div_for_dtype, fake_batched  # noqa: F401  (re-exported)
 from quack.gemm_config import SplitKMode
 from quack.cute_dsl_utils import get_compile_target_capacity, torch2cute_dtype_map
-from quack.tile_scheduler import AgSchedulerArguments, TileSchedulerOptions
+from quack.tile_scheduler import (
+    AgSchedulerArguments,
+    MultiBufferGatherArguments,
+    TileSchedulerOptions,
+)
 from quack.varlen_utils import VarlenArguments
 
 
@@ -392,6 +396,25 @@ def compute_cu_tiles_m(cu_seqlens_m, tile_m_cta):
     seqlens = cu_seqlens_m[1:] - cu_seqlens_m[:-1]
     tiles = torch.div(seqlens + (tile_m_cta - 1), tile_m_cta, rounding_mode="floor")
     return torch.cat([tiles.new_zeros(1), tiles.cumsum(0, dtype=torch.int32)])
+
+
+def make_fake_multi_buffer_gather(a_dtype, a_major, k, num_buffers):
+    """Each source has independent token and route extents; only K is shared."""
+    if num_buffers <= 1:
+        return None
+    return MultiBufferGatherArguments(
+        x_buffers=tuple(
+            fake_batched(
+                a_dtype, cute.sym_int(), k, None,
+                1 if a_major == "k" else 0, div_for_dtype(a_dtype),
+            )
+            for _ in range(num_buffers - 1)
+        ),
+        a_idx_buffers=tuple(
+            fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=4)
+            for _ in range(num_buffers - 1)
+        ),
+    )
 
 
 def make_fake_varlen_args(

@@ -40,6 +40,7 @@ from quack.gemm_tvm_ffi_utils import (
     compute_cu_tiles_m,
     launch_gemm,
     make_fake_gemm_tensors,
+    make_fake_multi_buffer_gather,
     make_fake_scheduler_args,
     make_fake_sf_tensor,
     make_fake_varlen_args,
@@ -47,7 +48,6 @@ from quack.gemm_tvm_ffi_utils import (
     make_varlen_args,
     plan_scheduler_args,
 )
-from quack.tile_scheduler import MultiBufferGatherArguments
 
 
 class FakeArgCtx(NamedTuple):
@@ -224,15 +224,8 @@ def _compile_gemm_epi(
         has_cu_tiles_m=varlen_m and _has_m_fold_sink(ops, epi_keys),
         gather_table=gather_table,
     )
-    multi_buffer_gather = (
-        MultiBufferGatherArguments(
-            x_buffers=tuple(mA for _ in range(gather_table_num_buffers - 1)),
-            a_idx_buffers=tuple(
-                varlen_args.mAIdx for _ in range(gather_table_num_buffers - 1)
-            ),
-        )
-        if gather_table_num_buffers > 1
-        else None
+    multi_buffer_gather = make_fake_multi_buffer_gather(
+        a_dtype, a_major, k, gather_table_num_buffers
     )
     scheduler_args = make_fake_scheduler_args(
         (is_dynamic_persistent and device_capacity[0] == 9),

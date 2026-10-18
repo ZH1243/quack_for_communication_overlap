@@ -2243,7 +2243,12 @@ def gemm_act(
     # Empty-input fast path. For M=0 or N=0 the outputs are empty; for K=0
     # (A@B == 0) the no-bias / no-C surface yields preact=0 and act(0)=0 for
     # every supported activation, so both outputs are zero.
-    if postact_out.numel() == 0 or A.numel() == 0:
+    # Buffer zero may be empty while another source contributes routes.
+    empty_a = A.numel() == 0 and (
+        multi_buffer_gather_args is None
+        or all(buffer.numel() == 0 for buffer in multi_buffer_gather_args.x_buffers)
+    )
+    if postact_out.numel() == 0 or empty_a:
         if preact_out is not None:
             _empty_k_matmul_into(preact_out)
         _empty_k_matmul_into(postact_out)

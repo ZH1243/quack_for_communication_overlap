@@ -134,3 +134,64 @@ torch.testing.assert_close(y, torch.softmax(x, dim=-1), atol=1e-2, rtol=1e-2)
 print("QuACK works:", y.shape, torch.cuda.get_device_name())
 PY
 ```
+
+## Bitmask token exchange on Hopper
+
+`run/hopper_stream_gather_table_gemm.py` supports an opt-in, one-time variable-size
+initial exchange. Add these options to a single-node `torchrun` command using
+`--initial-token-exchange --multi-buffer-gather --proxy-mode thread`:
+
+```bash
+--bitmask-token-routing --token-route-probability 0.25 --local-routes-per-token 2
+```
+
+Without `--bitmask-token-routing`, the existing equal-chunk exchange is unchanged.
+The new mode requires 2–8 GPUs, `--num-input-buffers` equal to the number of GPUs,
+and a positive `--source-tokens` (which need not be divisible by the GPU count).
+Rebuild the thread proxy with CUDA 12.9 or newer before running:
+
+```bash
+cmake -S run/cpu_proxy -B run/cpu_proxy/build
+cmake --build run/cpu_proxy/build -j
+```
+
+Each rank generates a reproducible `uint8` router vector on its GPU, with one byte
+per source token. On source rank `s`, bit `j` selects `(s + j + 1) % world_size`;
+only the low `world_size` bits are used, including the bit selecting the local
+GPU. Each bit is independently set with probability `--token-route-probability`
+(default 0.25). Tokens may therefore have zero or multiple destinations.
+
+Ranks exchange counts before allocating one input buffer per source. Selected
+source rows are copied in increasing token-index order with one
+`cudaMemcpyBatchAsync` call per nonempty destination. The exchange happens once,
+before warmup, and is excluded from GEMM timing.
+
+In this mode, `--tokens-per-buffer` and `--routes-per-buffer` do not determine
+allocation or work sizes. A buffer receiving `T` tokens has
+`T * --local-routes-per-token` local expert routes (default multiplier 2), with at
+least one route for every received token. Per-expert quotas remain near-even.
+Without `--routing-with-replacement`, the multiplier cannot exceed the number of
+local experts. Empty pairs have zero routes; completely idle ranks skip GEMMs
+but still participate in result-return completion barriers.
+
+Both `--return-token-results` and `--return-token-results-per-group` support the
+variable sizes, with their existing prerequisite flags. A source allocates its
+receive buffer for computing rank `d` using the number of tokens it sent to `d`.
+The return preserves packed token order and the selected output layout; it does
+not scatter into or reduce across the original source-token tensor. The routing
+plan retains the selected source indices (`inputs.routing_plan.indices`), also
+exposed as `ReturnExchange.source_token_indices`. Per-group returns use each
+peer's own byte count and tile offset. The reported GEMM throughput still excludes
+the final wait for return DMA and the rank barrier, although concurrent DMA can
+influence GEMM performance.
+
+CPU metadata checks and a Hopper numerical integration regression:
+
+```bash
+python -m unittest run.test_token_routing run.test_bitmask_routing
+torchrun --standalone --nnodes=1 --nproc-per-node=4 run/test_bitmask_token_exchange.py
+```
+
+The integration regression includes legacy exchange, unequal counts, sparse and
+empty routing, full replication, whole-buffer returns, and one/two-tile return
+groups. It validates dispatched token values, returned bytes, and GEMM outputs.
