@@ -44,6 +44,7 @@ try:
         balanced_buffer_allocations,
         check_correctness,
         check_down_correctness,
+        covered_token_routes,
         has_down_projection,
         make_arg_parser,
         pregather,
@@ -62,6 +63,7 @@ except ModuleNotFoundError as error:
         balanced_buffer_allocations,
         check_correctness,
         check_down_correctness,
+        covered_token_routes,
         has_down_projection,
         make_arg_parser,
         pregather,
@@ -331,19 +333,12 @@ def prepare_inputs(
         torch.randn((tokens, args.hidden), dtype=dtype, device=device)
         for _ in range(num_buffers)
     )
-    idx_buffers = []
-    for counts in counts_by_buffer:
-        A_idx_j = torch.empty(routes, dtype=torch.int32, device=device)
-        offset = 0
-        for count in counts:
-            if args.routing_with_replacement:
-                indices = torch.randint(tokens, (count,), dtype=torch.int32, device=device)
-            else:
-                indices = torch.randperm(tokens, dtype=torch.int32, device=device)[:count]
-            A_idx_j[offset : offset + count].copy_(indices)
-            offset += count
-        idx_buffers.append(A_idx_j)
-    A_idx = tuple(idx_buffers)
+    A_idx = tuple(
+        covered_token_routes(
+            tokens, counts, replacement=args.routing_with_replacement, device=device
+        )
+        for counts in counts_by_buffer
+    )
 
     cluster_rows = args.tile_m * args.cluster_m
     table_width = 4 + cluster_rows if args.indexed_gather else 2 + 2 * num_buffers

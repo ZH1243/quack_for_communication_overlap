@@ -79,8 +79,10 @@ from quack.gemm_interface import act_to_pytorch_fn_map, gated_to_pytorch_fn_map
 
 if __package__:
     from . import hopper_pregather_gemm as pregather
+    from .token_routing import covered_token_routes
 else:
     import hopper_pregather_gemm as pregather
+    from token_routing import covered_token_routes
 
 
 DTYPES = {
@@ -191,7 +193,10 @@ def make_arg_parser(
     parser.add_argument("--cluster-m", type=int, default=2)
     parser.add_argument("--max-swizzle-size", type=int, default=8)
     parser.add_argument("--pingpong", action="store_true")
-    parser.add_argument("--routing-with-replacement", action="store_true")
+    parser.add_argument(
+        "--routing-with-replacement", action="store_true",
+        help="Allow repeated token indices within an expert; every token still gets a route",
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--timing-samples", type=int, default=5)
@@ -312,6 +317,8 @@ def validate_args(args: argparse.Namespace) -> None:
         routes = args.routes
     if getattr(args, "down_projection2", False):
         down_projection_args(args, routes * (args.num_input_buffers if args.multi_buffer_gather else 1))
+    if routes < tokens:
+        raise ValueError("routes per buffer must be at least tokens per buffer for full coverage")
     if tokens <= 0 or routes <= 0:
         raise ValueError("tokens-per-buffer and routes-per-buffer must be positive")
     if getattr(args, "indexed_gather", False) and args.multi_buffer_gather:
@@ -638,19 +645,12 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> TableGathe
             torch.randn((tokens, args.hidden), dtype=dtype, device=device)
             for _ in range(args.num_input_buffers)
         )
-        idx_buffers = []
-        for counts in counts_by_buffer:
-            A_idx_j = torch.empty(routes, dtype=torch.int32, device=device)
-            offset = 0
-            for count in counts:
-                if args.routing_with_replacement:
-                    indices = torch.randint(tokens, (count,), dtype=torch.int32, device=device)
-                else:
-                    indices = torch.randperm(tokens, dtype=torch.int32, device=device)[:count]
-                A_idx_j[offset : offset + count].copy_(indices)
-                offset += count
-            idx_buffers.append(A_idx_j)
-        A_idx = tuple(idx_buffers)
+        A_idx = tuple(
+            covered_token_routes(
+                tokens, counts, replacement=args.routing_with_replacement, device=device
+            )
+            for counts in counts_by_buffer
+        )
         work_table, offsets, output_segments, x = build_multi_buffer_work_table(
             counts_by_buffer,
             output_dim=gemm_output_dim,
@@ -670,15 +670,9 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> TableGathe
     else:
         counts = route_counts(args.routes, args.experts)
         X = torch.randn((args.tokens, args.hidden), dtype=dtype, device=device)
-        A_idx = torch.empty(args.routes, dtype=torch.int32, device=device)
-        offset = 0
-        for count in counts:
-            if args.routing_with_replacement:
-                indices = torch.randint(args.tokens, (count,), dtype=torch.int32, device=device)
-            else:
-                indices = torch.randperm(args.tokens, dtype=torch.int32, device=device)[:count]
-            A_idx[offset : offset + count].copy_(indices)
-            offset += count
+        A_idx = covered_token_routes(
+            args.tokens, counts, replacement=args.routing_with_replacement, device=device
+        )
         # Both modes consume the same X, W, and sampled A_idx. Indexed mode
         # only embeds those routes and their packed output ranges in the table.
         if getattr(args, "indexed_gather", False):
