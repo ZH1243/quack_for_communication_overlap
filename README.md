@@ -193,6 +193,10 @@ dtype, available as `ReturnExchange.combined_output`. Tokens sent nowhere receiv
 zeros. This is an unweighted sum of the already locally combined expert outputs.
 The combine runs after return-copy completion and finishes before receive buffers
 are reused; its execution is excluded from both reported throughput timings.
+CUDA events bracket the final-combine launch after return-copy completion. Each
+rank reports the mean time per timing sample and the median of those means,
+excluding warmup. These event intervals can include GPU idle gaps during host
+enqueue and are not a profiler measurement of kernel-only duration.
 Without this flag, only the separate packed receive buffers are produced.
 
 CPU metadata checks and a Hopper numerical integration regression:

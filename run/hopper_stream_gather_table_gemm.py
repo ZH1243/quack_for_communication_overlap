@@ -746,6 +746,7 @@ def run_stream_once(
     device: torch.device,
     *,
     reset_events=None,
+    combine_events=None,
 ) -> float:
     work_table.fill_(-1)
     ready_rows.zero_()
@@ -780,7 +781,11 @@ def run_stream_once(
     # outside the interval used for effective throughput.
     proxy.wait()
     if return_exchange is not None and return_exchange.final_combine is not None:
+        if combine_events is not None:
+            combine_events[0].record(torch.cuda.current_stream(device))
         return_exchange.final_combine()
+        if combine_events is not None:
+            combine_events[1].record(torch.cuda.current_stream(device))
         # Finish reading receive buffers before the next iteration can overwrite them.
         torch.cuda.current_stream(device).synchronize()
     return elapsed_ms
@@ -1209,20 +1214,36 @@ def main() -> None:
             timings_ms = []
             reset_timings_ms = []
             excluding_reset_ms = []
+            combine_timings_ms = []
+            combine_events = (
+                tuple(torch.cuda.Event(enable_timing=True) for _ in range(2))
+                if args.final_combine else None
+            )
+            if combine_events is not None:
+                # Materialize timing events before collecting samples.
+                for event in combine_events:
+                    event.record(torch.cuda.current_stream(device))
+                combine_events[-1].synchronize()
             for _ in range(args.timing_samples):
                 launches_ms = []
                 resets_ms = []
+                combines_ms = []
                 for _ in range(args.iterations):
                     elapsed_ms = run_stream_once(
-                        proxy, launch, inputs.work_table, ready_rows, device, reset_events=reset_events
+                        proxy, launch, inputs.work_table, ready_rows, device,
+                        reset_events=reset_events, combine_events=combine_events,
                     )
                     if ready_trace is not None:
                         ready_traces.append(ready_trace.observations())
                     launches_ms.append(elapsed_ms)
+                    if combine_events is not None:
+                        combines_ms.append(combine_events[0].elapsed_time(combine_events[1]))
                     if measure_reset:
                         # run_stream_once synchronizes before these events are read or reused.
                         resets_ms.append(reset_events[0].elapsed_time(reset_events[1]))
                 timings_ms.append(statistics.mean(launches_ms))
+                if combine_events is not None:
+                    combine_timings_ms.append(statistics.mean(combines_ms))
                 if measure_reset:
                     reset_timings_ms.append(statistics.mean(resets_ms))
                     excluding_reset_ms.append(statistics.mean(
@@ -1267,6 +1288,12 @@ def main() -> None:
                 print(f"Per-launch end-to-end samples (ms): {[round(v, 4) for v in timings_ms]}")
                 print(f"Median {operation_name} time: {median_ms:.4f} ms")
                 print(f"Effective throughput: {tflops:.2f} TFLOP/s")
+
+            if combine_timings_ms:
+                print("Final combine CUDA-event sample means (ms): "
+                      f"{[round(v, 4) for v in combine_timings_ms]}")
+                print("Median final combine time (excluded from throughput): "
+                      f"{statistics.median(combine_timings_ms):.4f} ms")
 
             if ready_trace is not None:
                 group_width = min(inputs.down_args.max_swizzle_size,
