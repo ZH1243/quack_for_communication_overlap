@@ -866,19 +866,26 @@ class EpiMod:
                     multi_buffer_gather.x_buffers, multi_buffer_gather.a_idx_buffers
                 ):
                     if (
-                        A_extra.shape != A.shape
+                        A_extra.ndim != A.ndim
+                        or A_extra.shape[1:] != A.shape[1:]
                         or A_extra.stride() != A.stride()
                         or A_extra.dtype != A.dtype
                         or A_extra.device != A.device
                     ):
-                        raise ValueError("all multi-buffer X tensors must match buffer 0")
+                        raise ValueError(
+                            "multi-buffer X tensors must match buffer 0's column shape, "
+                            "stride, dtype and device; token counts may differ"
+                        )
                     if (
-                        idx_extra.shape != A_idx.shape
+                        idx_extra.ndim != 1
                         or idx_extra.stride() != A_idx.stride()
                         or idx_extra.dtype != torch.int32
                         or idx_extra.device != A.device
                     ):
-                        raise ValueError("all multi-buffer A_idx tensors must match buffer 0")
+                        raise ValueError(
+                            "multi-buffer A_idx tensors must be rank-1 int32 with matching "
+                            "stride and device; route counts may differ"
+                        )
             if gather_work_table.shape[0] == 0:
                 raise ValueError("gather_work_table must contain at least one row")
         elif varlen_m:

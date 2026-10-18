@@ -20,6 +20,50 @@ pytestmark = pytest.mark.skipif(
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("tokens", [(7, 11, 19), (0, 11, 19)])
+def test_gather_table_swiglu_unequal_buffers(tokens):
+    """The activation frontend accepts independent token and route extents."""
+    torch.manual_seed(0)
+    k, n, experts = 64, 128, 2
+    routes = [t + 3 if t else 0 for t in tokens]
+    counts = [(r // 2, r - r // 2) for r in routes]
+    offsets = [(0, a, a + b) for a, b in counts]
+    xs = tuple(torch.randn(t, k, device="cuda", dtype=torch.bfloat16) for t in tokens)
+    indices = tuple(
+        torch.randint(t, (r,), device="cuda", dtype=torch.int32)
+        if t else torch.empty(0, device="cuda", dtype=torch.int32)
+        for t, r in zip(tokens, routes)
+    )
+    weights = torch.randn(experts, 2 * n, k, device="cuda", dtype=torch.bfloat16)
+    weights = (weights / math.sqrt(k)).transpose(1, 2)
+    table = torch.tensor([
+        [expert, 0, *[v for bounds in offsets for v in bounds[expert:expert + 2]]]
+        for expert in range(experts)
+    ], dtype=torch.int32, device="cuda")
+    output = torch.empty(sum(routes), n, device="cuda", dtype=torch.bfloat16)
+    config = GemmConfig(
+        tile_m=64, tile_n=128, pingpong=True, cluster_m=2, cluster_n=1,
+        cluster_k=1, max_swizzle_size=2, device_capacity=9, use_tma_gather=False,
+    )
+    gemm_act(
+        xs, weights, activation="swiglu", postact_out=output, A_idx=indices,
+        gather_work_table=table, multi_buffer_gather=True, store_preact=False,
+        tuned=False, config=config, concat_layout=("B",),
+    )
+    references, baselines = [], []
+    for expert in range(experts):
+        for x, index, bounds in zip(xs, indices, offsets):
+            selected = x[index[bounds[expert]:bounds[expert + 1]].long()]
+            gate, up = (selected.float() @ weights[expert].float()).chunk(2, dim=-1)
+            references.append(gated_to_pytorch_fn_map["swiglu"](gate, up))
+            gate, up = (selected @ weights[expert]).chunk(2, dim=-1)
+            baselines.append(gated_to_pytorch_fn_map["swiglu"](gate, up).float())
+    reference, baseline = torch.cat(references), torch.cat(baselines)
+    allowed = max(6e-2, 2 * (baseline - reference).abs().max().item())
+    torch.testing.assert_close(output.float(), reference, atol=allowed, rtol=2e-3)
+
+
+@torch.inference_mode()
 @pytest.mark.parametrize(
     ("activation", "num_buffers", "pingpong"),
     [("relu", 1, False), ("relu", 1, True), ("swiglu", 3, True)],
