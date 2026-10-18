@@ -51,7 +51,7 @@ if __name__ == "__main__":
         ]
         if probability is not None:
             sys.argv.extend(["--bitmask-token-routing", "--token-route-probability",
-                             str(probability), "--local-routes-per-token", "2"])
+                             str(probability), "--local-routes-per-token", "2", "--final-combine"])
         if tile_major:
             sys.argv.append("--down-n-tile-major-output")
         if streaming:

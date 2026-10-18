@@ -185,10 +185,21 @@ peer's own byte count and tile offset. The reported GEMM throughput still exclud
 the final wait for return DMA and the rank barrier, although concurrent DMA can
 influence GEMM performance.
 
+Add `--final-combine` together with `--bitmask-token-routing --return-token-results`
+to reduce the returned results on each source GPU after every iteration. A CuTe
+kernel reads the packed buffers (including N-tile-major layout), sums contributions
+in FP32, and writes a contiguous `[source_tokens, hidden]` tensor in the received
+dtype, available as `ReturnExchange.combined_output`. Tokens sent nowhere receive
+zeros. This is an unweighted sum of the already locally combined expert outputs.
+The combine runs after return-copy completion and finishes before receive buffers
+are reused; its execution is excluded from both reported throughput timings.
+Without this flag, only the separate packed receive buffers are produced.
+
 CPU metadata checks and a Hopper numerical integration regression:
 
 ```bash
 python -m unittest run.test_token_routing run.test_bitmask_routing
+python -m unittest run.test_final_combine  # Requires CUDA and CuTe DSL
 torchrun --standalone --nnodes=1 --nproc-per-node=4 run/test_bitmask_token_exchange.py
 ```
 

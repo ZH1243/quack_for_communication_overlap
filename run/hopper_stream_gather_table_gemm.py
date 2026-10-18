@@ -173,6 +173,12 @@ def parse_args() -> argparse.Namespace:
         "--bitmask-token-routing", action="store_true",
         help="Use random destination bits for initial exchange (thread proxy, at most 8 GPUs)",
     )
+    parser.add_argument(
+        "--final-combine", action="store_true",
+        help="Sum returned bitmask results into source-token order on GPU after each run; "
+             "excluded from throughput timing (requires --bitmask-token-routing and "
+             "--return-token-results)",
+    )
     parser.add_argument("--token-route-probability", type=float, default=0.25,
                         help="Independent probability for each destination bit (default: 0.25)")
     parser.add_argument("--local-routes-per-token", type=int, default=2,
@@ -184,6 +190,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_stream_args(args: argparse.Namespace) -> None:
+    if args.final_combine and not (args.bitmask_token_routing and args.return_token_results):
+        raise ValueError("--final-combine requires --bitmask-token-routing and "
+                         "--return-token-results")
     if args.bitmask_token_routing:
         if not args.initial_token_exchange or args.proxy_mode != "thread":
             raise ValueError("--bitmask-token-routing requires --initial-token-exchange "
@@ -770,6 +779,10 @@ def run_stream_once(
     # Return DMA and the rank barrier must finish before buffer reuse, but are
     # outside the interval used for effective throughput.
     proxy.wait()
+    if return_exchange is not None and return_exchange.final_combine is not None:
+        return_exchange.final_combine()
+        # Finish reading receive buffers before the next iteration can overwrite them.
+        torch.cuda.current_stream(device).synchronize()
     return elapsed_ms
 
 
@@ -1184,6 +1197,9 @@ def main() -> None:
                           "while down GEMM continues; overlap may affect GEMM throughput.")
                 print("Return copies enabled: throughput timing excludes return copies and the "
                       "rank barrier; received buffers are indexed by computing GPU rank.")
+                if args.final_combine:
+                    print("Final combine enabled: source-ordered GPU sum after return copies; "
+                          "excluded from throughput timing.")
             for _ in range(max(1, args.warmup)):
                 run_stream_once(
                     proxy, launch, inputs.work_table, ready_rows, device, reset_events=reset_events

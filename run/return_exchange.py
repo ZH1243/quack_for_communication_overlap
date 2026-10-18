@@ -37,6 +37,19 @@ class ReturnExchange:
                 dtype=self.outputs[0].dtype, device=self.outputs[0].device,
             ) for count in plan.outgoing_counts)
         self.source_token_indices = plan.indices if plan is not None else None
+        self.final_combine = None
+        self.combined_output = None
+        self.final_combine_tile_n = args.down_tile_n if args.down_n_tile_major_output else 0
+        if args.final_combine:
+            if __package__:
+                from .final_combine import FinalCombine
+            else:
+                from final_combine import FinalCombine
+            self.final_combine = FinalCombine(
+                self.received, self.source_token_indices, args.source_tokens, args.hidden,
+                self.final_combine_tile_n,
+            )
+            self.combined_output = self.final_combine.output
         self.down_done = torch.cuda.Event()
         # Materialize the event before passing its handle to the native worker.
         self.down_done.record()
@@ -156,6 +169,19 @@ class ReturnExchange:
                                        rtol=0, atol=0)
         self.control.gather("check_complete")
         print("Return-copy reference check: PASSED (all received physical buffers match outputs)")
+        if self.final_combine is not None:
+            reference = torch.zeros_like(self.combined_output, dtype=torch.float32)
+            hidden = reference.shape[1]
+            tile_n = self.final_combine_tile_n
+            for buffer, index in zip(self.received, self.source_token_indices):
+                count = index.numel()
+                logical = (buffer.view(hidden // tile_n, count, tile_n)
+                           .permute(1, 0, 2).reshape(count, hidden)
+                           if tile_n else buffer.view(count, hidden))
+                reference.index_add_(0, index.to(reference.device), logical.float())
+            torch.testing.assert_close(self.combined_output, reference.to(self.combined_output.dtype),
+                                       rtol=0, atol=0)
+            print("Final-combine reference check: PASSED (source-token sums, including zeros)")
 
     def close(self, success=True):
         """Call only after the native proxy worker has been destroyed."""
