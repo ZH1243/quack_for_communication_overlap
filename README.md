@@ -202,6 +202,10 @@ CUDA events bracket the final-combine launch after return-copy completion. Each
 rank reports the mean time per timing sample and the median of those means,
 excluding warmup. These event intervals can include GPU idle gaps during host
 enqueue and are not a profiler measurement of kernel-only duration.
+Each rank also reports the final result size in bytes and effective bandwidth per
+sample and at the median time: `result.numel() * result.element_size() / time`.
+Bandwidth uses decimal GB/s (1 GB = 10^9 bytes) and counts only final output bytes,
+without adding input reads or metadata traffic.
 Without this flag, only the separate packed receive buffers are produced.
 
 CPU metadata checks and a Hopper numerical integration regression:

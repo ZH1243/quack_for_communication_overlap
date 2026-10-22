@@ -1300,10 +1300,26 @@ def main() -> None:
                 print(f"Effective throughput: {tflops:.2f} TFLOP/s")
 
             if combine_timings_ms:
+                combined_output = return_exchange.combined_output
+                combine_bytes = combined_output.numel() * combined_output.element_size()
+                median_combine_ms = statistics.median(combine_timings_ms)
+                combine_bandwidths = [
+                    combine_bytes / (elapsed_ms * 1e6) if elapsed_ms > 0 else float("nan")
+                    for elapsed_ms in combine_timings_ms
+                ]
+                median_combine_bandwidth = (
+                    combine_bytes / (median_combine_ms * 1e6)
+                    if median_combine_ms > 0 else float("nan")
+                )
                 print("Final combine CUDA-event sample means (ms): "
                       f"{[round(v, 4) for v in combine_timings_ms]}")
                 print("Median final combine time (excluded from throughput): "
-                      f"{statistics.median(combine_timings_ms):.4f} ms")
+                      f"{median_combine_ms:.4f} ms")
+                print(f"Final combine result size: {combine_bytes} bytes")
+                print("Final combine effective bandwidth per sample (GB/s, result bytes/time): "
+                      f"{[round(v, 2) for v in combine_bandwidths]}")
+                print("Final combine effective bandwidth at median time: "
+                      f"{median_combine_bandwidth:.2f} GB/s")
 
             if ready_trace is not None:
                 group_width = min(inputs.down_args.max_swizzle_size,
