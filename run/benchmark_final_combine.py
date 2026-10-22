@@ -55,8 +55,14 @@ def main():
     variants = [("direct-row", {})]
     if args.tile_n:
         variants.append(("direct-column", {"column_group_major": True}))
-    variants.extend((f"register-{peers}", {"register_prefetch": True, "prefetch_peers": peers})
-                    for peers in args.prefetch_peers)
+    for peers in args.prefetch_peers:
+        variants.append((f"register-row-{peers}", {
+            "register_prefetch": True, "prefetch_peers": peers,
+        }))
+        if args.tile_n:
+            variants.append((f"register-col-{peers}", {
+                "register_prefetch": True, "prefetch_peers": peers, "column_group_major": True,
+            }))
     for stages in args.stages:
         variants.append((f"pipeline-row-{stages}", {
             "pipelined": True, "pipeline_stages": stages,

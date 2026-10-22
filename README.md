@@ -280,9 +280,12 @@ same inputs, interleaves individual launches, rotates variant order, and queues
 a GPU burner before each timed round to avoid host enqueue gaps. It reports
 median/minimum/p90 kernel time, output bandwidth, logical input-plus-output
 bandwidth, and speedup over the original row-major kernel. It also includes the
-original column-group-major kernel, register depths 1 and 2, and both row and
-column traversal for every shared pipeline depth. Add `--prefetch-peers 1 2 4`
-to include register depth 4. Use an otherwise idle GPU; these timings reuse resident buffers and do
+original column-group-major kernel and both row and column traversal for every
+register prefetch depth and shared pipeline depth. Register depths default to 1
+and 2; add `--prefetch-peers 1 2 4` to include depth 4. `register-row-N` is the
+previous `register-N` variant; `register-col-N` combines register prefetch with
+column-group-major traversal. Column variants require a nonzero `--tile-n`.
+Use an otherwise idle GPU; these timings reuse resident buffers and do
 not reproduce the cache state or contention of the full distributed run. Recheck
 the original `torchrun` command with the new flag after the standalone check.
 
