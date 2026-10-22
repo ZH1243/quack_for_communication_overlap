@@ -210,6 +210,14 @@ thread, each CTA processes 4096 columns per iteration. The default,
 `ceil(source_tokens * hidden / (threads_per_cta * actual_elements_per_thread))` CTAs.
 The CTA count limits the number of blocks, but does not guarantee one CTA per SM
 or reserve particular SMs. This option requires `--final-combine`.
+Add `--final-combine-column-group-major` with `--down-n-tile-major-output` to
+assign work by N tile, then source token, then adjacent columns within the tile.
+Each combine group contains `--down-tile-n` columns, independently of the down
+GEMM's swizzle size. The default assignment remains row-major. For example, with
+`--hidden 4096 --down-tile-n 128 --final-combine-elements-per-thread 32
+--final-combine-threads-per-cta 512`, a CTA iteration processes 128 tokens × 128
+columns instead of four complete token rows. The output remains contiguous
+`[source_tokens, hidden]`; CTAs do not synchronize at group boundaries.
 The combine runs after return-copy completion and finishes before receive buffers
 are reused; its execution is excluded from both reported throughput timings.
 CUDA events bracket the final-combine launch after return-copy completion. Each

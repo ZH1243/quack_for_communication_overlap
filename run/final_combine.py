@@ -8,13 +8,15 @@ import torch
 
 
 class _CombineKernel:
-    def __init__(self, counts, hidden, tile_n, num_ctas, elements_per_thread, threads_per_cta):
+    def __init__(self, counts, hidden, tile_n, num_ctas, elements_per_thread, threads_per_cta,
+                 column_group_major):
         self.counts = counts
         self.hidden = hidden
         self.tile_n = tile_n
         self.num_ctas = num_ctas
         self.elements_per_thread = elements_per_thread
         self.threads_per_cta = threads_per_cta
+        self.column_group_major = column_group_major
 
     @cute.jit
     def __call__(self, received: tuple, rows: cute.Tensor, output: cute.Tensor,
@@ -41,9 +43,17 @@ class _CombineKernel:
         total = cute.make_rmem_tensor((vec,), cutlass.Float32)
         for chunk in cutlass.range(block, num_chunks, self.num_ctas):
             vector = chunk * self.threads_per_cta + thread
-            token = vector // vectors_per_token
-            column = vector % vectors_per_token * vec
             if vector < total_vectors:
+                token = vector // vectors_per_token
+                column = vector % vectors_per_token * vec
+                if cutlass.const_expr(self.column_group_major):
+                    # Visit every source token within one N tile before the next tile.
+                    vectors_per_group_row = self.tile_n // vec
+                    vectors_per_group = output.shape[0] * vectors_per_group_row
+                    group = vector // vectors_per_group
+                    within_group = vector % vectors_per_group
+                    token = within_group // vectors_per_group_row
+                    column = group * self.tile_n + within_group % vectors_per_group_row * vec
                 total.fill(0.0)
                 for peer in cutlass.range_constexpr(len(self.counts)):
                     row = rows[peer, token]
@@ -78,13 +88,16 @@ class FinalCombine:
     num_ctas=0 covers the flattened output with threads_per_cta * elements_per_thread
     elements per CTA; CTAs may span token boundaries.
     A positive value launches exactly that many CTAs, using a grid-stride loop.
+    column_group_major=True traverses [N tile, source token, vector within tile]
+    instead of [source token, vector within row]; requires tile_n > 0.
+    Output stays row-major. There is no global barrier between column groups.
     Aligned FP16/BF16 inputs use vector copies and independent FP32 accumulators.
     Unsupported alignment, row widths, tile widths, or dtypes use one element per thread.
     """
 
     @torch.inference_mode()
     def __init__(self, received, indices, source_tokens, hidden, tile_n=0, num_ctas=0,
-                 elements_per_thread=8, threads_per_cta=256):
+                 elements_per_thread=8, threads_per_cta=256, column_group_major=False):
         if num_ctas < 0:
             raise ValueError("num_ctas must be nonnegative")
         if elements_per_thread not in (1, 4, 8, 16, 32, 64, 128):
@@ -94,6 +107,9 @@ class FinalCombine:
         self.threads_per_cta = threads_per_cta
         if tile_n < 0 or (tile_n and hidden % tile_n):
             raise ValueError("hidden must be divisible by the N tile width")
+        if column_group_major and not tile_n:
+            raise ValueError("column_group_major requires N-tile-major input (tile_n > 0)")
+        self.column_group_major = column_group_major
         device, dtype = received[0].device, received[0].dtype
         active = [(buffer, index) for buffer, index in zip(received, indices) if index.numel()]
         self.output = torch.empty((source_tokens, hidden), device=device, dtype=dtype)
@@ -123,7 +139,7 @@ class FinalCombine:
         self.num_ctas = num_ctas or ((source_tokens * hidden + chunk_width - 1) // chunk_width)
         kernel = _CombineKernel(
             tuple(index.numel() for _, index in active), hidden, tile_n, self.num_ctas, vec,
-            threads_per_cta,
+            threads_per_cta, column_group_major,
         )
         self.compiled = cute.compile(
             kernel, *self.arguments, cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)

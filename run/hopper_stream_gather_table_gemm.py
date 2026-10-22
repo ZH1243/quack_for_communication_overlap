@@ -180,6 +180,11 @@ def parse_args() -> argparse.Namespace:
              "--return-token-results)",
     )
     parser.add_argument(
+        "--final-combine-column-group-major", action="store_true",
+        help="Assign final-combine work by N tile, then source token; each group has "
+             "--down-tile-n columns. Requires --final-combine and --down-n-tile-major-output",
+    )
+    parser.add_argument(
         "--final-combine-ctas", type=int, default=0,
         help="Fixed number of persistent final-combine CTAs; "
              "0 uses one CTA per output chunk (default: 0). Requires --final-combine; "
@@ -206,6 +211,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_stream_args(args: argparse.Namespace) -> None:
+    if args.final_combine_column_group_major and not (
+        args.final_combine and args.down_n_tile_major_output
+    ):
+        raise ValueError("--final-combine-column-group-major requires --final-combine and "
+                         "--down-n-tile-major-output")
     if args.final_combine_ctas < 0:
         raise ValueError("--final-combine-ctas must be nonnegative")
     if args.final_combine_ctas and not args.final_combine:
@@ -1228,7 +1238,9 @@ def main() -> None:
                     combine = return_exchange.final_combine
                     print(f"Final combine launch: {combine.num_ctas} CTAs, "
                           f"{combine.threads_per_cta} threads/CTA, "
-                          f"{combine.elements_per_thread} elements/thread")
+                          f"{combine.elements_per_thread} elements/thread, "
+                          f"{'column-group-major' if combine.column_group_major else 'row-major'} "
+                          "assignment")
             for _ in range(max(1, args.warmup)):
                 run_stream_once(
                     proxy, launch, inputs.work_table, ready_rows, device, reset_events=reset_events
