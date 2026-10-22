@@ -1,5 +1,7 @@
 """Source-side reduction of packed results returned by bitmask routing."""
 
+from typing import Optional
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -21,7 +23,7 @@ class _CombineKernel:
         self.column_group_major = column_group_major
 
     @cute.jit
-    def __call__(self, received: tuple, rows: cute.Tensor, output: cute.Tensor,
+    def __call__(self, received: Optional[tuple], rows: cute.Tensor, output: cute.Tensor,
                  stream: cuda.CUstream):
         self.kernel(received, rows, output).launch(
             grid=(self.num_ctas, 1, 1),
@@ -29,7 +31,7 @@ class _CombineKernel:
         )
 
     @cute.kernel
-    def kernel(self, received: tuple, rows: cute.Tensor, output: cute.Tensor):
+    def kernel(self, received: Optional[tuple], rows: cute.Tensor, output: cute.Tensor):
         thread, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
         vec = self.elements_per_thread
@@ -107,7 +109,7 @@ class _PipelinedCombineKernel(_CombineKernel):
         cute.arch.cp_async_commit_group()
 
     @cute.kernel
-    def kernel(self, received: tuple, rows: cute.Tensor, output: cute.Tensor):
+    def kernel(self, received: Optional[tuple], rows: cute.Tensor, output: cute.Tensor):
         thread, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
         vec = self.elements_per_thread
@@ -247,8 +249,13 @@ class FinalCombine:
                     "pipeline_stages, elements_per_thread, or threads_per_cta."
                 )
         alignment = min(16, vec * self.output.element_size())
+        # An empty tuple has no runtime tensor arguments and triggers a CuTe JIT
+        # adapter warning. None explicitly represents absent inputs; counts stays
+        # empty, so both kernels compile out all peer reads and still write zeros.
+        received_args = tuple(from_dlpack(buffer, assumed_align=alignment)
+                              for buffer in self.buffers) if self.buffers else None
         self.arguments = (
-            tuple(from_dlpack(buffer, assumed_align=alignment) for buffer in self.buffers),
+            received_args,
             from_dlpack(self.rows), from_dlpack(self.output, assumed_align=alignment),
         )
         chunk_width = threads_per_cta * vec

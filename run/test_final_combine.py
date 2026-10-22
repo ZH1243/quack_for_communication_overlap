@@ -1,6 +1,7 @@
 """GPU numerical regression: python -m unittest run.test_final_combine."""
 
 import unittest
+import warnings
 from itertools import product
 
 import torch
@@ -129,7 +130,11 @@ class PipelinedFinalCombineTest(unittest.TestCase):
         )
         for dtype, case in product((torch.float16, torch.bfloat16), cases):
             tokens, hidden, tile_n, vec, threads, ctas, stages, peers = case
-            with self.subTest(dtype=dtype, case=case):
+            with self.subTest(dtype=dtype, case=case), warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "error", message=r"Argument received .*cannot be converted to a JitArgument",
+                    category=UserWarning,
+                )
                 generator = torch.Generator().manual_seed(42)
                 indices = []
                 for peer in range(peers):
