@@ -1,6 +1,7 @@
 """GPU numerical regression: python -m unittest run.test_final_combine."""
 
 import unittest
+from itertools import product
 
 import torch
 
@@ -17,14 +18,17 @@ class FinalCombineTest(unittest.TestCase):
             ([0, 1, 2, 3, 4, 5, 6],) * 8,
         )
         for dtype in (torch.float16, torch.bfloat16):
-            for tile_n, hidden in ((0, 259), (0, 4096), (128, 384), (128, 4096), (6, 264)):
+            for tile_n, hidden in (
+                (0, 259), (0, 4096), (128, 384), (128, 4096), (128, 4224), (6, 264)
+            ):
                 for pattern in patterns:
                     # Serial, two persistent CTAs, uneven stride, default, and idle CTAs.
                     for num_ctas in (1, 2, 3, 0, 129):
-                        for elements_per_thread in (1, 4, 8):
+                        for elements_per_thread, threads_per_cta in product((1, 4, 8), (256, 512)):
                             with self.subTest(
                                 dtype=dtype, tile_n=tile_n, pattern=pattern,
                                 num_ctas=num_ctas, elements_per_thread=elements_per_thread,
+                                threads_per_cta=threads_per_cta,
                             ):
                                 indices = tuple(torch.tensor(p, dtype=torch.int64) for p in pattern)
                                 received = []
@@ -35,6 +39,7 @@ class FinalCombineTest(unittest.TestCase):
                                 combine = FinalCombine(
                                     tuple(received), indices, 7, hidden, tile_n, num_ctas=num_ctas,
                                     elements_per_thread=elements_per_thread,
+                                    threads_per_cta=threads_per_cta,
                                 )
                                 for iteration in range(2):
                                     reference = torch.zeros(

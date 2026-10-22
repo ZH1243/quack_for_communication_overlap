@@ -8,19 +8,20 @@ import torch
 
 
 class _CombineKernel:
-    def __init__(self, counts, hidden, tile_n, num_ctas, elements_per_thread):
+    def __init__(self, counts, hidden, tile_n, num_ctas, elements_per_thread, threads_per_cta):
         self.counts = counts
         self.hidden = hidden
         self.tile_n = tile_n
         self.num_ctas = num_ctas
         self.elements_per_thread = elements_per_thread
+        self.threads_per_cta = threads_per_cta
 
     @cute.jit
     def __call__(self, received: tuple, rows: cute.Tensor, output: cute.Tensor,
                  stream: cuda.CUstream):
         self.kernel(received, rows, output).launch(
             grid=(self.num_ctas, 1, 1),
-            block=(256, 1, 1), stream=stream,
+            block=(self.threads_per_cta, 1, 1), stream=stream,
         )
 
     @cute.kernel
@@ -28,7 +29,7 @@ class _CombineKernel:
         thread, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
         vec = self.elements_per_thread
-        blocks_per_token = cute.ceil_div(self.hidden, 256 * vec)
+        blocks_per_token = cute.ceil_div(self.hidden, self.threads_per_cta * vec)
         copy_atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), output.element_type,
             num_bits_per_copy=vec * output.element_type.width,
@@ -37,7 +38,7 @@ class _CombineKernel:
         total = cute.make_rmem_tensor((vec,), cutlass.Float32)
         for chunk in cutlass.range(block, blocks_per_token * output.shape[0], self.num_ctas):
             token = chunk // blocks_per_token
-            column = (chunk % blocks_per_token * 256 + thread) * vec
+            column = (chunk % blocks_per_token * self.threads_per_cta + thread) * vec
             if column < self.hidden:
                 total.fill(0.0)
                 for peer in cutlass.range_constexpr(len(self.counts)):
@@ -70,19 +71,22 @@ class FinalCombine:
     indices. Empty peers are omitted. Reduction uses FP32 in ascending peer order
     with a single conversion to the received dtype; no atomics or reset required.
     The caller must finish all incoming copies before calling this object.
-    num_ctas=0 launches one CTA per 256 * elements_per_thread columns; a positive value launches
-    exactly that many CTAs, each processing chunks with a grid-stride loop.
+    num_ctas=0 launches one CTA per threads_per_cta * elements_per_thread columns;
+    a positive value launches exactly that many CTAs, using a grid-stride loop.
     Aligned FP16/BF16 inputs use vector copies and independent FP32 accumulators.
     Unsupported alignment, row widths, tile widths, or dtypes use one element per thread.
     """
 
     @torch.inference_mode()
     def __init__(self, received, indices, source_tokens, hidden, tile_n=0, num_ctas=0,
-                 elements_per_thread=8):
+                 elements_per_thread=8, threads_per_cta=256):
         if num_ctas < 0:
             raise ValueError("num_ctas must be nonnegative")
         if elements_per_thread not in (1, 4, 8):
             raise ValueError("elements_per_thread must be 1, 4, or 8")
+        if threads_per_cta not in (256, 512):
+            raise ValueError("threads_per_cta must be 256 or 512")
+        self.threads_per_cta = threads_per_cta
         if tile_n < 0 or (tile_n and hidden % tile_n):
             raise ValueError("hidden must be divisible by the N tile width")
         device, dtype = received[0].device, received[0].dtype
@@ -110,10 +114,11 @@ class FinalCombine:
             tuple(from_dlpack(buffer, assumed_align=alignment) for buffer in self.buffers),
             from_dlpack(self.rows), from_dlpack(self.output, assumed_align=alignment),
         )
-        chunk_width = 256 * vec
+        chunk_width = threads_per_cta * vec
         self.num_ctas = num_ctas or source_tokens * ((hidden + chunk_width - 1) // chunk_width)
         kernel = _CombineKernel(
-            tuple(index.numel() for _, index in active), hidden, tile_n, self.num_ctas, vec
+            tuple(index.numel() for _, index in active), hidden, tile_n, self.num_ctas, vec,
+            threads_per_cta,
         )
         self.compiled = cute.compile(
             kernel, *self.arguments, cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)

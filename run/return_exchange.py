@@ -49,6 +49,7 @@ class ReturnExchange:
                 self.received, self.source_token_indices, args.source_tokens, args.hidden,
                 self.final_combine_tile_n, num_ctas=args.final_combine_ctas,
                 elements_per_thread=args.final_combine_elements_per_thread,
+                threads_per_cta=args.final_combine_threads_per_cta,
             )
             self.combined_output = self.final_combine.output
         self.down_done = torch.cuda.Event()

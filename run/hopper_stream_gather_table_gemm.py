@@ -181,7 +181,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--final-combine-ctas", type=int, default=0,
-        help="Fixed number of persistent final-combine CTAs (256 threads each); "
+        help="Fixed number of persistent final-combine CTAs; "
              "0 uses one CTA per output chunk (default: 0). Requires --final-combine; "
              "does not guarantee one CTA per SM",
     )
@@ -189,6 +189,10 @@ def parse_args() -> argparse.Namespace:
         "--final-combine-elements-per-thread", type=int, choices=(1, 4, 8), default=8,
         help="Final-combine vector width (default: 8); falls back to 1 for unsupported "
              "alignment, dimensions, or dtype",
+    )
+    parser.add_argument(
+        "--final-combine-threads-per-cta", type=int, choices=(256, 512), default=256,
+        help="Threads per final-combine CTA (default: 256)",
     )
     parser.add_argument("--token-route-probability", type=float, default=0.25,
                         help="Independent probability for each destination bit (default: 0.25)")
@@ -1221,7 +1225,8 @@ def main() -> None:
                     print("Final combine enabled: source-ordered GPU sum after return copies; "
                           "excluded from throughput timing.")
                     combine = return_exchange.final_combine
-                    print(f"Final combine launch: {combine.num_ctas} CTAs, 256 threads/CTA, "
+                    print(f"Final combine launch: {combine.num_ctas} CTAs, "
+                          f"{combine.threads_per_cta} threads/CTA, "
                           f"{combine.elements_per_thread} elements/thread")
             for _ in range(max(1, args.warmup)):
                 run_stream_once(
