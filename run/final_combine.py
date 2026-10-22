@@ -29,17 +29,21 @@ class _CombineKernel:
         thread, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
         vec = self.elements_per_thread
-        blocks_per_token = cute.ceil_div(self.hidden, self.threads_per_cta * vec)
+        vectors_per_token = self.hidden // vec
+        total_vectors = output.shape[0] * vectors_per_token
+        num_chunks = cute.ceil_div(total_vectors, self.threads_per_cta)
         copy_atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), output.element_type,
-            num_bits_per_copy=vec * output.element_type.width,
+            # Larger per-thread tiles repeat the 128-bit copy atom.
+            num_bits_per_copy=min(128, vec * output.element_type.width),
         )
         values = cute.make_rmem_tensor((vec,), output.element_type)
         total = cute.make_rmem_tensor((vec,), cutlass.Float32)
-        for chunk in cutlass.range(block, blocks_per_token * output.shape[0], self.num_ctas):
-            token = chunk // blocks_per_token
-            column = (chunk % blocks_per_token * self.threads_per_cta + thread) * vec
-            if column < self.hidden:
+        for chunk in cutlass.range(block, num_chunks, self.num_ctas):
+            vector = chunk * self.threads_per_cta + thread
+            token = vector // vectors_per_token
+            column = vector % vectors_per_token * vec
+            if vector < total_vectors:
                 total.fill(0.0)
                 for peer in cutlass.range_constexpr(len(self.counts)):
                     row = rows[peer, token]
@@ -71,8 +75,9 @@ class FinalCombine:
     indices. Empty peers are omitted. Reduction uses FP32 in ascending peer order
     with a single conversion to the received dtype; no atomics or reset required.
     The caller must finish all incoming copies before calling this object.
-    num_ctas=0 launches one CTA per threads_per_cta * elements_per_thread columns;
-    a positive value launches exactly that many CTAs, using a grid-stride loop.
+    num_ctas=0 covers the flattened output with threads_per_cta * elements_per_thread
+    elements per CTA; CTAs may span token boundaries.
+    A positive value launches exactly that many CTAs, using a grid-stride loop.
     Aligned FP16/BF16 inputs use vector copies and independent FP32 accumulators.
     Unsupported alignment, row widths, tile widths, or dtypes use one element per thread.
     """
@@ -82,8 +87,8 @@ class FinalCombine:
                  elements_per_thread=8, threads_per_cta=256):
         if num_ctas < 0:
             raise ValueError("num_ctas must be nonnegative")
-        if elements_per_thread not in (1, 4, 8):
-            raise ValueError("elements_per_thread must be 1, 4, or 8")
+        if elements_per_thread not in (1, 4, 8, 16, 32):
+            raise ValueError("elements_per_thread must be 1, 4, 8, 16, or 32")
         if threads_per_cta not in (256, 512):
             raise ValueError("threads_per_cta must be 256 or 512")
         self.threads_per_cta = threads_per_cta
@@ -105,17 +110,17 @@ class FinalCombine:
         vec = elements_per_thread
         if (dtype not in (torch.float16, torch.bfloat16) or hidden % vec
                 or (tile_n and tile_n % vec)
-                or any(buffer.data_ptr() % (vec * buffer.element_size())
+                or any(buffer.data_ptr() % min(16, vec * buffer.element_size())
                        for buffer in self.buffers)):
             vec = 1
         self.elements_per_thread = vec
-        alignment = vec * self.output.element_size()
+        alignment = min(16, vec * self.output.element_size())
         self.arguments = (
             tuple(from_dlpack(buffer, assumed_align=alignment) for buffer in self.buffers),
             from_dlpack(self.rows), from_dlpack(self.output, assumed_align=alignment),
         )
         chunk_width = threads_per_cta * vec
-        self.num_ctas = num_ctas or source_tokens * ((hidden + chunk_width - 1) // chunk_width)
+        self.num_ctas = num_ctas or ((source_tokens * hidden + chunk_width - 1) // chunk_width)
         kernel = _CombineKernel(
             tuple(index.numel() for _, index in active), hidden, tile_n, self.num_ctas, vec,
             threads_per_cta,

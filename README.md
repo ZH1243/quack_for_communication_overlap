@@ -196,12 +196,15 @@ per CTA by default. Use `--final-combine-threads-per-cta 512` to double the thre
 while keeping the requested CTA count fixed. By default each thread processes
 eight adjacent elements using vector loads/stores and eight FP32 accumulators. With 256 threads, each CTA processes 2048-column chunks
 in a grid-stride loop. Use `--final-combine-elements-per-thread 1` for the scalar
-baseline, or `4` for four elements per thread. Unsupported alignment, row/tile
+baseline, or `4`, `16`, or `32` to vary the per-thread work. Widths 16 and 32
+use multiple 128-bit copies and one FP32 accumulator per element. CTAs span
+token boundaries to keep threads active when a token needs fewer than a full
+CTA of threads. Larger widths may increase register pressure. Unsupported alignment, row/tile
 widths, or dtypes fall back to one element per thread. The launch log reports the
 actual vector width and threads per CTA. With 512 threads and eight elements per
 thread, each CTA processes 4096 columns per iteration. The default,
 `--final-combine-ctas 0`, launches
-`source_tokens * ceil(hidden / (threads_per_cta * actual_elements_per_thread))` CTAs.
+`ceil(source_tokens * hidden / (threads_per_cta * actual_elements_per_thread))` CTAs.
 The CTA count limits the number of blocks, but does not guarantee one CTA per SM
 or reserve particular SMs. This option requires `--final-combine`.
 The combine runs after return-copy completion and finishes before receive buffers
