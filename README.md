@@ -192,8 +192,13 @@ in FP32, and writes a contiguous `[source_tokens, hidden]` tensor in the receive
 dtype, available as `ReturnExchange.combined_output`. Tokens sent nowhere receive
 zeros. This is an unweighted sum of the already locally combined expert outputs.
 Add `--final-combine-ctas 16` to launch exactly 16 persistent CTAs, with 256 threads
-per CTA. Each CTA processes 256-column chunks in a grid-stride loop. The default,
-`--final-combine-ctas 0`, launches `source_tokens * ceil(hidden / 256)` CTAs.
+per CTA. By default each thread processes eight adjacent elements using vector
+loads/stores and eight FP32 accumulators. Each CTA processes 2048-column chunks
+in a grid-stride loop. Use `--final-combine-elements-per-thread 1` for the scalar
+baseline, or `4` for four elements per thread. Unsupported alignment, row/tile
+widths, or dtypes fall back to one element per thread. The launch log reports the
+actual vector width. The default, `--final-combine-ctas 0`, launches
+`source_tokens * ceil(hidden / (256 * actual_elements_per_thread))` CTAs.
 The CTA count limits the number of blocks, but does not guarantee one CTA per SM
 or reserve particular SMs. This option requires `--final-combine`.
 The combine runs after return-copy completion and finishes before receive buffers
