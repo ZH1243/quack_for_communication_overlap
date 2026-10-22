@@ -25,7 +25,7 @@ class FinalCombineTest(unittest.TestCase):
                     # Serial, two persistent CTAs, uneven stride, default, and idle CTAs.
                     for num_ctas in (1, 2, 3, 0, 129):
                         for elements_per_thread, threads_per_cta in product(
-                            (1, 4, 8, 16, 32), (256, 512)
+                            (1, 4, 8, 16, 32, 64, 128), (256, 512)
                         ):
                             with self.subTest(
                                 dtype=dtype, tile_n=tile_n, pattern=pattern,

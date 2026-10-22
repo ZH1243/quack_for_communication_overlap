@@ -87,8 +87,8 @@ class FinalCombine:
                  elements_per_thread=8, threads_per_cta=256):
         if num_ctas < 0:
             raise ValueError("num_ctas must be nonnegative")
-        if elements_per_thread not in (1, 4, 8, 16, 32):
-            raise ValueError("elements_per_thread must be 1, 4, 8, 16, or 32")
+        if elements_per_thread not in (1, 4, 8, 16, 32, 64, 128):
+            raise ValueError("elements_per_thread must be 1, 4, 8, 16, 32, 64, or 128")
         if threads_per_cta not in (256, 512):
             raise ValueError("threads_per_cta must be 256 or 512")
         self.threads_per_cta = threads_per_cta

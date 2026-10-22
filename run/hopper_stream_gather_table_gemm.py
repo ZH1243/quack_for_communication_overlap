@@ -186,7 +186,8 @@ def parse_args() -> argparse.Namespace:
              "does not guarantee one CTA per SM",
     )
     parser.add_argument(
-        "--final-combine-elements-per-thread", type=int, choices=(1, 4, 8, 16, 32), default=8,
+        "--final-combine-elements-per-thread", type=int,
+        choices=(1, 4, 8, 16, 32, 64, 128), default=8,
         help="Final-combine vector width (default: 8); falls back to 1 for unsupported "
              "alignment, dimensions, or dtype",
     )
