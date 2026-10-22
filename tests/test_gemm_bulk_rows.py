@@ -935,7 +935,8 @@ def test_n_tile_major_output(routing, pingpong, mode, n, dtype):
 
 @pytest.mark.parametrize("mode", ["bulk_rows", "bulk_rows_reduce"])
 @pytest.mark.parametrize("expert_waves", [False, True])
-def test_n_tile_major_runner(monkeypatch, mode, expert_waves):
+@pytest.mark.parametrize("sm_count", [None, 2])
+def test_n_tile_major_runner(monkeypatch, mode, expert_waves, sm_count):
     import sys
     from run import hopper_pregather_gemm as runner
 
@@ -945,8 +946,12 @@ def test_n_tile_major_runner(monkeypatch, mode, expert_waves):
         "--scatter-table --n-tile-major-output --warmup 2 --iterations 2 --timing-samples 1"
     ).split()
     argv.extend(("--epilogue-store", mode))
+    if sm_count is not None:
+        argv.extend(("--sm-count", str(sm_count), "--pingpong"))
     if expert_waves:
         argv.extend(("--gather-table", "--gather-table-expert-waves"))
+        if sm_count is not None:
+            argv.extend(("--gather-table-wave-barrier", "--gather-table-publish-ready"))
     if mode == "bulk_rows_reduce":
         argv.extend(("--scatter-table-with-replacement", "--scatter-table-destination-rows", "17"))
     monkeypatch.setattr(sys, "argv", argv)

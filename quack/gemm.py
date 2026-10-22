@@ -666,7 +666,11 @@ def gemm(
     bulk_row_swizzle: bool = False,
     # Diagnostic: only store the first rows of each CTA tile; other D rows are untouched.
     bulk_store_rows: Optional[int] = None,
+    # Cap persistent CTAs in whole clusters; does not reserve or pin physical SMs.
+    sm_count: Optional[int] = None,
 ) -> _GemmPlan:
+    if sm_count is not None and not persistent:
+        raise ValueError("sm_count requires persistent=True")
     if n_tile_major_output:
         if scatter_table is None or epilogue_store not in ("bulk_rows", "bulk_rows_reduce"):
             raise ValueError("n_tile_major_output requires scatter_table and bulk-row stores")
@@ -794,6 +798,7 @@ def gemm(
         persistent,
         is_dynamic_persistent,
         max_swizzle_size,
+        sm_count,
         add_to_output,
         rounding_mode,
         use_tma_gather,
@@ -868,6 +873,7 @@ def gemm(
             scatter_table=scatter_table,
             multi_buffer_scatter=multi_buffer_scatter,
             n_tile_major_output=n_tile_major_output,
+            sm_count=sm_count,
         )
         _gemm_plan_cache[key] = plan
     run_gemm_plan(
@@ -1084,6 +1090,7 @@ def _build_gemm_plan(
     bulk_row_double_buffer=False,
     bulk_row_swizzle=False,
     bulk_store_rows=None,
+    sm_count=None,
 ) -> _GemmPlan:
     if wave_ready_host_address is not None:
         if wave_ready_prefix is None:
@@ -1522,7 +1529,8 @@ def _build_gemm_plan(
     tile_shape_mnk = (tile_M, tile_N) if tile_K is None else (tile_M, tile_N, tile_K)
     cluster_size = cluster_M * cluster_N * cluster_K
     max_active_clusters = (
-        get_max_active_clusters(cluster_size, device_capacity=device_capacity) if persistent else 0
+        get_max_active_clusters(cluster_size, device_capacity=device_capacity, sm_count=sm_count)
+        if persistent else 0
     )
     if wave_ready_prefix is not None:
         num_work = gather_work_table.shape[0] * work_group_size

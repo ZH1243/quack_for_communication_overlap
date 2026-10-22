@@ -33,6 +33,10 @@ for every preceding-wave CTA before entering its epilogue. The kernel uses a
 cooperative launch (an oversized grid is rejected by CUDA). The per-call counter
 reset is included in timing and CUDA Graph capture. The persistent cluster count must be
 divisible by the effective swizzle size.
+Use --sm-count X to cap plain GEMM's persistent CTAs at X, rounded only by
+hardware capacity and available work. X must be a positive multiple of cluster-m.
+This caps parallelism without reserving physical SMs. In the two-GEMM runner,
+use --down-sm-count X with --down-projection2; expert-wave metadata uses the same cap.
 Add --gather-table-publish-ready to publish fully accumulated output column groups
 to inputs.ready_groups (GPU int32[1]); group width is effective_swizzle_size * tile_n.
 Requires expert waves and the wave barrier. A GPU consumer must acquire-load the
@@ -244,6 +248,11 @@ def add_kernel_arguments(parser: argparse.ArgumentParser, *, prefix: str = "") -
         help="Optional K tile; by default QuACK chooses it from the operand dtype",
     )
     add_argument("--cluster-m", type=int, default=2)
+    add_argument(
+        "--sm-count", type=int, default=None,
+        help="Cap persistent CTAs (plain GEMM only; positive multiple of cluster-m). "
+        "Defaults to hardware capacity; does not reserve physical SMs.",
+    )
     add_argument("--max-swizzle-size", type=int, default=8)
     add_argument("--pingpong", action="store_true")
     add_argument(
@@ -447,6 +456,12 @@ def scatter_output_sizes(args: argparse.Namespace) -> tuple[list[int], list[int]
 
 
 def validate_args(args: argparse.Namespace, *, prepacked: bool = False) -> None:
+    sm_count = getattr(args, "sm_count", None)
+    if sm_count is not None:
+        if args.cluster_m <= 0 or sm_count <= 0 or sm_count % args.cluster_m:
+            raise ValueError("--sm-count must be positive and divisible by --cluster-m")
+        if args.activation is not None:
+            raise ValueError("--sm-count requires plain GEMM without --activation")
     named_positive = {
         "tokens": args.tokens,
         "hidden": args.hidden,
@@ -653,7 +668,10 @@ def prepare_grouped_inputs(
             * clusters_n
         )
         # Match GatherTableTileScheduler.get_grid_shape and GEMM's capacity query.
-        wave_work_ids = min(get_max_active_clusters(args.cluster_m), num_work)
+        wave_work_ids = min(
+            get_max_active_clusters(args.cluster_m, sm_count=getattr(args, "sm_count", None)),
+            num_work,
+        )
         if wave_work_ids <= 0 or wave_work_ids % x:
             raise ValueError(
                 "--gather-table-expert-waves requires wave_work_ids % "
@@ -884,6 +902,7 @@ def make_launch(args: argparse.Namespace, inputs: PregatherInputs):
                 ),
                 multi_buffer_scatter=args.multi_buffer_scatter,
                 n_tile_major_output=args.n_tile_major_output,
+                sm_count=getattr(args, "sm_count", None),
             )
 
         if args.down_projection:

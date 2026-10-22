@@ -80,14 +80,22 @@ def get_max_active_clusters(
     cluster_size: int,
     device_capacity: Tuple[int, int] | None = None,
     device_id: int = 0,
+    sm_count: int | None = None,
 ) -> int:
+    """Query cluster capacity, optionally capped by a persistent CTA budget."""
+    if sm_count is not None and (sm_count <= 0 or sm_count % cluster_size):
+        raise ValueError("sm_count must be positive and divisible by the cluster size")
     if device_capacity is None:
         device_capacity = get_device_capacity()
     if device_capacity[0] < 9:
         if cluster_size != 1:
             raise ValueError("SM8x kernels do not support CTA clusters; cluster_size must be 1")
-        return get_device_multiprocessor_count(device_id)
-    return cutlass.utils.HardwareInfo(device_id).get_max_active_clusters(cluster_size=cluster_size)
+        capacity = get_device_multiprocessor_count(device_id)
+    else:
+        capacity = cutlass.utils.HardwareInfo(device_id).get_max_active_clusters(
+            cluster_size=cluster_size
+        )
+    return capacity if sm_count is None else min(capacity, sm_count // cluster_size)
 
 
 def _parse_arch_str(arch_str: str) -> Tuple[int, int]:
