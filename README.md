@@ -218,6 +218,52 @@ GEMM's swizzle size. The default assignment remains row-major. For example, with
 --final-combine-threads-per-cta 512`, a CTA iteration processes 128 tokens × 128
 columns instead of four complete token rows. The output remains contiguous
 `[source_tokens, hidden]`; CTAs do not synchronize at group boundaries.
+
+Add `--final-combine-pipelined` to opt into an asynchronous peer-prefetch kernel,
+intended for a small fixed CTA budget. It issues 128-bit `cp.async` loads into a
+shared-memory ring, keeps several peers in flight, and accumulates completed
+stages in FP32 in the same ascending peer order as the original kernel. Each
+thread owns its shared-memory slots; no CTA barriers or atomics are needed.
+Shared memory is interleaved in 16-byte lane stripes. N-tile-major inputs
+automatically use column-group-major traversal with this kernel; output is still
+row-major. The original kernel remains the default.
+
+For the 4-CTA, 512-thread, 32-element configuration, append just:
+
+```bash
+--final-combine-pipelined
+```
+
+The default `--final-combine-pipeline-stages 3` uses 96 KiB of shared memory per
+CTA for that configuration. Try `2` (64 KiB) and `4` (128 KiB) as well. The CTA
+count and threads per CTA remain exactly as requested. The pipeline requires
+SM80 or newer, aligned FP16/BF16 buffers, and an elements-per-thread value of at
+least 8 dividing both hidden and the input N tile width. Unsupported configurations
+or requests exceeding the device's shared-memory limit fail with an error;
+the pipeline never silently falls back to the original kernel. More stages can
+hide additional load latency but consume more shared memory. Actual speedup
+must be measured on the target GPU; this implementation was developed on a Mac
+without CUDA execution.
+
+Run the focused numerical regression and standalone benchmark on Hopper:
+
+```bash
+python -m unittest run.test_final_combine.PipelinedFinalCombineTest
+python -m run.benchmark_final_combine \
+  --source-tokens 4096 --hidden 4096 --tile-n 128 --peers 8 \
+  --route-probability 0.5 --ctas 4 --elements-per-thread 32 --threads-per-cta 512
+```
+
+The benchmark checks every variant against a PyTorch FP32 reference, warms the
+same inputs, interleaves individual launches, rotates variant order, and queues
+a GPU burner before each timed round to avoid host enqueue gaps. It reports
+median/minimum/p90 kernel time, output bandwidth, logical input-plus-output
+bandwidth, and speedup over the original row-major kernel. It also includes the
+original column-group-major kernel to separate traversal effects from pipeline
+effects. Use an otherwise idle GPU; these timings reuse resident buffers and do
+not reproduce the cache state or contention of the full distributed run. Recheck
+the original `torchrun` command with the new flag after the standalone check.
+
 The combine runs after return-copy completion and finishes before receive buffers
 are reused; its execution is excluded from both reported throughput timings.
 CUDA events bracket the final-combine launch after return-copy completion. Each

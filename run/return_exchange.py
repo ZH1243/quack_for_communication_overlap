@@ -51,6 +51,8 @@ class ReturnExchange:
                 elements_per_thread=args.final_combine_elements_per_thread,
                 threads_per_cta=args.final_combine_threads_per_cta,
                 column_group_major=args.final_combine_column_group_major,
+                pipelined=args.final_combine_pipelined,
+                pipeline_stages=args.final_combine_pipeline_stages,
             )
             self.combined_output = self.final_combine.output
         self.down_done = torch.cuda.Event()

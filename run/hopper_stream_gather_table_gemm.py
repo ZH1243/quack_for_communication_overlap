@@ -180,6 +180,17 @@ def parse_args() -> argparse.Namespace:
              "--return-token-results)",
     )
     parser.add_argument(
+        "--final-combine-pipelined", action="store_true",
+        help="Use asynchronous shared-memory peer prefetch for final combine (requires "
+             "--final-combine, aligned FP16/BF16 and elements/thread >= 8); "
+             "automatically uses column-group-major traversal for N-tile-major input",
+    )
+    parser.add_argument(
+        "--final-combine-pipeline-stages", type=int, choices=(2, 3, 4), default=3,
+        help="Peer prefetch stages for --final-combine-pipelined (default: 3); "
+             "shared bytes/CTA = stages * threads/CTA * elements/thread * 2",
+    )
+    parser.add_argument(
         "--final-combine-column-group-major", action="store_true",
         help="Assign final-combine work by N tile, then source token; each group has "
              "--down-tile-n columns. Requires --final-combine and --down-n-tile-major-output",
@@ -211,6 +222,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_stream_args(args: argparse.Namespace) -> None:
+    if args.final_combine_pipelined and not args.final_combine:
+        raise ValueError("--final-combine-pipelined requires --final-combine")
     if args.final_combine_column_group_major and not (
         args.final_combine and args.down_n_tile_major_output
     ):
@@ -1241,6 +1254,10 @@ def main() -> None:
                           f"{combine.elements_per_thread} elements/thread, "
                           f"{'column-group-major' if combine.column_group_major else 'row-major'} "
                           "assignment")
+                    print("Final combine implementation: "
+                          f"{'pipelined' if combine.pipelined else 'direct'}, "
+                          f"{combine.pipeline_stages} prefetch stages, "
+                          f"{combine.shared_memory_bytes} shared-memory bytes/CTA")
             for _ in range(max(1, args.warmup)):
                 run_stream_once(
                     proxy, launch, inputs.work_table, ready_rows, device, reset_events=reset_events

@@ -105,5 +105,68 @@ class FinalCombineTest(unittest.TestCase):
                         torch.testing.assert_close(actual, reference.to(dtype), rtol=0, atol=0)
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA and CuTe DSL")
+class PipelinedFinalCombineTest(unittest.TestCase):
+    def test_reference_and_direct(self):
+        from run.final_combine import FinalCombine
+
+        # Partial chunks, idle CTAs, ring wrap, short pipeline drains, and no peers.
+        # Tuple: tokens, hidden, tile_n, vector, threads, CTAs, stages, active peers.
+        cases = (
+            (1, 128, 0, 8, 256, 1, 2, 1),
+            (19, 384, 128, 32, 512, 4, 3, 8),
+            (257, 4096, 128, 32, 512, 4, 3, 8),
+            (259, 384, 0, 32, 256, 3, 2, 8),
+            (17, 256, 128, 8, 256, 0, 4, 2),
+            (7, 128, 128, 8, 256, 129, 3, 0),
+            (131, 384, 128, 16, 256, 1, 4, 8),
+            (67, 256, 128, 64, 256, 2, 2, 3),
+            (37, 256, 128, 128, 256, 2, 2, 4),
+        )
+        for dtype, case in product((torch.float16, torch.bfloat16), cases):
+            tokens, hidden, tile_n, vec, threads, ctas, stages, peers = case
+            with self.subTest(dtype=dtype, case=case):
+                generator = torch.Generator().manual_seed(42)
+                indices = []
+                for peer in range(peers):
+                    # Peer zero is dense (except the last token); others have holes
+                    # and different packed row orders, independent of token order.
+                    dense = tokens == 131
+                    index = torch.randperm(tokens if dense else max(1, tokens - 1),
+                                           generator=generator)
+                    indices.append(index if peer == 0 or dense else index[::1 + peer % 3])
+                indices.insert(0, torch.empty(0, dtype=torch.int64))
+                received = tuple(torch.empty(
+                    (hidden // tile_n, index.numel() * tile_n)
+                    if tile_n else (index.numel(), hidden), dtype=dtype, device="cuda",
+                ) for index in indices)
+                direct = FinalCombine(
+                    received, indices, tokens, hidden, tile_n, num_ctas=ctas,
+                    elements_per_thread=vec, threads_per_cta=threads,
+                )
+                pipeline = FinalCombine(
+                    received, indices, tokens, hidden, tile_n, num_ctas=ctas,
+                    elements_per_thread=vec, threads_per_cta=threads,
+                    pipelined=True, pipeline_stages=stages,
+                )
+                for iteration in range(3):
+                    reference = torch.zeros((tokens, hidden), device="cuda", dtype=torch.float32)
+                    for peer, (buffer, index) in enumerate(zip(received, indices)):
+                        generator = torch.Generator(device="cuda").manual_seed(
+                            100 * iteration + peer
+                        )
+                        logical = torch.randn((index.numel(), hidden), dtype=dtype,
+                                              device="cuda", generator=generator)
+                        physical = (logical.reshape(index.numel(), hidden // tile_n, tile_n)
+                                    .permute(1, 0, 2).reshape_as(buffer) if tile_n else logical)
+                        buffer.copy_(physical)
+                        reference.index_add_(0, index.cuda(), logical.float())
+                    for combine in (direct, pipeline):
+                        combine.output.fill_(float("nan"))
+                        actual = combine()
+                        torch.cuda.synchronize()
+                        torch.testing.assert_close(actual, reference.to(dtype), rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     unittest.main()
