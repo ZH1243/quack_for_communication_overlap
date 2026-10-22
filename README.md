@@ -191,6 +191,11 @@ kernel reads the packed buffers (including N-tile-major layout), sums contributi
 in FP32, and writes a contiguous `[source_tokens, hidden]` tensor in the received
 dtype, available as `ReturnExchange.combined_output`. Tokens sent nowhere receive
 zeros. This is an unweighted sum of the already locally combined expert outputs.
+Add `--final-combine-ctas 16` to launch exactly 16 persistent CTAs, with 256 threads
+per CTA. Each CTA processes 256-column chunks in a grid-stride loop. The default,
+`--final-combine-ctas 0`, launches `source_tokens * ceil(hidden / 256)` CTAs.
+The CTA count limits the number of blocks, but does not guarantee one CTA per SM
+or reserve particular SMs. This option requires `--final-combine`.
 The combine runs after return-copy completion and finishes before receive buffers
 are reused; its execution is excluded from both reported throughput timings.
 CUDA events bracket the final-combine launch after return-copy completion. Each

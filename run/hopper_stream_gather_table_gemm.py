@@ -179,6 +179,12 @@ def parse_args() -> argparse.Namespace:
              "excluded from throughput timing (requires --bitmask-token-routing and "
              "--return-token-results)",
     )
+    parser.add_argument(
+        "--final-combine-ctas", type=int, default=0,
+        help="Fixed number of persistent final-combine CTAs (256 threads each); "
+             "0 uses one CTA per 256-column chunk (default: 0). Requires --final-combine; "
+             "does not guarantee one CTA per SM",
+    )
     parser.add_argument("--token-route-probability", type=float, default=0.25,
                         help="Independent probability for each destination bit (default: 0.25)")
     parser.add_argument("--local-routes-per-token", type=int, default=2,
@@ -190,6 +196,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_stream_args(args: argparse.Namespace) -> None:
+    if args.final_combine_ctas < 0:
+        raise ValueError("--final-combine-ctas must be nonnegative")
+    if args.final_combine_ctas and not args.final_combine:
+        raise ValueError("--final-combine-ctas requires --final-combine")
     if args.final_combine and not (args.bitmask_token_routing and args.return_token_results):
         raise ValueError("--final-combine requires --bitmask-token-routing and "
                          "--return-token-results")

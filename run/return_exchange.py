@@ -47,7 +47,7 @@ class ReturnExchange:
                 from final_combine import FinalCombine
             self.final_combine = FinalCombine(
                 self.received, self.source_token_indices, args.source_tokens, args.hidden,
-                self.final_combine_tile_n,
+                self.final_combine_tile_n, num_ctas=args.final_combine_ctas,
             )
             self.combined_output = self.final_combine.output
         self.down_done = torch.cuda.Event()

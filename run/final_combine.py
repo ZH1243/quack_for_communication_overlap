@@ -8,16 +8,17 @@ import torch
 
 
 class _CombineKernel:
-    def __init__(self, counts, hidden, tile_n):
+    def __init__(self, counts, hidden, tile_n, num_ctas):
         self.counts = counts
         self.hidden = hidden
         self.tile_n = tile_n
+        self.num_ctas = num_ctas
 
     @cute.jit
     def __call__(self, received: tuple, rows: cute.Tensor, output: cute.Tensor,
                  stream: cuda.CUstream):
         self.kernel(received, rows, output).launch(
-            grid=(cute.ceil_div(self.hidden, 256) * output.shape[0], 1, 1),
+            grid=(self.num_ctas, 1, 1),
             block=(256, 1, 1), stream=stream,
         )
 
@@ -26,19 +27,20 @@ class _CombineKernel:
         thread, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
         blocks_per_token = cute.ceil_div(self.hidden, 256)
-        token = block // blocks_per_token
-        column = block % blocks_per_token * 256 + thread
-        if column < self.hidden:
-            total = cutlass.Float32(0.0)
-            for peer in cutlass.range_constexpr(len(self.counts)):
-                row = rows[peer, token]
-                if row >= 0:
-                    offset = row * self.hidden + column
-                    if cutlass.const_expr(self.tile_n > 0):
-                        offset = ((column // self.tile_n * self.counts[peer] + row)
-                                  * self.tile_n + column % self.tile_n)
-                    total += received[peer][offset].to(cutlass.Float32)
-            output[token, column] = total.to(output.element_type)
+        for chunk in cutlass.range(block, blocks_per_token * output.shape[0], self.num_ctas):
+            token = chunk // blocks_per_token
+            column = chunk % blocks_per_token * 256 + thread
+            if column < self.hidden:
+                total = cutlass.Float32(0.0)
+                for peer in cutlass.range_constexpr(len(self.counts)):
+                    row = rows[peer, token]
+                    if row >= 0:
+                        offset = row * self.hidden + column
+                        if cutlass.const_expr(self.tile_n > 0):
+                            offset = ((column // self.tile_n * self.counts[peer] + row)
+                                      * self.tile_n + column % self.tile_n)
+                        total += received[peer][offset].to(cutlass.Float32)
+                output[token, column] = total.to(output.element_type)
 
 
 class FinalCombine:
@@ -48,10 +50,14 @@ class FinalCombine:
     indices. Empty peers are omitted. Reduction uses FP32 in ascending peer order
     with a single conversion to the received dtype; no atomics or reset required.
     The caller must finish all incoming copies before calling this object.
+    num_ctas=0 launches one CTA per 256-column chunk; a positive value launches
+    exactly that many CTAs, each processing chunks with a grid-stride loop.
     """
 
     @torch.inference_mode()
-    def __init__(self, received, indices, source_tokens, hidden, tile_n=0):
+    def __init__(self, received, indices, source_tokens, hidden, tile_n=0, num_ctas=0):
+        if num_ctas < 0:
+            raise ValueError("num_ctas must be nonnegative")
         if tile_n < 0 or (tile_n and hidden % tile_n):
             raise ValueError("hidden must be divisible by the N tile width")
         device, dtype = received[0].device, received[0].dtype
@@ -69,7 +75,10 @@ class FinalCombine:
         self.buffers = tuple(buffer.view(-1) for buffer, _ in active)
         self.arguments = (tuple(from_dlpack(buffer) for buffer in self.buffers),
                           from_dlpack(self.rows), from_dlpack(self.output))
-        kernel = _CombineKernel(tuple(index.numel() for _, index in active), hidden, tile_n)
+        self.num_ctas = num_ctas or source_tokens * ((hidden + 255) // 256)
+        kernel = _CombineKernel(
+            tuple(index.numel() for _, index in active), hidden, tile_n, self.num_ctas
+        )
         self.compiled = cute.compile(
             kernel, *self.arguments, cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
         )
