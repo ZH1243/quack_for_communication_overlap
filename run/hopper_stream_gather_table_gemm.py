@@ -180,6 +180,13 @@ def parse_args() -> argparse.Namespace:
              "--return-token-results)",
     )
     parser.add_argument(
+        "--final-combine-periodic-release", action="store_true",
+        help="Release one populated final-combine N-tile group per --flush-interval-us "
+             "via pinned-host-to-HBM memcpy; forces column-group-major traversal and requires "
+             "--final-combine, --down-n-tile-major-output, --proxy-mode thread and "
+             "--flag-update-mode memcpy. First group is released after one interval",
+    )
+    parser.add_argument(
         "--final-combine-pipelined", action="store_true",
         help="Use asynchronous shared-memory peer prefetch for final combine (requires "
              "--final-combine, aligned FP16/BF16 and elements/thread >= 8); "
@@ -237,6 +244,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_stream_args(args: argparse.Namespace) -> None:
+    if args.final_combine_periodic_release:
+        if not (args.final_combine and args.down_n_tile_major_output
+                and args.proxy_mode == "thread" and args.flag_update_mode == "memcpy"):
+            raise ValueError("--final-combine-periodic-release requires --final-combine, "
+                             "--down-n-tile-major-output, --proxy-mode thread and "
+                             "--flag-update-mode memcpy")
+        args.final_combine_column_group_major = True
     if args.final_combine_column_group_major_output and not args.final_combine:
         raise ValueError("--final-combine-column-group-major-output requires --final-combine")
     if args.final_combine_register_prefetch and not args.final_combine:
@@ -1271,6 +1285,10 @@ def main() -> None:
                     print("Final combine enabled: source-ordered GPU sum after return copies; "
                           "excluded from throughput timing.")
                     combine = return_exchange.final_combine
+                    if args.final_combine_periodic_release:
+                        print(f"Final combine periodic release: one {args.down_tile_n}-column "
+                              f"group every {args.flush_interval_us} us (requested), "
+                              "after return completion; first release after one interval")
                     print(f"Final combine launch: {combine.num_ctas} CTAs, "
                           f"{combine.threads_per_cta} threads/CTA, "
                           f"{combine.elements_per_thread} elements/thread, "

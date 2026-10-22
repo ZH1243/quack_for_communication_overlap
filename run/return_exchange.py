@@ -55,6 +55,9 @@ class ReturnExchange:
                 pipeline_stages=args.final_combine_pipeline_stages,
                 register_prefetch=args.final_combine_register_prefetch,
                 prefetch_peers=args.final_combine_prefetch_peers,
+                release_interval_us=(args.flush_interval_us
+                                     if args.final_combine_periodic_release else None),
+                release_library=(proxy.library if args.final_combine_periodic_release else None),
                 output_tile_n=(args.down_tile_n
                                if args.final_combine_column_group_major_output else 0),
             )

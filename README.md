@@ -334,6 +334,38 @@ Use an otherwise idle GPU; these timings reuse resident buffers and do
 not reproduce the cache state or contention of the full distributed run. Recheck
 the original `torchrun` command with the new flag after the standalone check.
 
+Add `--final-combine-periodic-release` to simulate delayed column-group availability
+**after all return copies have completed**. The native CPU proxy helper publishes
+one additional ready group using pinned-host-to-HBM `int32` copies every
+`--flush-interval-us` (requested host submission interval). The first group is
+released after one interval; zero releases all groups without intentional delay.
+`--flush-entries` still controls only the up-GEMM table batches.
+
+```bash
+# Rebuild on the CUDA host before using the new flag:
+cmake -S run/cpu_proxy -B run/cpu_proxy/build
+cmake --build run/cpu_proxy/build -j
+# Append to the existing streaming command:
+# --final-combine-periodic-release
+```
+
+This mode requires `--final-combine --down-n-tile-major-output --proxy-mode thread
+--flag-update-mode memcpy`. It automatically enables column-group-major traversal
+without changing the selected output layout. One group is `--down-tile-n` columns,
+independent of down-GEMM swizzle grouping. All three combine implementations poll
+with system-scope acquire loads before reading that group's input contributions.
+The counter resets to zero before each launch, and publication runs on a separate
+nonblocking stream using immutable pinned values. The native helper runs on the
+calling CPU thread while the enqueued combine kernel runs on the GPU; the call
+returns after the flag copies finish, with GPU combine completion still ordered
+on the caller's CUDA stream. This is a synthetic gate, not a return-copy readiness
+protocol. Combine timing includes the artificial waits and host publication costs;
+microsecond intervals are subject to OS scheduling and CUDA submission latency.
+
+```bash
+python -m unittest run.test_final_combine.FinalCombineReadinessTest
+```
+
 The combine runs after return-copy completion and finishes before receive buffers
 are reused; its execution is excluded from both reported throughput timings.
 CUDA events bracket the final-combine launch after return-copy completion. Each

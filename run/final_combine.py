@@ -1,5 +1,6 @@
 """Source-side reduction of packed results returned by bitmask routing."""
 
+import ctypes
 from typing import Optional
 
 import cuda.bindings.driver as cuda
@@ -9,6 +10,56 @@ import cutlass.utils
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 import torch
+
+
+class _PeriodicGroupRelease:
+    """Publish immutable pinned-host prefix values on a separate CUDA stream."""
+
+    def __init__(self, library, device, groups, interval_us):
+        if interval_us < 0:
+            raise ValueError("release interval must be nonnegative")
+        try:
+            self.publish = library.stream_gather_publish_combine_groups
+        except AttributeError as error:
+            raise RuntimeError("Rebuild run/cpu_proxy for periodic final combine") from error
+        self.publish.argtypes = [
+            ctypes.c_int, ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int,
+            ctypes.c_int, ctypes.c_uint64, ctypes.POINTER(ctypes.c_char), ctypes.c_size_t,
+        ]
+        self.publish.restype = ctypes.c_int
+        self.library = library
+        self.device = device.index
+        self.groups = groups
+        self.interval_us = interval_us
+        self.values = torch.arange(1, groups + 1, dtype=torch.int32, pin_memory=True)
+        self.ready = torch.zeros(1, dtype=torch.int32, device=device)
+        self.stream = torch.cuda.Stream(device=device)
+        self.reset_done = torch.cuda.Event()
+
+    def reset(self):
+        # Current-stream ordering also keeps reset behind the previous combine.
+        self.ready.zero_()
+        self.reset_done.record(torch.cuda.current_stream(self.ready.device))
+        self.stream.wait_event(self.reset_done)
+
+    def release(self):
+        # The kernel is already enqueued. Native host code publishes while it runs;
+        # no Python sleep precision or background-thread scheduling is involved.
+        error = ctypes.create_string_buffer(4096)
+        if self.publish(self.device, self.ready.data_ptr(), self.values.data_ptr(),
+                        self.groups, self.interval_us, self.stream.cuda_stream,
+                        error, len(error)):
+            raise RuntimeError(error.value.decode(errors="replace"))
+
+
+@cute.jit
+def _wait_for_column_group(ready_groups: cute.Tensor, column: cutlass.Int32,
+                           tile_n: cutlass.Constexpr[int]):
+    ready = cute.arch.load(ready_groups.iterator.llvm_ptr, cutlass.Int32,
+                           sem="acquire", scope="sys")
+    while ready < column // tile_n + 1:
+        ready = cute.arch.load(ready_groups.iterator.llvm_ptr, cutlass.Int32,
+                               sem="acquire", scope="sys")
 
 
 class _CombineKernel:
@@ -25,14 +76,15 @@ class _CombineKernel:
 
     @cute.jit
     def __call__(self, received: Optional[tuple], rows: cute.Tensor, output: cute.Tensor,
-                 stream: cuda.CUstream):
-        self.kernel(received, rows, output).launch(
+                 ready_groups: Optional[cute.Tensor], stream: cuda.CUstream):
+        self.kernel(received, rows, output, ready_groups).launch(
             grid=(self.num_ctas, 1, 1),
             block=(self.threads_per_cta, 1, 1), stream=stream,
         )
 
     @cute.kernel
-    def kernel(self, received: Optional[tuple], rows: cute.Tensor, output: cute.Tensor):
+    def kernel(self, received: Optional[tuple], rows: cute.Tensor, output: cute.Tensor,
+               ready_groups: Optional[cute.Tensor]):
         thread, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
         vec = self.elements_per_thread
@@ -59,6 +111,8 @@ class _CombineKernel:
                     within_group = vector % vectors_per_group
                     token = within_group // vectors_per_group_row
                     column = group * self.tile_n + within_group % vectors_per_group_row * vec
+                if cutlass.const_expr(ready_groups is not None):
+                    _wait_for_column_group(ready_groups, column, self.tile_n)
                 total.fill(0.0)
                 for peer in cutlass.range_constexpr(len(self.counts)):
                     row = rows[peer, token]
@@ -96,7 +150,8 @@ class _RegisterCombineKernel(_CombineKernel):
     """
 
     @cute.kernel
-    def kernel(self, received: Optional[tuple], rows: cute.Tensor, output: cute.Tensor):
+    def kernel(self, received: Optional[tuple], rows: cute.Tensor, output: cute.Tensor,
+               ready_groups: Optional[cute.Tensor]):
         thread, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
         vec = self.elements_per_thread
@@ -127,6 +182,8 @@ class _RegisterCombineKernel(_CombineKernel):
                     column = (tile * self.tile_n
                               + within_tile % groups_per_tile_row * (lanes * vec))
                 column += vector % lanes * 8
+                if cutlass.const_expr(ready_groups is not None):
+                    _wait_for_column_group(ready_groups, column, self.tile_n)
                 for peer in cutlass.range_constexpr(peer_count):
                     peer_rows[peer] = rows[peer, token]
                 total.fill(0.0)
@@ -198,7 +255,8 @@ class _PipelinedCombineKernel(_CombineKernel):
         cute.arch.cp_async_commit_group()
 
     @cute.kernel
-    def kernel(self, received: Optional[tuple], rows: cute.Tensor, output: cute.Tensor):
+    def kernel(self, received: Optional[tuple], rows: cute.Tensor, output: cute.Tensor,
+               ready_groups: Optional[cute.Tensor]):
         thread, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
         vec = self.elements_per_thread
@@ -236,6 +294,8 @@ class _PipelinedCombineKernel(_CombineKernel):
                     within_group = vector % vectors_per_group
                     token = within_group // vectors_per_group_row
                     column = group * self.tile_n + within_group % vectors_per_group_row * vec
+                if cutlass.const_expr(ready_groups is not None):
+                    _wait_for_column_group(ready_groups, column, self.tile_n)
                 for peer in cutlass.range_constexpr(peer_count):
                     peer_rows[peer] = rows[peer, token]
                 total.fill(0.0)
@@ -288,6 +348,11 @@ class FinalCombine:
     register_prefetch=True stripes 8-element vectors across lanes and loads
     prefetch_peers peers into registers before reducing them. Both optimized paths
     use row-major traversal unless column_group_major is explicitly selected.
+    ready_groups optionally gates every input load on a system-acquire prefix count;
+    it forces column-group-major traversal. The caller owns publication and reset.
+    release_interval_us with release_library instead owns the flag and periodically
+    publishes one group via the native CPU proxy after launch. Inputs must already
+    be populated; this simulates readiness, not incoming-copy completion.
     Unsupported pipeline configurations raise instead of silently using the baseline.
     """
 
@@ -295,7 +360,14 @@ class FinalCombine:
     def __init__(self, received, indices, source_tokens, hidden, tile_n=0, num_ctas=0,
                  elements_per_thread=8, threads_per_cta=256, column_group_major=False,
                  pipelined=False, pipeline_stages=3, register_prefetch=False, prefetch_peers=2,
-                 output_tile_n=0):
+                 output_tile_n=0, ready_groups=None, release_interval_us=None,
+                 release_library=None):
+        if ready_groups is not None or release_interval_us is not None:
+            if tile_n <= 0:
+                raise ValueError("column-group readiness requires N-tile-major input")
+            column_group_major = True
+        if release_interval_us is not None and (ready_groups is not None or release_library is None):
+            raise ValueError("periodic release requires a proxy library and owns its readiness flag")
         if num_ctas < 0:
             raise ValueError("num_ctas must be nonnegative")
         if elements_per_thread not in (1, 4, 8, 16, 32, 64, 128):
@@ -328,6 +400,18 @@ class FinalCombine:
         self.pipeline_stages = pipeline_stages if pipelined else 0
         self.shared_memory_bytes = 0
         device, dtype = received[0].device, received[0].dtype
+        self.release = None
+        if release_interval_us is not None:
+            self.release = _PeriodicGroupRelease(
+                release_library, device, hidden // tile_n, release_interval_us
+            )
+            ready_groups = self.release.ready
+        if ready_groups is not None and (
+            ready_groups.device != device or ready_groups.dtype != torch.int32
+            or ready_groups.numel() != 1 or not ready_groups.is_contiguous()
+        ):
+            raise ValueError("ready_groups must be one contiguous CUDA int32 on the input device")
+        self.ready_groups = ready_groups
         active = [(buffer, index) for buffer, index in zip(received, indices) if index.numel()]
         output_shape = ((hidden // output_tile_n, source_tokens * output_tile_n)
                         if output_tile_n else (source_tokens, hidden))
@@ -374,6 +458,7 @@ class FinalCombine:
         self.arguments = (
             received_args,
             from_dlpack(self.rows), from_dlpack(self.output, assumed_align=alignment),
+            from_dlpack(ready_groups) if ready_groups is not None else None,
         )
         chunk_width = threads_per_cta * vec
         self.num_ctas = num_ctas or ((source_tokens * hidden + chunk_width - 1) // chunk_width)
@@ -399,7 +484,12 @@ class FinalCombine:
             kernel, *self.arguments, cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
         )
 
+    @torch.inference_mode()
     def __call__(self):
+        if self.release is not None:
+            self.release.reset()
         self.compiled(*self.arguments,
                       cuda.CUstream(torch.cuda.current_stream(self.output.device).cuda_stream))
+        if self.release is not None:
+            self.release.release()
         return self.output

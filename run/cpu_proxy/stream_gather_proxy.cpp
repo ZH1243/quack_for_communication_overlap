@@ -854,6 +854,37 @@ Options make_thread_options(int device, int table_rows, int table_width, int exp
 }  // namespace
 
 #ifdef QUACK_STREAM_GATHER_PROXY_LIBRARY
+// Caller owns the pinned immutable values, HBM counter and nonblocking stream.
+// The stream already waits for the counter reset, before the consumer launch.
+extern "C" int stream_gather_publish_combine_groups(
+    int device, std::uintptr_t ready, std::uintptr_t values, int groups,
+    int interval_us, std::uintptr_t stream_handle, char* error, std::size_t capacity) {
+  try {
+    if (!ready || !values || groups <= 0 || interval_us < 0 || !stream_handle)
+      throw std::runtime_error("invalid periodic combine publication arguments");
+    check_cuda(cudaSetDevice(device), "cudaSetDevice(combine release)");
+    auto stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    auto* host_values = reinterpret_cast<const std::int32_t*>(values);
+    auto* device_ready = reinterpret_cast<std::int32_t*>(ready);
+    // Start the release clock only once the reset preceding this launch is done.
+    check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize(combine reset)");
+    auto deadline = std::chrono::steady_clock::now();
+    for (int group = 0; group < groups; ++group) {
+      deadline += std::chrono::microseconds(interval_us);
+      if (interval_us) std::this_thread::sleep_until(deadline);
+      check_cuda(cudaMemcpyAsync(device_ready, host_values + group, sizeof(std::int32_t),
+                                 cudaMemcpyHostToDevice, stream),
+                 "cudaMemcpyAsync(combine readiness)");
+    }
+    // Keep pinned sources alive and prevent late updates from racing the next reset.
+    check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize(combine release)");
+    return 0;
+  } catch (const std::exception& exception) {
+    write_error(error, capacity, exception.what());
+    return 1;
+  }
+}
+
 extern "C" void* stream_gather_ready_trace_create(
     int device, int groups, std::uintptr_t* device_pointer, char* error, std::size_t capacity) {
   try {

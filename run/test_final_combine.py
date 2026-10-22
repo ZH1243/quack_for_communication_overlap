@@ -1,5 +1,8 @@
 """GPU numerical regression: python -m unittest run.test_final_combine."""
 
+import ctypes
+from pathlib import Path
+import time
 import unittest
 import warnings
 from itertools import product
@@ -266,6 +269,96 @@ class FinalCombineOutputLayoutTest(unittest.TestCase):
                 expected = (reference.to(dtype).reshape(7, 44, 6)
                             .permute(1, 0, 2).contiguous().reshape(44, 42))
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA and CuTe DSL")
+class FinalCombineReadinessTest(unittest.TestCase):
+    @torch.inference_mode()
+    def test_delayed_groups_guard_input_loads(self):
+        from run.final_combine import FinalCombine
+
+        # Partial chunks and group boundaries inside a CTA; sparse, empty peers.
+        tokens, hidden, tile_n = 65, 384, 128
+        indices = (torch.arange(0, tokens, 2), torch.arange(1, tokens, 3), torch.empty(0).long())
+        for implementation in ({}, {"register_prefetch": True}, {"pipelined": True}):
+            for dtype in (torch.float16, torch.bfloat16):
+                with self.subTest(implementation=implementation, dtype=dtype):
+                    received = tuple(torch.zeros((3, index.numel() * tile_n),
+                                                 device="cuda", dtype=dtype) for index in indices)
+                    ready = torch.zeros(1, device="cuda", dtype=torch.int32)
+                    combine = FinalCombine(
+                        received, indices, tokens, hidden, tile_n, num_ctas=4,
+                        elements_per_thread=32, threads_per_cta=512, ready_groups=ready,
+                        **implementation,
+                    )
+                    publisher = torch.cuda.Stream()
+                    prefixes = torch.arange(1, 4, dtype=torch.int32, pin_memory=True)
+                    for iteration in range(2):
+                        ready.zero_()
+                        combine.output.fill_(float("nan"))
+                        for buffer in received:
+                            buffer.zero_()
+                        # Inputs are deliberately withheld until each flag update:
+                        # removing a readiness wait must produce the wrong sum.
+                        reference = torch.zeros((tokens, hidden), dtype=torch.float32)
+                        host_buffers = []
+                        for peer, index in enumerate(indices):
+                            generator = torch.Generator().manual_seed(iteration * 10 + peer)
+                            logical = torch.randn((index.numel(), hidden), generator=generator,
+                                                  dtype=dtype)
+                            reference.index_add_(0, index, logical.float())
+                            physical = (logical.reshape(index.numel(), 3, tile_n).permute(1, 0, 2)
+                                        .contiguous().reshape(3, index.numel() * tile_n).pin_memory())
+                            host_buffers.append(physical)
+                        torch.cuda.synchronize()
+                        actual = combine()
+                        try:
+                            for group in range(3):
+                                time.sleep(0.02)
+                                with torch.cuda.stream(publisher):
+                                    for buffer, host in zip(received, host_buffers):
+                                        if buffer.numel():
+                                            buffer[group].copy_(host[group], non_blocking=True)
+                                    ready.copy_(prefixes[group:group + 1], non_blocking=True)
+                        finally:
+                            # Unblock the GPU even if a host-side assertion/copy raises.
+                            with torch.cuda.stream(publisher):
+                                ready.copy_(prefixes[-1:], non_blocking=True)
+                            publisher.synchronize()
+                            torch.cuda.synchronize()
+                        torch.testing.assert_close(actual.cpu(), reference.to(dtype), rtol=0, atol=0)
+
+    @torch.inference_mode()
+    def test_native_periodic_release_repeated_runs(self):
+        from run.final_combine import FinalCombine
+
+        path = Path(__file__).parent / "cpu_proxy/build/libstream_gather_proxy_thread.so"
+        if not path.exists():
+            self.skipTest("build run/cpu_proxy to test native periodic publication")
+        library = ctypes.CDLL(str(path.resolve()))
+        indices = (torch.tensor([0, 2, 4]), torch.tensor([1, 2]))
+        for implementation in ({}, {"register_prefetch": True}, {"pipelined": True}):
+            with self.subTest(implementation=implementation):
+                received = tuple(torch.empty((3, index.numel() * 128), device="cuda",
+                                             dtype=torch.bfloat16) for index in indices)
+                combine = FinalCombine(
+                    received, indices, 5, 384, 128, num_ctas=4, elements_per_thread=32,
+                    threads_per_cta=512, release_interval_us=1000, release_library=library,
+                    **implementation,
+                )
+                for iteration in range(2):
+                    reference = torch.zeros((5, 384), dtype=torch.float32, device="cuda")
+                    for peer, (buffer, index) in enumerate(zip(received, indices)):
+                        generator = torch.Generator(device="cuda").manual_seed(iteration * 10 + peer)
+                        logical = torch.randn((index.numel(), 384), device="cuda",
+                                              dtype=torch.bfloat16, generator=generator)
+                        buffer.copy_(logical.reshape(-1, 3, 128).permute(1, 0, 2).reshape_as(buffer))
+                        reference.index_add_(0, index.cuda(), logical.float())
+                    combine.output.fill_(float("nan"))
+                    actual = combine()
+                    torch.cuda.synchronize()
+                    torch.testing.assert_close(actual, reference.bfloat16(), rtol=0, atol=0)
+                    self.assertEqual(combine.ready_groups.item(), 3)
 
 
 if __name__ == "__main__":
