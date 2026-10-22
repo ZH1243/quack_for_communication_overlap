@@ -8,6 +8,8 @@ import torch
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA and CuTe DSL")
 class FinalCombineTest(unittest.TestCase):
+    # FinalCombine allocates inference tensors; poison/reuse them in the same mode.
+    @torch.inference_mode()
     def test_source_order_sum_and_repeated_overwrite(self):
         from run.final_combine import FinalCombine
 
@@ -68,6 +70,7 @@ class FinalCombineTest(unittest.TestCase):
                                         actual, reference.to(dtype), rtol=0, atol=0
                                     )
 
+    @torch.inference_mode()
     def test_column_group_major_persistent_ctas(self):
         from run.final_combine import FinalCombine
 
@@ -107,6 +110,7 @@ class FinalCombineTest(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA and CuTe DSL")
 class PipelinedFinalCombineTest(unittest.TestCase):
+    @torch.inference_mode()
     def test_reference_and_direct(self):
         from run.final_combine import FinalCombine
 
