@@ -24,6 +24,7 @@ def main():
     parser.add_argument("--elements-per-thread", type=int, default=32)
     parser.add_argument("--threads-per-cta", type=int, default=512)
     parser.add_argument("--stages", type=int, nargs="+", choices=(2, 3, 4), default=[2, 3, 4])
+    parser.add_argument("--prefetch-peers", type=int, nargs="+", choices=(1, 2, 4), default=[1, 2])
     parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
     parser.add_argument("--rounds", type=int, default=50)
     parser.add_argument("--warmup-seconds", type=float, default=2.0)
@@ -51,18 +52,25 @@ def main():
         received.append(logical if not args.tile_n else
                         logical.reshape(index.numel(), args.hidden // args.tile_n, args.tile_n)
                         .permute(1, 0, 2).contiguous())
-    variants = [("direct-row", False, False, 3)]
+    variants = [("direct-row", {})]
     if args.tile_n:
-        variants.append(("direct-column", False, True, 3))
-    variants.extend((f"pipeline-{stages}", True, bool(args.tile_n), stages)
-                    for stages in args.stages)
+        variants.append(("direct-column", {"column_group_major": True}))
+    variants.extend((f"register-{peers}", {"register_prefetch": True, "prefetch_peers": peers})
+                    for peers in args.prefetch_peers)
+    for stages in args.stages:
+        variants.append((f"pipeline-row-{stages}", {
+            "pipelined": True, "pipeline_stages": stages,
+        }))
+        if args.tile_n:
+            variants.append((f"pipeline-col-{stages}", {
+                "pipelined": True, "pipeline_stages": stages, "column_group_major": True,
+            }))
     combines = {}
-    for name, pipelined, column_major, stages in variants:
+    for name, options in variants:
         combine = FinalCombine(
             received, indices, args.source_tokens, args.hidden, args.tile_n,
             num_ctas=args.ctas, elements_per_thread=args.elements_per_thread,
-            threads_per_cta=args.threads_per_cta, column_group_major=column_major,
-            pipelined=pipelined, pipeline_stages=stages,
+            threads_per_cta=args.threads_per_cta, **options,
         )
         combine.output.fill_(float("nan"))
         torch.testing.assert_close(combine(), reference.to(dtype), rtol=0, atol=0)

@@ -82,6 +82,77 @@ class _CombineKernel:
                 cute.copy(copy_atom, values, destination)
 
 
+class _RegisterCombineKernel(_CombineKernel):
+    """Stripe 128-bit vectors across lanes; load peer batches before consuming them.
+
+    Unlike contiguous per-thread vectors, every copy instruction covers adjacent
+    lane stripes. Stage values in received precision, then reduce in peer order.
+    Prefetch depth is a compiler scheduling opportunity, not an async-copy fence.
+    """
+
+    @cute.kernel
+    def kernel(self, received: Optional[tuple], rows: cute.Tensor, output: cute.Tensor):
+        thread, _, _ = cute.arch.thread_idx()
+        block, _, _ = cute.arch.block_idx()
+        vec = self.elements_per_thread
+        lanes = self.lanes_per_group
+        total_vectors = output.shape[0] * (self.hidden // vec)
+        num_chunks = cute.ceil_div(total_vectors, self.threads_per_cta)
+        peer_count = len(self.counts)
+        depth = self.prefetch_peers
+        copy_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), output.element_type, num_bits_per_copy=128,
+        )
+        staged = cute.make_rmem_tensor((8, vec // 8, depth), output.element_type)
+        values = cute.make_rmem_tensor((8, vec // 8), output.element_type)
+        total = cute.make_rmem_tensor((8, vec // 8), cutlass.Float32)
+        peer_rows = cute.make_rmem_tensor((max(1, peer_count),), cutlass.Int32)
+        for chunk in cutlass.range(block, num_chunks, self.num_ctas):
+            vector = chunk * self.threads_per_cta + thread
+            if vector < total_vectors:
+                group = vector // lanes
+                token = group // (self.hidden // (lanes * vec))
+                column = group % (self.hidden // (lanes * vec)) * (lanes * vec)
+                if cutlass.const_expr(self.column_group_major):
+                    groups_per_tile_row = self.tile_n // (lanes * vec)
+                    groups_per_tile = output.shape[0] * groups_per_tile_row
+                    tile = group // groups_per_tile
+                    within_tile = group % groups_per_tile
+                    token = within_tile // groups_per_tile_row
+                    column = (tile * self.tile_n
+                              + within_tile % groups_per_tile_row * (lanes * vec))
+                column += vector % lanes * 8
+                for peer in cutlass.range_constexpr(peer_count):
+                    peer_rows[peer] = rows[peer, token]
+                total.fill(0.0)
+                for first in cutlass.range_constexpr(0, peer_count, depth):
+                    for slot in cutlass.range_constexpr(min(depth, peer_count - first)):
+                        peer = first + slot
+                        row = peer_rows[peer]
+                        if row >= 0:
+                            for stripe in cutlass.range_constexpr(vec // 8):
+                                col = column + stripe * lanes * 8
+                                offset = row * self.hidden + col
+                                if cutlass.const_expr(self.tile_n > 0):
+                                    offset = ((col // self.tile_n * self.counts[peer] + row)
+                                              * self.tile_n + col % self.tile_n)
+                                source = cute.make_tensor(
+                                    received[peer].iterator + cute.assume(offset, divby=8),
+                                    cute.make_layout((8,)),
+                                )
+                                cute.copy(copy_atom, source, staged[None, stripe, slot])
+                    for slot in cutlass.range_constexpr(min(depth, peer_count - first)):
+                        if peer_rows[first + slot] >= 0:
+                            total.store(total.load()
+                                        + staged[None, None, slot].load().to(cutlass.Float32))
+                values.store(total.load().to(output.element_type))
+                destination = cute.make_tensor(
+                    output.iterator + cute.assume(token * self.hidden + column, divby=8),
+                    cute.make_layout((8, vec // 8), stride=(1, lanes * 8)),
+                )
+                cute.copy(copy_atom, values, destination)
+
+
 class _PipelinedCombineKernel(_CombineKernel):
     """Prefetch peers through a private per-thread shared-memory ring.
 
@@ -188,15 +259,17 @@ class FinalCombine:
     Aligned FP16/BF16 inputs use vector copies and independent FP32 accumulators.
     Unsupported alignment, row widths, tile widths, or dtypes use one element per thread.
     pipelined=True opts into asynchronous peer prefetch (SM80+, aligned FP16/BF16,
-    elements_per_thread >= 8). N-tile-major inputs automatically use column-group
-    traversal. pipeline_stages controls the shared-memory ring, not the CTA count.
+    elements_per_thread >= 8). pipeline_stages controls the shared-memory ring.
+    register_prefetch=True stripes 8-element vectors across lanes and loads
+    prefetch_peers peers into registers before reducing them. Both optimized paths
+    use row-major traversal unless column_group_major is explicitly selected.
     Unsupported pipeline configurations raise instead of silently using the baseline.
     """
 
     @torch.inference_mode()
     def __init__(self, received, indices, source_tokens, hidden, tile_n=0, num_ctas=0,
                  elements_per_thread=8, threads_per_cta=256, column_group_major=False,
-                 pipelined=False, pipeline_stages=3):
+                 pipelined=False, pipeline_stages=3, register_prefetch=False, prefetch_peers=2):
         if num_ctas < 0:
             raise ValueError("num_ctas must be nonnegative")
         if elements_per_thread not in (1, 4, 8, 16, 32, 64, 128):
@@ -205,13 +278,22 @@ class FinalCombine:
             raise ValueError("threads_per_cta must be 256 or 512")
         if pipeline_stages not in (2, 3, 4):
             raise ValueError("pipeline_stages must be 2, 3, or 4")
+        if pipelined and register_prefetch:
+            raise ValueError("pipelined and register_prefetch are mutually exclusive")
+        if prefetch_peers not in (1, 2, 4):
+            raise ValueError("prefetch_peers must be 1, 2, or 4")
         self.threads_per_cta = threads_per_cta
         if tile_n < 0 or (tile_n and hidden % tile_n):
             raise ValueError("hidden must be divisible by the N tile width")
         if column_group_major and not tile_n:
             raise ValueError("column_group_major requires N-tile-major input (tile_n > 0)")
-        self.column_group_major = column_group_major or (pipelined and tile_n > 0)
+        self.column_group_major = column_group_major
         self.pipelined = pipelined
+        self.register_prefetch = register_prefetch
+        self.prefetch_peers = prefetch_peers if register_prefetch else 0
+        self.implementation = (
+            "register" if register_prefetch else "pipelined" if pipelined else "direct"
+        )
         self.pipeline_stages = pipeline_stages if pipelined else 0
         self.shared_memory_bytes = 0
         device, dtype = received[0].device, received[0].dtype
@@ -234,10 +316,11 @@ class FinalCombine:
                        for buffer in self.buffers)):
             vec = 1
         self.elements_per_thread = vec
-        if pipelined:
+        if pipelined or register_prefetch:
             if vec < 8:
-                raise ValueError("pipelined combine requires aligned FP16/BF16 inputs and an "
+                raise ValueError("prefetch combine requires aligned FP16/BF16 inputs and an "
                                  "elements_per_thread >= 8 dividing hidden and tile_n")
+        if pipelined:
             properties = torch.cuda.get_device_properties(device)
             if properties.major < 8:
                 raise ValueError("pipelined combine requires SM80 or newer")
@@ -251,7 +334,7 @@ class FinalCombine:
         alignment = min(16, vec * self.output.element_size())
         # An empty tuple has no runtime tensor arguments and triggers a CuTe JIT
         # adapter warning. None explicitly represents absent inputs; counts stays
-        # empty, so both kernels compile out all peer reads and still write zeros.
+        # empty, so all kernels compile out all peer reads and still write zeros.
         received_args = tuple(from_dlpack(buffer, assumed_align=alignment)
                               for buffer in self.buffers) if self.buffers else None
         self.arguments = (
@@ -261,12 +344,23 @@ class FinalCombine:
         chunk_width = threads_per_cta * vec
         self.num_ctas = num_ctas or ((source_tokens * hidden + chunk_width - 1) // chunk_width)
         kernel_type = _PipelinedCombineKernel if pipelined else _CombineKernel
+        if register_prefetch:
+            kernel_type = _RegisterCombineKernel
         kernel = kernel_type(
             tuple(index.numel() for _, index in active), hidden, tile_n, self.num_ctas, vec,
             threads_per_cta, self.column_group_major,
         )
         if pipelined:
             kernel.stages = pipeline_stages
+        if register_prefetch:
+            kernel.prefetch_peers = prefetch_peers
+            # A lane group must divide a row (or a column-group row) exactly.
+            # Power-of-two groups fit inside warps, including narrow/odd row counts.
+            width = tile_n if column_group_major else hidden
+            lanes = 32
+            while (width // vec) % lanes:
+                lanes //= 2
+            kernel.lanes_per_group = lanes
         self.compiled = cute.compile(
             kernel, *self.arguments, cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
         )

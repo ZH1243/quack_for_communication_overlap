@@ -53,6 +53,8 @@ class ReturnExchange:
                 column_group_major=args.final_combine_column_group_major,
                 pipelined=args.final_combine_pipelined,
                 pipeline_stages=args.final_combine_pipeline_stages,
+                register_prefetch=args.final_combine_register_prefetch,
+                prefetch_peers=args.final_combine_prefetch_peers,
             )
             self.combined_output = self.final_combine.output
         self.down_done = torch.cuda.Event()

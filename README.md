@@ -224,9 +224,10 @@ intended for a small fixed CTA budget. It issues 128-bit `cp.async` loads into a
 shared-memory ring, keeps several peers in flight, and accumulates completed
 stages in FP32 in the same ascending peer order as the original kernel. Each
 thread owns its shared-memory slots; no CTA barriers or atomics are needed.
-Shared memory is interleaved in 16-byte lane stripes. N-tile-major inputs
-automatically use column-group-major traversal with this kernel; output is still
-row-major. The original kernel remains the default.
+Shared memory is interleaved in 16-byte lane stripes. Traversal is row-major by
+default, including for N-tile-major inputs; use `--final-combine-column-group-major`
+to opt into column traversal. This replaces the pipeline's earlier automatic
+column traversal. The original kernel remains the default.
 
 For the 4-CTA, 512-thread, 32-element configuration, append just:
 
@@ -241,14 +242,34 @@ SM80 or newer, aligned FP16/BF16 buffers, and an elements-per-thread value of at
 least 8 dividing both hidden and the input N tile width. Unsupported configurations
 or requests exceeding the device's shared-memory limit fail with an error;
 the pipeline never silently falls back to the original kernel. More stages can
-hide additional load latency but consume more shared memory. Actual speedup
-must be measured on the target GPU; this implementation was developed on a Mac
-without CUDA execution.
+hide additional load latency but consume more shared memory. In an H20 run with
+the benchmark defaults, direct row traversal took 1018 us, direct column traversal
+1246 us, and the shared-memory pipeline with column traversal about 1480 us at all
+three stage counts. That run showed a regression, not a pipeline speedup.
+
+The alternative `--final-combine-register-prefetch` uses no shared memory. It
+assigns adjacent eight-element stripes to adjacent lanes, then loads a batch of
+peers into registers before reducing them in FP32 in ascending peer order. It
+keeps the same CTA/thread counts and row-major output. Select it instead of
+`--final-combine-pipelined`:
+
+```bash
+--final-combine-register-prefetch --final-combine-prefetch-peers 2
+```
+
+`--final-combine-prefetch-peers 1` isolates the striped mapping; `2` (default) and
+`4` allow more independent peer loads at higher register cost. The compiler
+controls instruction scheduling, so this is a prefetch opportunity rather than
+an explicit asynchronous-copy pipeline. Wide vectors and deep prefetch may spill
+or exceed launch resources. Like the shared pipeline, this path requires aligned
+FP16/BF16 buffers and at least eight elements per thread dividing hidden and the
+N tile width. The register variant still needs target-GPU validation and timing.
 
 Run the focused numerical regression and standalone benchmark on Hopper:
 
 ```bash
 python -m unittest run.test_final_combine.PipelinedFinalCombineTest
+python -m unittest run.test_final_combine.RegisterFinalCombineTest
 python -m run.benchmark_final_combine \
   --source-tokens 4096 --hidden 4096 --tile-n 128 --peers 8 \
   --route-probability 0.5 --ctas 4 --elements-per-thread 32 --threads-per-cta 512
@@ -259,8 +280,9 @@ same inputs, interleaves individual launches, rotates variant order, and queues
 a GPU burner before each timed round to avoid host enqueue gaps. It reports
 median/minimum/p90 kernel time, output bandwidth, logical input-plus-output
 bandwidth, and speedup over the original row-major kernel. It also includes the
-original column-group-major kernel to separate traversal effects from pipeline
-effects. Use an otherwise idle GPU; these timings reuse resident buffers and do
+original column-group-major kernel, register depths 1 and 2, and both row and
+column traversal for every shared pipeline depth. Add `--prefetch-peers 1 2 4`
+to include register depth 4. Use an otherwise idle GPU; these timings reuse resident buffers and do
 not reproduce the cache state or contention of the full distributed run. Recheck
 the original `torchrun` command with the new flag after the standalone check.
 

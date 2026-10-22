@@ -183,7 +183,17 @@ def parse_args() -> argparse.Namespace:
         "--final-combine-pipelined", action="store_true",
         help="Use asynchronous shared-memory peer prefetch for final combine (requires "
              "--final-combine, aligned FP16/BF16 and elements/thread >= 8); "
-             "automatically uses column-group-major traversal for N-tile-major input",
+             "uses row-major traversal unless --final-combine-column-group-major is set",
+    )
+    parser.add_argument(
+        "--final-combine-register-prefetch", action="store_true",
+        help="Use striped 128-bit loads and register peer prefetch for final combine; "
+             "requires --final-combine and is mutually exclusive with --final-combine-pipelined",
+    )
+    parser.add_argument(
+        "--final-combine-prefetch-peers", type=int, choices=(1, 2, 4), default=2,
+        help="Peers loaded before reduction by --final-combine-register-prefetch (default: 2); "
+             "1 measures striped mapping alone; higher values increase register pressure",
     )
     parser.add_argument(
         "--final-combine-pipeline-stages", type=int, choices=(2, 3, 4), default=3,
@@ -222,6 +232,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_stream_args(args: argparse.Namespace) -> None:
+    if args.final_combine_register_prefetch and not args.final_combine:
+        raise ValueError("--final-combine-register-prefetch requires --final-combine")
+    if args.final_combine_register_prefetch and args.final_combine_pipelined:
+        raise ValueError("--final-combine-register-prefetch and --final-combine-pipelined "
+                         "are mutually exclusive")
     if args.final_combine_pipelined and not args.final_combine:
         raise ValueError("--final-combine-pipelined requires --final-combine")
     if args.final_combine_column_group_major and not (
@@ -1255,7 +1270,7 @@ def main() -> None:
                           f"{'column-group-major' if combine.column_group_major else 'row-major'} "
                           "assignment")
                     print("Final combine implementation: "
-                          f"{'pipelined' if combine.pipelined else 'direct'}, "
+                          f"{combine.implementation}, {combine.prefetch_peers} register peers, "
                           f"{combine.pipeline_stages} prefetch stages, "
                           f"{combine.shared_memory_bytes} shared-memory bytes/CTA")
             for _ in range(max(1, args.warmup)):

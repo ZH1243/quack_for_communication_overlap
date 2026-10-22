@@ -111,6 +111,8 @@ class FinalCombineTest(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA and CuTe DSL")
 class PipelinedFinalCombineTest(unittest.TestCase):
+    register_prefetch = False
+
     @torch.inference_mode()
     def test_reference_and_direct(self):
         from run.final_combine import FinalCombine
@@ -121,6 +123,8 @@ class PipelinedFinalCombineTest(unittest.TestCase):
             (1, 128, 0, 8, 256, 1, 2, 1),
             (19, 384, 128, 32, 512, 4, 3, 8),
             (257, 4096, 128, 32, 512, 4, 3, 8),
+            (257, 4096, 128, 32, 512, 4, 2, 8),
+            (19, 4096, 128, 32, 256, 4, 4, 8),
             (259, 384, 0, 32, 256, 3, 2, 8),
             (17, 256, 128, 8, 256, 0, 4, 2),
             (7, 128, 128, 8, 256, 129, 3, 0),
@@ -156,7 +160,10 @@ class PipelinedFinalCombineTest(unittest.TestCase):
                 pipeline = FinalCombine(
                     received, indices, tokens, hidden, tile_n, num_ctas=ctas,
                     elements_per_thread=vec, threads_per_cta=threads,
-                    pipelined=True, pipeline_stages=stages,
+                    pipelined=not self.register_prefetch, pipeline_stages=stages,
+                    register_prefetch=self.register_prefetch,
+                    prefetch_peers=stages if stages != 3 else 1,
+                    column_group_major=bool(tile_n) and tokens == 19,
                 )
                 for iteration in range(3):
                     reference = torch.zeros((tokens, hidden), device="cuda", dtype=torch.float32)
@@ -175,6 +182,12 @@ class PipelinedFinalCombineTest(unittest.TestCase):
                         actual = combine()
                         torch.cuda.synchronize()
                         torch.testing.assert_close(actual, reference.to(dtype), rtol=0, atol=0)
+
+
+class RegisterFinalCombineTest(PipelinedFinalCombineTest):
+    """Run the same numerical cases against the register-prefetch implementation."""
+
+    register_prefetch = True
 
 
 if __name__ == "__main__":
