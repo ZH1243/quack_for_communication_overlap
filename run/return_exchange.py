@@ -55,6 +55,8 @@ class ReturnExchange:
                 pipeline_stages=args.final_combine_pipeline_stages,
                 register_prefetch=args.final_combine_register_prefetch,
                 prefetch_peers=args.final_combine_prefetch_peers,
+                output_tile_n=(args.down_tile_n
+                               if args.final_combine_column_group_major_output else 0),
             )
             self.combined_output = self.final_combine.output
         self.down_done = torch.cuda.Event()
@@ -177,8 +179,10 @@ class ReturnExchange:
         self.control.gather("check_complete")
         print("Return-copy reference check: PASSED (all received physical buffers match outputs)")
         if self.final_combine is not None:
-            reference = torch.zeros_like(self.combined_output, dtype=torch.float32)
-            hidden = reference.shape[1]
+            combine = self.final_combine
+            hidden = combine.hidden
+            reference = torch.zeros((combine.source_tokens, hidden),
+                                    device=self.combined_output.device, dtype=torch.float32)
             tile_n = self.final_combine_tile_n
             for buffer, index in zip(self.received, self.source_token_indices):
                 count = index.numel()
@@ -186,6 +190,10 @@ class ReturnExchange:
                            .permute(1, 0, 2).reshape(count, hidden)
                            if tile_n else buffer.view(count, hidden))
                 reference.index_add_(0, index.to(reference.device), logical.float())
+            if combine.output_tile_n:
+                reference = (reference.view(combine.source_tokens, hidden // combine.output_tile_n,
+                                            combine.output_tile_n)
+                             .permute(1, 0, 2).reshape_as(self.combined_output))
             torch.testing.assert_close(self.combined_output, reference.to(self.combined_output.dtype),
                                        rtol=0, atol=0)
             print("Final-combine reference check: PASSED (source-token sums, including zeros)")

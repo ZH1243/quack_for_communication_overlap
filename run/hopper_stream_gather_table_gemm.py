@@ -201,6 +201,11 @@ def parse_args() -> argparse.Namespace:
              "shared bytes/CTA = stages * threads/CTA * elements/thread * 2",
     )
     parser.add_argument(
+        "--final-combine-column-group-major-output", action="store_true",
+        help="Store combined results as [hidden/down_tile_n, source_tokens*down_tile_n]; "
+             "requires --final-combine; independent of traversal and received-buffer layout",
+    )
+    parser.add_argument(
         "--final-combine-column-group-major", action="store_true",
         help="Assign final-combine work by N tile, then source token; each group has "
              "--down-tile-n columns. Requires --final-combine and --down-n-tile-major-output",
@@ -232,6 +237,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_stream_args(args: argparse.Namespace) -> None:
+    if args.final_combine_column_group_major_output and not args.final_combine:
+        raise ValueError("--final-combine-column-group-major-output requires --final-combine")
     if args.final_combine_register_prefetch and not args.final_combine:
         raise ValueError("--final-combine-register-prefetch requires --final-combine")
     if args.final_combine_register_prefetch and args.final_combine_pipelined:
@@ -1273,6 +1280,10 @@ def main() -> None:
                           f"{combine.implementation}, {combine.prefetch_peers} register peers, "
                           f"{combine.pipeline_stages} prefetch stages, "
                           f"{combine.shared_memory_bytes} shared-memory bytes/CTA")
+                    print("Final combine output: "
+                          f"{'column-group-major' if combine.output_tile_n else 'row-major'}, "
+                          f"shape={tuple(combine.output.shape)}, "
+                          f"group width={combine.output_tile_n}")
             for _ in range(max(1, args.warmup)):
                 run_stream_once(
                     proxy, launch, inputs.work_table, ready_rows, device, reset_events=reset_events

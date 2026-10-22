@@ -18,6 +18,8 @@ def main():
     parser.add_argument("--source-tokens", type=int, default=4096)
     parser.add_argument("--hidden", type=int, default=4096)
     parser.add_argument("--tile-n", type=int, default=128, help="0 for row-major input")
+    parser.add_argument("--output-tile-n", type=int, default=0,
+                        help="Output column-group width; 0 keeps row-major output (default)")
     parser.add_argument("--peers", type=int, default=8)
     parser.add_argument("--route-probability", type=float, default=0.5)
     parser.add_argument("--ctas", type=int, default=4)
@@ -34,6 +36,8 @@ def main():
         parser.error("tokens, hidden, peers, rounds and burner cycles must be positive")
     if args.tile_n < 0 or (args.tile_n and args.hidden % args.tile_n):
         parser.error("tile-n must be zero or a positive divisor of hidden")
+    if args.output_tile_n < 0 or (args.output_tile_n and args.hidden % args.output_tile_n):
+        parser.error("output-tile-n must be zero or a positive divisor of hidden")
     if not 0 <= args.route_probability <= 1:
         parser.error("route-probability must be in [0, 1]")
     from run.final_combine import FinalCombine
@@ -52,6 +56,12 @@ def main():
         received.append(logical if not args.tile_n else
                         logical.reshape(index.numel(), args.hidden // args.tile_n, args.tile_n)
                         .permute(1, 0, 2).contiguous())
+    expected = reference.to(dtype)
+    if args.output_tile_n:
+        expected = (expected.view(args.source_tokens, args.hidden // args.output_tile_n,
+                                  args.output_tile_n)
+                    .permute(1, 0, 2).contiguous()
+                    .view(args.hidden // args.output_tile_n, args.source_tokens * args.output_tile_n))
     variants = [("direct-row", {})]
     if args.tile_n:
         variants.append(("direct-column", {"column_group_major": True}))
@@ -76,13 +86,15 @@ def main():
         combine = FinalCombine(
             received, indices, args.source_tokens, args.hidden, args.tile_n,
             num_ctas=args.ctas, elements_per_thread=args.elements_per_thread,
-            threads_per_cta=args.threads_per_cta, **options,
+            threads_per_cta=args.threads_per_cta, output_tile_n=args.output_tile_n, **options,
         )
         combine.output.fill_(float("nan"))
-        torch.testing.assert_close(combine(), reference.to(dtype), rtol=0, atol=0)
+        torch.testing.assert_close(combine(), expected, rtol=0, atol=0)
         combines[name] = combine
     torch.cuda.synchronize()
     print(f"Numerical checks passed on {torch.cuda.get_device_name()}.")
+    print(f"Output layout: {'column-group-major' if args.output_tile_n else 'row-major'}, "
+          f"group width={args.output_tile_n}; variant row/col labels describe traversal.")
     deadline = time.monotonic() + args.warmup_seconds
     while time.monotonic() < deadline:
         for _ in range(10):

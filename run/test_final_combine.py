@@ -190,5 +190,83 @@ class RegisterFinalCombineTest(PipelinedFinalCombineTest):
     register_prefetch = True
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA and CuTe DSL")
+class FinalCombineOutputLayoutTest(unittest.TestCase):
+    @torch.inference_mode()
+    def test_all_kernels_and_traversals(self):
+        from run.final_combine import FinalCombine
+
+        # tokens, hidden, input tile, output tile, vector, threads, CTAs, traversal, empty
+        # Cover register stripes crossing output groups, different input/output
+        # widths, row-major input, tails, idle CTAs, and entirely absent peers.
+        cases = (
+            (257, 4096, 128, 128, 32, 512, 4, False, False),
+            (37, 512, 128, 64, 32, 256, 3, True, False),
+            (7, 512, 0, 256, 32, 256, 129, False, False),
+            (17, 512, 128, 128, 8, 256, 0, True, True),
+        )
+        for dtype, case, implementation in product(
+            (torch.float16, torch.bfloat16), cases, ("direct", "register", "pipelined"),
+        ):
+            tokens, hidden, tile_n, output_tile, vec, threads, ctas, traversal, empty = case
+            with self.subTest(dtype=dtype, case=case, implementation=implementation):
+                # Token tokens-1 is unrouted; packed rows are in reverse token order.
+                indices = tuple(torch.arange(peer % 3, tokens - 1, 1 + peer % 3).flip(0)
+                                if not empty and peer != 1 else torch.empty(0, dtype=torch.int64)
+                                for peer in range(8))
+                received = tuple(torch.empty(index.numel() * hidden, dtype=dtype, device="cuda")
+                                 for index in indices)
+                combines = [FinalCombine(
+                    received, indices, tokens, hidden, tile_n, num_ctas=ctas,
+                    elements_per_thread=vec, threads_per_cta=threads,
+                    column_group_major=traversal, pipelined=implementation == "pipelined",
+                    register_prefetch=implementation == "register", prefetch_peers=4,
+                    output_tile_n=width,
+                ) for width in (0, output_tile)]
+                for iteration in range(2):
+                    reference = torch.zeros((tokens, hidden), device="cuda", dtype=torch.float32)
+                    for peer, (buffer, index) in enumerate(zip(received, indices)):
+                        generator = torch.Generator(device="cuda").manual_seed(
+                            100 * iteration + peer
+                        )
+                        logical = torch.randn((index.numel(), hidden), dtype=dtype,
+                                              device="cuda", generator=generator)
+                        physical = (logical.reshape(index.numel(), hidden // tile_n, tile_n)
+                                    .permute(1, 0, 2).reshape(-1) if tile_n else logical.reshape(-1))
+                        buffer.copy_(physical)
+                        reference.index_add_(0, index.cuda(), logical.float())
+                    expected = reference.to(dtype)
+                    for combine in combines:
+                        combine.output.fill_(float("nan"))
+                        actual = combine()
+                        torch.cuda.synchronize()
+                        physical_expected = (expected.reshape(tokens, hidden // output_tile,
+                                                              output_tile)
+                                             .permute(1, 0, 2).contiguous().reshape_as(actual)
+                                             if combine.output_tile_n else expected)
+                        torch.testing.assert_close(actual, physical_expected, rtol=0, atol=0)
+
+    @torch.inference_mode()
+    def test_scalar_output_layout(self):
+        from run.final_combine import FinalCombine
+
+        # Six-column groups force scalar fallback from the requested vector width.
+        indices = (torch.tensor([4, 0, 2]), torch.tensor([0, 3]))
+        for dtype in (torch.bfloat16, torch.float32):
+            with self.subTest(dtype=dtype):
+                received = tuple(torch.randn((i.numel(), 264), device="cuda", dtype=dtype)
+                                 for i in indices)
+                combine = FinalCombine(received, indices, 7, 264, num_ctas=3,
+                                       elements_per_thread=8, output_tile_n=6)
+                reference = torch.zeros((7, 264), device="cuda", dtype=torch.float32)
+                for buffer, index in zip(received, indices):
+                    reference.index_add_(0, index.cuda(), buffer.float())
+                combine.output.fill_(float("nan"))
+                actual = combine()
+                expected = (reference.to(dtype).reshape(7, 44, 6)
+                            .permute(1, 0, 2).contiguous().reshape(44, 42))
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     unittest.main()

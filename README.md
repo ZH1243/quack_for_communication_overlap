@@ -217,7 +217,42 @@ GEMM's swizzle size. The default assignment remains row-major. For example, with
 `--hidden 4096 --down-tile-n 128 --final-combine-elements-per-thread 32
 --final-combine-threads-per-cta 512`, a CTA iteration processes 128 tokens × 128
 columns instead of four complete token rows. The output remains contiguous
-`[source_tokens, hidden]`; CTAs do not synchronize at group boundaries.
+`[source_tokens, hidden]` by default; CTAs do not synchronize at group boundaries.
+
+Add `--final-combine-column-group-major-output` to change the **physical result
+layout**, independently of `--final-combine-column-group-major` traversal. All
+three implementations (direct, register prefetch, shared pipeline) support this.
+The output group width is `--down-tile-n`; `ReturnExchange.combined_output` is then
+a contiguous tensor shaped `[hidden / down_tile_n, source_tokens * down_tile_n]`,
+logically `[column group, source token, column within group]`. The kernel writes
+this order directly, with no extra transpose launch. The flat element offset is:
+
+```text
+((column // group_width) * source_tokens + token) * group_width + column % group_width
+```
+
+For column traversal, four-peer register prefetch, and column-group-major output,
+append these flags to the distributed command:
+
+```bash
+--final-combine-register-prefetch --final-combine-prefetch-peers 4 \
+--final-combine-column-group-major --final-combine-column-group-major-output
+```
+
+The output flag also works with row traversal and row-major received buffers.
+Consumers must use the selected physical layout. To reconstruct a logical
+row-major tensor outside the timed kernel (this can allocate and copy):
+
+```python
+logical = combined_output.view(hidden // group_width, source_tokens, group_width) \
+                         .permute(1, 0, 2).reshape(source_tokens, hidden)
+```
+
+The Python API selects this with `FinalCombine(..., output_tile_n=128)` (`0`
+keeps row-major output). Input and output group widths may differ. Vector width
+must divide the output group width as well as the input group width: the direct
+kernel falls back to scalar copies if needed; prefetch kernels reject unsupported
+widths. The integration reference check validates the selected physical layout.
 
 Add `--final-combine-pipelined` to opt into an asynchronous peer-prefetch kernel,
 intended for a small fixed CTA budget. It issues 128-bit `cp.async` loads into a
@@ -270,6 +305,7 @@ Run the focused numerical regression and standalone benchmark on Hopper:
 ```bash
 python -m unittest run.test_final_combine.PipelinedFinalCombineTest
 python -m unittest run.test_final_combine.RegisterFinalCombineTest
+python -m unittest run.test_final_combine.FinalCombineOutputLayoutTest
 python -m run.benchmark_final_combine \
   --source-tokens 4096 --hidden 4096 --tile-n 128 --peers 8 \
   --route-probability 0.5 --ctas 4 --elements-per-thread 32 --threads-per-cta 512
@@ -285,6 +321,15 @@ register prefetch depth and shared pipeline depth. Register depths default to 1
 and 2; add `--prefetch-peers 1 2 4` to include depth 4. `register-row-N` is the
 previous `register-N` variant; `register-col-N` combines register prefetch with
 column-group-major traversal. Column variants require a nonzero `--tile-n`.
+Use `--output-tile-n 128` to benchmark column-group-major output for every variant;
+the default `--output-tile-n 0` keeps row-major output. The `row`/`col` labels still
+describe traversal, and the benchmark logs the output layout separately. For example:
+
+```bash
+python -m run.benchmark_final_combine --prefetch-peers 1 2 4 --stages 2 --ctas 4 \
+  --output-tile-n 128
+```
+
 Use an otherwise idle GPU; these timings reuse resident buffers and do
 not reproduce the cache state or contention of the full distributed run. Recheck
 the original `torchrun` command with the new flag after the standalone check.

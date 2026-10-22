@@ -13,7 +13,7 @@ import torch
 
 class _CombineKernel:
     def __init__(self, counts, hidden, tile_n, num_ctas, elements_per_thread, threads_per_cta,
-                 column_group_major):
+                 column_group_major, output_tile_n):
         self.counts = counts
         self.hidden = hidden
         self.tile_n = tile_n
@@ -21,6 +21,7 @@ class _CombineKernel:
         self.elements_per_thread = elements_per_thread
         self.threads_per_cta = threads_per_cta
         self.column_group_major = column_group_major
+        self.output_tile_n = output_tile_n
 
     @cute.jit
     def __call__(self, received: Optional[tuple], rows: cute.Tensor, output: cute.Tensor,
@@ -36,7 +37,7 @@ class _CombineKernel:
         block, _, _ = cute.arch.block_idx()
         vec = self.elements_per_thread
         vectors_per_token = self.hidden // vec
-        total_vectors = output.shape[0] * vectors_per_token
+        total_vectors = rows.shape[1] * vectors_per_token
         num_chunks = cute.ceil_div(total_vectors, self.threads_per_cta)
         copy_atom = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(), output.element_type,
@@ -53,7 +54,7 @@ class _CombineKernel:
                 if cutlass.const_expr(self.column_group_major):
                     # Visit every source token within one N tile before the next tile.
                     vectors_per_group_row = self.tile_n // vec
-                    vectors_per_group = output.shape[0] * vectors_per_group_row
+                    vectors_per_group = rows.shape[1] * vectors_per_group_row
                     group = vector // vectors_per_group
                     within_group = vector % vectors_per_group
                     token = within_group // vectors_per_group_row
@@ -75,8 +76,12 @@ class _CombineKernel:
                         cute.copy(copy_atom, source, values)
                         total.store(total.load() + values.load().to(cutlass.Float32))
                 values.store(total.load().to(output.element_type))
+                output_offset = token * self.hidden + column
+                if cutlass.const_expr(self.output_tile_n > 0):
+                    output_offset = ((column // self.output_tile_n * rows.shape[1] + token)
+                                     * self.output_tile_n + column % self.output_tile_n)
                 destination = cute.make_tensor(
-                    output.iterator + cute.assume(token * self.hidden + column, divby=vec),
+                    output.iterator + cute.assume(output_offset, divby=vec),
                     cute.make_layout((vec,)),
                 )
                 cute.copy(copy_atom, values, destination)
@@ -96,7 +101,7 @@ class _RegisterCombineKernel(_CombineKernel):
         block, _, _ = cute.arch.block_idx()
         vec = self.elements_per_thread
         lanes = self.lanes_per_group
-        total_vectors = output.shape[0] * (self.hidden // vec)
+        total_vectors = rows.shape[1] * (self.hidden // vec)
         num_chunks = cute.ceil_div(total_vectors, self.threads_per_cta)
         peer_count = len(self.counts)
         depth = self.prefetch_peers
@@ -115,7 +120,7 @@ class _RegisterCombineKernel(_CombineKernel):
                 column = group % (self.hidden // (lanes * vec)) * (lanes * vec)
                 if cutlass.const_expr(self.column_group_major):
                     groups_per_tile_row = self.tile_n // (lanes * vec)
-                    groups_per_tile = output.shape[0] * groups_per_tile_row
+                    groups_per_tile = rows.shape[1] * groups_per_tile_row
                     tile = group // groups_per_tile
                     within_tile = group % groups_per_tile
                     token = within_tile // groups_per_tile_row
@@ -146,11 +151,24 @@ class _RegisterCombineKernel(_CombineKernel):
                             total.store(total.load()
                                         + staged[None, None, slot].load().to(cutlass.Float32))
                 values.store(total.load().to(output.element_type))
-                destination = cute.make_tensor(
-                    output.iterator + cute.assume(token * self.hidden + column, divby=8),
-                    cute.make_layout((8, vec // 8), stride=(1, lanes * 8)),
-                )
-                cute.copy(copy_atom, values, destination)
+                if cutlass.const_expr(self.output_tile_n > 0):
+                    # Row traversal may stripe a thread's values across several
+                    # output groups. Address each 128-bit stripe independently.
+                    for stripe in cutlass.range_constexpr(vec // 8):
+                        col = column + stripe * lanes * 8
+                        output_offset = ((col // self.output_tile_n * rows.shape[1] + token)
+                                         * self.output_tile_n + col % self.output_tile_n)
+                        destination = cute.make_tensor(
+                            output.iterator + cute.assume(output_offset, divby=8),
+                            cute.make_layout((8,)),
+                        )
+                        cute.copy(copy_atom, values[None, stripe], destination)
+                else:
+                    destination = cute.make_tensor(
+                        output.iterator + cute.assume(token * self.hidden + column, divby=8),
+                        cute.make_layout((8, vec // 8), stride=(1, lanes * 8)),
+                    )
+                    cute.copy(copy_atom, values, destination)
 
 
 class _PipelinedCombineKernel(_CombineKernel):
@@ -185,7 +203,7 @@ class _PipelinedCombineKernel(_CombineKernel):
         block, _, _ = cute.arch.block_idx()
         vec = self.elements_per_thread
         vectors_per_token = self.hidden // vec
-        total_vectors = output.shape[0] * vectors_per_token
+        total_vectors = rows.shape[1] * vectors_per_token
         num_chunks = cute.ceil_div(total_vectors, self.threads_per_cta)
         peer_count = len(self.counts)
         stages = self.stages
@@ -213,7 +231,7 @@ class _PipelinedCombineKernel(_CombineKernel):
                 column = vector % vectors_per_token * vec
                 if cutlass.const_expr(self.column_group_major):
                     vectors_per_group_row = self.tile_n // vec
-                    vectors_per_group = output.shape[0] * vectors_per_group_row
+                    vectors_per_group = rows.shape[1] * vectors_per_group_row
                     group = vector // vectors_per_group
                     within_group = vector % vectors_per_group
                     token = within_group // vectors_per_group_row
@@ -236,8 +254,12 @@ class _PipelinedCombineKernel(_CombineKernel):
                                       shared[None, thread, None, peer % stages],
                                       load_atom, peer + stages)
                 values.store(total.load().to(output.element_type))
+                output_offset = token * self.hidden + column
+                if cutlass.const_expr(self.output_tile_n > 0):
+                    output_offset = ((column // self.output_tile_n * rows.shape[1] + token)
+                                     * self.output_tile_n + column % self.output_tile_n)
                 destination = cute.make_tensor(
-                    output.iterator + cute.assume(token * self.hidden + column, divby=8),
+                    output.iterator + cute.assume(output_offset, divby=8),
                     cute.make_layout((8, vec // 8)),
                 )
                 cute.copy(copy_atom, values, destination)
@@ -255,7 +277,10 @@ class FinalCombine:
     A positive value launches exactly that many CTAs, using a grid-stride loop.
     column_group_major=True traverses [N tile, source token, vector within tile]
     instead of [source token, vector within row]; requires tile_n > 0.
-    Output stays row-major. There is no global barrier between column groups.
+    Output defaults to row-major. output_tile_n > 0 independently selects physical
+    [hidden // output_tile_n, source_tokens * output_tile_n] storage, logically
+    [column group, source token, column within group]. There is no extra transpose
+    kernel and no global barrier between column groups.
     Aligned FP16/BF16 inputs use vector copies and independent FP32 accumulators.
     Unsupported alignment, row widths, tile widths, or dtypes use one element per thread.
     pipelined=True opts into asynchronous peer prefetch (SM80+, aligned FP16/BF16,
@@ -269,7 +294,8 @@ class FinalCombine:
     @torch.inference_mode()
     def __init__(self, received, indices, source_tokens, hidden, tile_n=0, num_ctas=0,
                  elements_per_thread=8, threads_per_cta=256, column_group_major=False,
-                 pipelined=False, pipeline_stages=3, register_prefetch=False, prefetch_peers=2):
+                 pipelined=False, pipeline_stages=3, register_prefetch=False, prefetch_peers=2,
+                 output_tile_n=0):
         if num_ctas < 0:
             raise ValueError("num_ctas must be nonnegative")
         if elements_per_thread not in (1, 4, 8, 16, 32, 64, 128):
@@ -285,9 +311,14 @@ class FinalCombine:
         self.threads_per_cta = threads_per_cta
         if tile_n < 0 or (tile_n and hidden % tile_n):
             raise ValueError("hidden must be divisible by the N tile width")
+        if output_tile_n < 0 or (output_tile_n and hidden % output_tile_n):
+            raise ValueError("output_tile_n must be zero or a positive divisor of hidden")
         if column_group_major and not tile_n:
             raise ValueError("column_group_major requires N-tile-major input (tile_n > 0)")
         self.column_group_major = column_group_major
+        self.output_tile_n = output_tile_n
+        self.source_tokens = source_tokens
+        self.hidden = hidden
         self.pipelined = pipelined
         self.register_prefetch = register_prefetch
         self.prefetch_peers = prefetch_peers if register_prefetch else 0
@@ -298,7 +329,9 @@ class FinalCombine:
         self.shared_memory_bytes = 0
         device, dtype = received[0].device, received[0].dtype
         active = [(buffer, index) for buffer, index in zip(received, indices) if index.numel()]
-        self.output = torch.empty((source_tokens, hidden), device=device, dtype=dtype)
+        output_shape = ((hidden // output_tile_n, source_tokens * output_tile_n)
+                        if output_tile_n else (source_tokens, hidden))
+        self.output = torch.empty(output_shape, device=device, dtype=dtype)
         inverse = torch.full((len(active), source_tokens), -1, dtype=torch.int32)
         for peer, (buffer, index) in enumerate(active):
             if not buffer.is_contiguous() or buffer.numel() != index.numel() * hidden:
@@ -312,6 +345,7 @@ class FinalCombine:
         vec = elements_per_thread
         if (dtype not in (torch.float16, torch.bfloat16) or hidden % vec
                 or (tile_n and tile_n % vec)
+                or (output_tile_n and output_tile_n % vec)
                 or any(buffer.data_ptr() % min(16, vec * buffer.element_size())
                        for buffer in self.buffers)):
             vec = 1
@@ -319,7 +353,7 @@ class FinalCombine:
         if pipelined or register_prefetch:
             if vec < 8:
                 raise ValueError("prefetch combine requires aligned FP16/BF16 inputs and an "
-                                 "elements_per_thread >= 8 dividing hidden and tile_n")
+                                 "elements_per_thread >= 8 dividing hidden and input/output tiles")
         if pipelined:
             properties = torch.cuda.get_device_properties(device)
             if properties.major < 8:
@@ -348,7 +382,7 @@ class FinalCombine:
             kernel_type = _RegisterCombineKernel
         kernel = kernel_type(
             tuple(index.numel() for _, index in active), hidden, tile_n, self.num_ctas, vec,
-            threads_per_cta, self.column_group_major,
+            threads_per_cta, self.column_group_major, output_tile_n,
         )
         if pipelined:
             kernel.stages = pipeline_stages
