@@ -638,9 +638,12 @@ class GemmSm100(GemmTmaBase):
                 epi_m, epi_n = (cute.size(t) for t in self.epi_tile)
                 # Bulk copies need ordinary contiguous rows; retain every subtile until store.
                 assert tile_m % epi_m == 0 and tile_n % epi_n == 0
-                self.epi_smem_layout_staged = cute.make_layout(
-                    (epi_m, epi_n, (tile_m // epi_m, tile_n // epi_n)),
-                    stride=(tile_n, 1, (epi_m * tile_n, epi_n)),
+                # Keep the tiler's strides: with 2-CTA M=64, one subtile
+                # covers two separated N ranges (e.g. 0:32 and 64:96).
+                # Using only epi_n would swap the middle column ranges.
+                d_tile = cute.make_layout((tile_m, tile_n), stride=(tile_n, 1))
+                self.epi_smem_layout_staged = cute.group_modes(
+                    cute.flat_divide(d_tile, self.epi_tile), 2, 4
                 )
         self.scatter_rows = getattr(epilogue_args, "mScatter", None) is not None
         self.scatter_addresses = (
@@ -3084,7 +3087,10 @@ class GemmSm100(GemmTmaBase):
         )
         epi_bytes_per_stage = d_bytes_per_stage + epi_smem_bytes.d_stage
         if const_expr(full_tile_store):
-            epi_stage = (cta_tile_shape_mnk[0] * cta_tile_shape_mnk[1]) // cute.size(epi_tile)
+            # SM100 epi_tile contains Layout modes, not just integer extents.
+            epi_stage = (cta_tile_shape_mnk[0] * cta_tile_shape_mnk[1]) // cute.size(
+                cute.shape(epi_tile)
+            )
         epi_bytes = epi_smem_bytes.unstaged + epi_bytes_per_stage * epi_stage
         if const_expr(c_dtype is not None):
             c_bytes_per_stage = cute.size_in_bytes(c_dtype, c_smem_layout_staged_one)
