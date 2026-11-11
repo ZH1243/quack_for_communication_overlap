@@ -381,6 +381,51 @@ the activation API does not expose that limit. Use `--baseline-only` to measure 
 existing indexed-gather path separately; compare identical configurations, data, and
 node conditions across revisions to check for regressions in ordinary GEMM.
 
+**Blackwell bulk-row output slowdown and mitigations.** The communication output
+path initially incurred a large throughput drop on B300. For BF16 R=32768 routes
+across 8 experts (M=4096 per expert), K=7168, N=2048, MMA tile=(256,512), cluster
+M=2, one run measured 611.36 us for single-table gather with TMA output and
+849.68 us for `bulk_rows`: about 39% more latency, or 28% less GEMM TFLOPS.
+The large jump was already present in the plain bulk-copy path. Reduction and
+scatter added comparatively small costs for this workload and destination mapping.
+
+`bulk_rows` and `bulk_rows_reduce` share the output staging, row addressing,
+copy-issuance scheduling and completion protocol. The latter adds values into the
+destination instead of overwriting it. In the benchmark, `bulk rows` and
+`row scatter` use `epilogue_store="bulk_rows"`; `reduce unique` and `scatter add`
+use `epilogue_store="bulk_rows_reduce"`. `reduce unique` has one-to-one destinations,
+while `scatter add` maps multiple logical output rows to each destination row.
+The multi-destination, compact, wave and ready-prefix variants also use
+`bulk_rows_reduce`. Comparing `single table` with plain `bulk rows` isolated the
+shared bulk-output cost before validating the improvements on reduction paths.
+
+The investigation combined matched numerical benchmarks, compiled layout/stage
+traces and Nsight Compute profiles. Full-tile bulk output consumed about 128 KiB
+of shared memory per CTA, versus 32 KiB for the TMA subtile ring, reducing A/B
+pipeline depth from four stages to two. A smaller output window restored four
+stages but left substantial overhead. Subsequent profiles showed the same 168
+registers/thread and one resident CTA/SM for both paths, plus 4.7% more shared-store
+wavefronts for bulk output. These aggregate counters guided the experiments;
+they did not establish that bank conflicts or reduction alone caused the whole gap.
+
+| Approach tested | Purpose | Measured outcome for this workload |
+| --- | --- | --- |
+| Reduce tile N from 512 to 256 | Reduce full-tile output storage and lost A/B stages. | The relative bulk penalty narrowed to roughly 9-10%, but the smaller tile also lowered TMA baseline throughput. We continued tuning tile N=512. |
+| Pad shared-memory rows by 16 bytes | Spread row starts across banks while preserving aligned bulk-copy sources and A/B stage count. | Full-tile bulk latency changed from 880.86 to 851.12 us in the padding comparison; two A/B stages remained. |
+| Keep one 128-column output window | Reuse a smaller output allocation while storing rows in segments. | Padded D storage fell from 133,104 to 34,800 bytes, A/B stages returned from two to four, and same-run TMA-relative overhead fell from 30.94% to 21.08%. |
+| Split that budget into two 64-column buffers | Overlap one buffer's async reads with filling the other. | Regressed: overhead increased from 21.25% to 47.75%. Row-copy requests doubled and barrier phases increased. Keep one buffer for this workload. |
+| Issue row copies from four existing epilogue warps | Distribute the same copies without changing window width, shared layout or A/B stages. | Bulk latency changed from 803.90 to 732.53 us; same-run TMA-relative overhead fell from 21.76% to 3.89%. |
+
+Each row summarizes a separate matched experiment, not one measurement under
+identical clocks. Percent overheads above describe latency, not TFLOPS loss.
+The best measured settings for this shape are `--bulk-smem-padding 16
+--bulk-smem-cols 128 --bulk-smem-buffers 1 --bulk-store-warps 4`. The subsequent
+13-variant run passed numerical checks and measured 4.10% bulk-output overhead
+versus single-table TMA, and 7.74% total latency overhead for the host-ready path
+versus packed GEMM (about 92.8% of baseline TFLOPS). Full results, reproduction
+commands and validation limits follow. These are explicit benchmark overrides;
+library defaults have not been changed based on this one workload.
+
 To investigate an epilogue bottleneck, select only the matched TMA and bulk-store
 paths and print their actual compiled stages, shared-memory layout sizes, TMEM
 allocation, and register-to-shared copy layouts:
@@ -540,8 +585,8 @@ runs had different control timings and up to 6.7% within-run baseline drift, so
 the exact gain needs repeated measurements. Four issuing warps are the leading
 candidate for this shape; the feature benchmark below also passed. Broader
 numerical regression coverage and other shapes remain necessary before changing
-defaults. The TMA store path is
-unaffected. Register-allocation changes are still possible in bulk specializations.
+defaults. The TMA store path is unaffected. Register-allocation changes are still
+possible in bulk specializations.
 
 Scatter indices use the same row assignment. All issuing lanes drain their own
 async groups before SMEM reuse and kernel exit. With wave publication, an
