@@ -11,6 +11,12 @@ Usage:
     # Custom size
     python benchmarks/benchmark_gemm_autotuned.py --M 8192 --N 8192 --K 4096
 
+    # Pinned B300 BF16 config, numerical check and repeated timing windows
+    python benchmarks/benchmark_gemm_autotuned.py --only-gemm \
+        --config-tile-m 256 --config-tile-n 512 --config-cluster-m 2 \
+        --no-config-pingpong --config-swap-ab --config-dynamic-persistent \
+        --warmup-ms 1000 --repeats 1000 --rounds 5 --seed 0
+
     # Control worker count
     QUACK_COMPILE_WORKERS=8 python benchmarks/benchmark_gemm_autotuned.py
 
@@ -26,6 +32,7 @@ import argparse
 import math
 import os
 import shutil
+import statistics
 import time
 
 import torch
@@ -63,7 +70,9 @@ def tflops(flops, ms):
     return flops / (ms * 1e9)
 
 
-def benchmark_gemm(m, n, k, dtype=torch.bfloat16, repeats=30, config=None):
+def benchmark_gemm(
+    m, n, k, dtype=torch.bfloat16, repeats=30, config=None, warmup_ms=5, rounds=1
+):
     """Benchmark plain GEMM: out = A @ B"""
     a = torch.randn(m, k, device="cuda", dtype=dtype)
     # gemm() expects B as (K, N)
@@ -76,17 +85,41 @@ def benchmark_gemm(m, n, k, dtype=torch.bfloat16, repeats=30, config=None):
     else:
         out = torch.empty(m, n, device="cuda", dtype=dtype)
         fn = lambda: gemm_tuned.fn(a, b, out, config=config)
-    fn()  # warmup / autotune
-    time.sleep(0.5)
-    ms = do_bench(fn, warmup=5, rep=repeats)
+    result = fn()  # compile / autotune before checking or timing
+    actual = result if config is None else out
+    reference = a.float() @ b.float()
+    baseline = a @ b
+    baseline_error = (baseline.float() - reference).abs().max().item()
+    torch.testing.assert_close(
+        actual.float(), reference, atol=max(1e-3, 2 * baseline_error), rtol=1e-2
+    )
+    print("  Ref check PASSED")
+    del result, actual, reference, baseline
+    w = b.T.contiguous()  # (N, K) for F.linear
+    functions = {"quack": fn, "cuBLAS": lambda: F.linear(a, w)}
+    timings = {name: [] for name in functions}
+    for round_idx in range(rounds):
+        # Alternate timing-window order to expose drift. These are separate
+        # do_bench windows, not single-launch interleaving on shared GPUs.
+        order = ("quack", "cuBLAS") if round_idx % 2 == 0 else ("cuBLAS", "quack")
+        for name in order:
+            timings[name].append(do_bench(functions[name], warmup=warmup_ms, rep=repeats))
+        if rounds > 1:
+            print(
+                f"  round {round_idx + 1}/{rounds}: "
+                f"quack {timings['quack'][-1]:.3f}ms "
+                f"({tflops(nflops, timings['quack'][-1]):.1f} TFLOPS), "
+                f"cuBLAS {timings['cuBLAS'][-1]:.3f}ms "
+                f"({tflops(nflops, timings['cuBLAS'][-1]):.1f} TFLOPS)"
+            )
+    ms = statistics.median(timings["quack"])
+    ms_pt = statistics.median(timings["cuBLAS"])
     tf = tflops(nflops, ms)
     gbps = nbytes / (ms * 1e6)
-
-    w = b.T.contiguous()  # (N, K) for F.linear
-    time.sleep(0.5)
-    ms_pt = do_bench(lambda: F.linear(a, w), warmup=5, rep=repeats)
     tf_pt = tflops(nflops, ms_pt)
 
+    if rounds > 1:
+        print("  Median latency across rounds:")
     print(f"  quack: {ms:.3f}ms  {tf:.1f} TFLOPS  {gbps:.0f} GB/s")
     print(f"  cuBLAS: {ms_pt:.3f}ms  {tf_pt:.1f} TFLOPS")
     print(f"  speedup: {ms_pt / ms:.2f}x")
@@ -252,7 +285,7 @@ def forced_config_from_args(args):
         cluster_n=args.config_cluster_n,
         pingpong=args.config_pingpong,
         swap_ab=args.config_swap_ab,
-        is_dynamic_persistent=False,
+        is_dynamic_persistent=args.config_dynamic_persistent,
         device_capacity=torch.cuda.get_device_capability()[0],
     )
 
@@ -263,7 +296,11 @@ def main():
     parser.add_argument("--N", type=int, default=8192)
     parser.add_argument("--K", type=int, default=8192)
     parser.add_argument("--dtype", choices=["float16", "bfloat16"], default="bfloat16")
-    parser.add_argument("--repeats", type=int, default=30)
+    parser.add_argument("--repeats", type=int, default=30, help="Timing budget in milliseconds")
+    parser.add_argument("--warmup-ms", type=int, default=5, help="Plain GEMM warmup per window")
+    parser.add_argument("--rounds", type=int, default=1, help="Plain GEMM timing rounds")
+    parser.add_argument("--seed", type=int, default=0, help="Random input seed")
+    parser.add_argument("--only-gemm", action="store_true", help="Only benchmark plain GEMM")
     parser.add_argument("--dim", type=int, default=4096, help="Model dim for transformer shapes")
     parser.add_argument("--batch", type=int, default=8192, help="Batch size for transformer shapes")
     parser.add_argument(
@@ -301,8 +338,16 @@ def main():
     parser.add_argument("--config-cluster-n", type=int, default=1)
     parser.add_argument("--config-pingpong", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--config-swap-ab", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--config-dynamic-persistent", action=argparse.BooleanOptionalAction, default=False
+    )
     parser.add_argument("--cold", action="store_true", help="Clear .so and autotuning caches first")
     args = parser.parse_args()
+    if args.rounds < 1 or args.repeats <= 0 or args.warmup_ms < 0:
+        parser.error("rounds/repeats must be positive and warmup-ms must be nonnegative")
+    if sum((args.only_gemm, args.only_gated, args.only_dgated)) > 1:
+        parser.error("--only-gemm, --only-gated and --only-dgated are mutually exclusive")
+    torch.manual_seed(args.seed)
 
     if args.cold:
         clear_caches()
@@ -329,9 +374,6 @@ def main():
     )
     forced_config = forced_config_from_args(args)
     ffn = int(args.dim * 3.5)  # Llama-3 ratio
-
-    if args.only_gated and args.only_dgated:
-        raise ValueError("--only-gated and --only-dgated are mutually exclusive")
 
     if args.only_gated:
         print(
@@ -389,7 +431,12 @@ def main():
     print("=" * 60)
     print(f"GEMM: ({M}, {K}) x ({K}, {N})")
     print("=" * 60)
-    benchmark_gemm(M, N, K, dtype, repeats=args.repeats, config=forced_config)
+    benchmark_gemm(
+        M, N, K, dtype, repeats=args.repeats, config=forced_config,
+        warmup_ms=args.warmup_ms, rounds=args.rounds,
+    )
+    if args.only_gemm:
+        return
     print()
 
     # --- 2. GEMM + activation ---
@@ -426,7 +473,10 @@ def main():
     ]
     for label, m, n, k in gemm_shapes:
         print(f"\n  {label}: ({m}, {k}) x ({k}, {n})")
-        benchmark_gemm(m, n, k, dtype, repeats=args.repeats, config=forced_config)
+        benchmark_gemm(
+            m, n, k, dtype, repeats=args.repeats, config=forced_config,
+            warmup_ms=args.warmup_ms, rounds=args.rounds,
+        )
 
     # FFN up: fused GEMM + gated activation — B is (K, 2*ffn), output is (M, ffn)
     for activation in gated_activations:
