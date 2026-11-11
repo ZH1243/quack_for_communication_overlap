@@ -2106,11 +2106,13 @@ class GemmSm100(GemmTmaBase):
                             scatter_rows,
                         )
                     else:
+                        # SM100's tiler contains CuTe layouts. Use the kernel
+                        # argument, not the host-region SSA values in self.epi_tile.
                         copy_D, _, _ = self.epilog_gmem_copy_and_partition(
                             tma_atom_d,
                             d_tensor,
                             self.cta_tile_shape_mnk[:2],
-                            self.epi_tile,
+                            epi_tile,
                             sD,
                             d_tile_coord,
                         )
