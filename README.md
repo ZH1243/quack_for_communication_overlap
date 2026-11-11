@@ -381,6 +381,49 @@ the activation API does not expose that limit. Use `--baseline-only` to measure 
 existing indexed-gather path separately; compare identical configurations, data, and
 node conditions across revisions to check for regressions in ordinary GEMM.
 
+To investigate an epilogue bottleneck, select only the matched TMA and bulk-store
+paths and print their actual compiled stages, shared-memory layout sizes, TMEM
+allocation, and register-to-shared copy layouts:
+
+```bash
+QUACK_CACHE_ENABLED=0 CUDA_VISIBLE_DEVICES=0 \
+python run/blackwell_gemm_communication_bench.py \
+  --k 7168 --n 2048 --buffers 16 --tile-m 256 --tile-n 256 --cluster-m 2 \
+  --stores --variants "single table" "bulk rows" --print-kernel-config
+```
+
+Repeat with `--tile-n 512` to inspect that configuration. The first selected variant
+becomes the baseline; later variants must include their named controls in the
+selection. All selected outputs are still checked. The tracing hooks run only during
+compilation and are restored afterwards; they do not insert device instrumentation.
+Disabling the QuACK object cache is required so compilation actually runs the hooks.
+Layout byte counts exclude barriers, auxiliary outputs and allocation padding.
+
+For hardware profiling, `--profile-variant` checks and warms one enabled variant,
+then performs one eager call in the `quack_profile` NVTX push/pop range. It checks the
+output again after the profiled call. For example, on the B300 node with Nsight Compute:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 ncu --nvtx --nvtx-include "quack_profile/" \
+  --clock-control none \
+  --section LaunchStats --section SpeedOfLight \
+  --section MemoryWorkloadAnalysis_Tables --section WarpStateStats \
+  -o run/blackwell_bulk_n256 \
+  python run/blackwell_gemm_communication_bench.py \
+  --k 7168 --n 2048 --buffers 16 --tile-m 256 --tile-n 256 --cluster-m 2 \
+  --stores --profile-variant "bulk rows"
+```
+
+Collect the matched TMA control by changing `--profile-variant` to `"single table"`
+and the report name to `run/blackwell_tma_n256`. Examine shared-memory bank conflicts,
+wavefronts, tensor utilization and warp stalls. The NVTX trailing slash is required
+for push/pop ranges ([Nsight Compute CLI](https://docs.nvidia.com/nsight-compute/NsightComputeCli/index.html#nvtx-filtering));
+the shared-memory counters are in
+[Memory Workload Analysis Tables](https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#shared-memory).
+Use the graph benchmark for throughput comparisons: profiler replay and cache handling
+change the execution conditions. The mandatory counter reset is part of wave calls;
+profiling a wave variant can therefore include more than one kernel in the range.
+
 For proxy integration, use `device_capacity=10`, static persistence, `use_tma_gather=False`,
 and `pingpong=False`. The ready/table/scatter ABIs are the same as Hopper's. **MMA tile M
 and per-CTA M differ on Blackwell:** `tile_m=128, cluster_m=2` processes 64 rows per CTA

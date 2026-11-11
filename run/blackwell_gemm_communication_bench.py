@@ -13,7 +13,9 @@ from quack.gemm import build_scatter_row_addresses, gemm
 from quack.gemm_config import GemmConfig, cta_tile_shape_m
 from quack.gemm_interface import gemm_act
 
-from blackwell_bench_utils import Variant, mapped_host_flag, measure
+from blackwell_bench_utils import (
+    Variant, kernel_config_trace, mapped_host_flag, measure, profile_variant, select_variants,
+)
 from blackwell_gemm_tables import make_table
 from wave_ready import build_wave_ready_prefix
 
@@ -47,6 +49,13 @@ def parse_args():
     parser.add_argument("--swiglu", action="store_true",
                         help="compare indexed/table fused SwiGLU with store_preact=False")
     parser.add_argument("--baseline-only", action="store_true")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--variants", nargs="+", metavar="NAME",
+                           help="time only these enabled variants; first becomes the baseline")
+    selection.add_argument("--profile-variant", metavar="NAME",
+                           help="check/warm one enabled variant, then launch in NVTX quack_profile")
+    parser.add_argument("--print-kernel-config", action="store_true",
+                        help="print compiled stages/layouts; requires QUACK_CACHE_ENABLED=0")
     parser.add_argument("--rounds", type=int, default=9)
     parser.add_argument("--repetitions", type=int, default=16)
     parser.add_argument("--warmup", type=int, default=100, help="full graph replays")
@@ -300,6 +309,14 @@ def benchmark(args, resources):
         print(f"SwiGLU: projection N={args.n}, output width={args.n // 2}, no preact store. "
               "TFLOPS counts GEMM operations only; the timed path includes activation.", flush=True)
 
+    if args.profile_variant is not None:
+        selected = select_variants(variants, [args.profile_variant])
+        profile_variant(
+            selected[args.profile_variant], name=args.profile_variant, warmup=args.warmup
+        )
+        return
+    if args.variants is not None:
+        variants = select_variants(variants, args.variants)
     measure(variants, flops=2 * r * args.n * args.k, rounds=args.rounds,
             repetitions=args.repetitions, warmup=args.warmup)
     print("Packing, metadata construction, and destination zeroing excluded; "
@@ -309,6 +326,8 @@ def benchmark(args, resources):
 def main():
     args = parse_args()
     with ExitStack() as resources:
+        if args.print_kernel_config:
+            resources.enter_context(kernel_config_trace())
         benchmark(args, resources)
 
 
