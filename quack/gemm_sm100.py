@@ -333,6 +333,9 @@ class GemmSm100(GemmTmaBase):
         # For gather_A: separate A-index prefetch warp (was the empty warp)
         self.a_prefetch_warp_id = self.scheduler_warp_id + 1 if self.gather_A else None
         self.num_epi_warps = len(self.epilog_warp_id)
+        if self.bulk_row_store:
+            assert self.bulk_store_num_warps in (1, 2, 4)
+            assert self.bulk_store_num_warps <= self.num_epi_warps
         self.epilogue_barrier = pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierGemm.Epilogue),
             num_threads=self.num_epi_warps * cute.arch.WARP_SIZE,
@@ -2045,6 +2048,9 @@ class GemmSm100(GemmTmaBase):
             tmem.wait_for_alloc()
 
             is_tma_warp = Boolean(warp_idx == self.epilog_warp_id[0])
+            is_bulk_store_warp = is_tma_warp
+            if const_expr(self.bulk_row_store and self.bulk_store_num_warps > 1):
+                is_bulk_store_warp = warp_idx < self.bulk_store_num_warps
 
             # Retrieving tensor memory ptr and make accumulator tensor
             acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
@@ -2137,11 +2143,11 @@ class GemmSm100(GemmTmaBase):
                         d_tile_coord = tile_coord_mnkl
                     scatter_rows = None
                     if const_expr(self.scatter_rows):
-                        # Load consecutive mapping entries across the store warp
-                        # before R2S staging. Keep only ceil(tile_m / 32) entries
-                        # per lane in registers; no extra SMEM or barrier needed.
+                        # Distribute mapping entries exactly as the row-copy
+                        # workers. Each keeps only its own rows in registers.
                         tile_m = const_expr(self.cta_tile_shape_mnk[0])
-                        rows_per_lane = const_expr(cute.ceil_div(tile_m, cute.arch.WARP_SIZE))
+                        store_threads = const_expr(self.bulk_store_num_warps * cute.arch.WARP_SIZE)
+                        rows_per_lane = const_expr(cute.ceil_div(tile_m, store_threads))
                         scatter_rows = cute.make_rmem_tensor(
                             (rows_per_lane,), Int64 if const_expr(self.scatter_addresses) else Int32
                         )
@@ -2157,9 +2163,9 @@ class GemmSm100(GemmTmaBase):
                                 + tile_coord_mnkl[0] * tile_m
                             )
                             source_end = varlen_params.cu_seqlens_m[batch_idx + 1]
-                        if is_tma_warp:
+                        if is_bulk_store_warp:
                             for rb in cutlass.range_constexpr(rows_per_lane):
-                                row = rb * cute.arch.WARP_SIZE + epi_tidx % cute.arch.WARP_SIZE
+                                row = rb * store_threads + epi_tidx % store_threads
                                 if row < tile_m and source_start + row < source_end:
                                     if const_expr(
                                         self.scatter_addresses and self.n_tile_major_output
@@ -2285,7 +2291,9 @@ class GemmSm100(GemmTmaBase):
                 # acc_pipeline.consumer_release was already called in self.epi_load_acc_subtile
                 if const_expr(self.gather_table):
                     if const_expr(tile_sched_params.wave_store_counter is not None):
-                        self.complete_store_wave(tile_sched_params, store_wave, is_tma_warp)
+                        self.complete_store_wave(
+                            tile_sched_params, store_wave, is_tma_warp, is_bulk_store_warp
+                        )
                         store_wave += 1
                 acc_consumer_state.advance()
                 iket.range_pop()
@@ -2301,10 +2309,11 @@ class GemmSm100(GemmTmaBase):
                     work_tile = next_work_tile
 
             # Wait for D store complete
-            if is_tma_warp:
-                if const_expr(self.bulk_row_store):
+            if const_expr(self.bulk_row_store):
+                if is_bulk_store_warp:
                     cute.arch.cp_async_bulk_wait_group(0, read=False)
-                else:
+            else:
+                if is_tma_warp:
                     epi_store_pipeline.producer_tail()
 
             # Dealloc the tensor memory buffer
@@ -2406,11 +2415,18 @@ class GemmSm100(GemmTmaBase):
         self.epilogue_barrier.arrive_and_wait()
 
     @cute.jit
-    def complete_store_wave(self, params, wave, is_store_warp):
+    def complete_store_wave(self, params, wave, is_store_warp, is_bulk_store_warp):
+        if const_expr(self.bulk_store_num_warps > 1):
+            # The publishing lane must observe completion from every issuing
+            # warp. A warp-only rendezvous cannot cover the other row owners.
+            if is_bulk_store_warp:
+                cute.arch.cp_async_bulk_wait_group(0, read=False)
+            self.epilogue_barrier.arrive_and_wait()
         if is_store_warp:
             # Bulk groups belong to individual lanes. A .read drain only permits
             # SMEM reuse; publication must wait for destination writes from ALL lanes.
-            cute.arch.cp_async_bulk_wait_group(0, read=False)
+            if const_expr(self.bulk_store_num_warps == 1):
+                cute.arch.cp_async_bulk_wait_group(0, read=False)
             cute.arch.sync_warp()
             if cute.arch.lane_idx() == 0:
                 counter = params.wave_store_counter.iterator.llvm_ptr

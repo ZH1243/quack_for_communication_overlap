@@ -29,6 +29,7 @@ def blackwell_compile_settings():
     """Apply process-local layout experiments and tracing before plans compile."""
     cols = os.environ.get("QUACK_TEST_BULK_SMEM_COLS")
     buffers = os.environ.get("QUACK_TEST_BULK_SMEM_BUFFERS")
+    store_warps = os.environ.get("QUACK_TEST_BULK_STORE_WARPS")
     trace = os.environ.get("QUACK_PRINT_KERNEL_CONFIG") == "1"
     with ExitStack() as contexts:
         if cols is not None:
@@ -39,6 +40,10 @@ def blackwell_compile_settings():
             from blackwell_bench_utils import bulk_smem_buffers
 
             contexts.enter_context(bulk_smem_buffers(int(buffers)))
+        if store_warps is not None:
+            from blackwell_bench_utils import bulk_store_warps
+
+            contexts.enter_context(bulk_store_warps(int(store_warps)))
         if trace:
             from blackwell_bench_utils import kernel_config_trace
 

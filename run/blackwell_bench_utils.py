@@ -1,6 +1,7 @@
 """Timing and mapped-host flag helpers for the Blackwell feature benchmark."""
 
 import ctypes
+import math
 import statistics
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -95,6 +96,25 @@ def bulk_smem_buffers(count):
 
 
 @contextmanager
+def bulk_store_warps(count):
+    """Distribute the same row copies among existing SM100 epilogue warps."""
+    from quack.cache import CACHE_ENABLED
+    from quack.gemm_sm100 import GemmSm100
+
+    if CACHE_ENABLED:
+        raise ValueError("bulk store warp overrides require QUACK_CACHE_ENABLED=0")
+    if count not in (1, 2, 4):
+        raise ValueError("bulk store warp count must be 1, 2, or 4")
+    previous = GemmSm100.bulk_store_num_warps
+    GemmSm100.bulk_store_num_warps = count
+    try:
+        print(f"Bulk row-copy issuing warps: {count} (existing epilogue warps)", flush=True)
+        yield
+    finally:
+        GemmSm100.bulk_store_num_warps = previous
+
+
+@contextmanager
 def kernel_config_trace():
     """Print specialization/layout metadata during compilation; no device tracing."""
     from quack.cache import CACHE_ENABLED
@@ -130,6 +150,10 @@ def kernel_config_trace():
         print(f"  epilogue tile={self.epi_tile}", flush=True)
         print(f"  D shared layout={self.epi_smem_layout_staged}", flush=True)
         if self.bulk_row_store:
+            print(f"  bulk issuing warps={self.bulk_store_num_warps}, "
+                  f"rows/issuing thread="
+                  f"{math.ceil(self.cta_tile_shape_mnk[0] / (32 * self.bulk_store_num_warps))}",
+                  flush=True)
             print(f"  bulk row padding={self.bulk_store_smem_padding_bytes_used} bytes, "
                   f"SMEM row stride={self.bulk_store_smem_row_stride} elements", flush=True)
             print(f"  bulk buffered columns={self.bulk_store_smem_cols}, "

@@ -14,8 +14,8 @@ from quack.gemm_config import GemmConfig, cta_tile_shape_m
 from quack.gemm_interface import gemm_act
 
 from blackwell_bench_utils import (
-    Variant, bulk_smem_buffers, bulk_smem_cols, bulk_smem_padding, kernel_config_trace,
-    mapped_host_flag, measure, profile_variant, select_variants,
+    Variant, bulk_smem_buffers, bulk_smem_cols, bulk_smem_padding, bulk_store_warps,
+    kernel_config_trace, mapped_host_flag, measure, profile_variant, select_variants,
 )
 from blackwell_gemm_tables import make_table
 from wave_ready import build_wave_ready_prefix
@@ -63,6 +63,8 @@ def parse_args():
                         help="total buffered column limit, 0=full; requires QUACK_CACHE_ENABLED=0")
     parser.add_argument("--bulk-smem-buffers", type=int, choices=(1, 2), default=None,
                         help="split the column budget into reusable windows; requires cache disabled")
+    parser.add_argument("--bulk-store-warps", type=int, choices=(1, 2, 4), default=None,
+                        help="row-copy issuing warps within the epilogue; requires cache disabled")
     parser.add_argument("--rounds", type=int, default=9)
     parser.add_argument("--repetitions", type=int, default=16)
     parser.add_argument("--warmup", type=int, default=100, help="full graph replays")
@@ -89,6 +91,8 @@ def parse_args():
         parser.error("--bulk-smem-cols requires --stores, --waves, or --host-ready")
     if args.bulk_smem_buffers is not None and not args.stores:
         parser.error("--bulk-smem-buffers requires --stores, --waves, or --host-ready")
+    if args.bulk_store_warps is not None and not args.stores:
+        parser.error("--bulk-store-warps requires --stores, --waves, or --host-ready")
     ntiles = math.ceil(args.n / args.tile_n)
     if ntiles % args.group_size:
         parser.error("N tile count must be divisible by group-size")
@@ -345,6 +349,8 @@ def main():
             resources.enter_context(bulk_smem_cols(args.bulk_smem_cols))
         if args.bulk_smem_buffers is not None:
             resources.enter_context(bulk_smem_buffers(args.bulk_smem_buffers))
+        if args.bulk_store_warps is not None:
+            resources.enter_context(bulk_store_warps(args.bulk_store_warps))
         if args.print_kernel_config:
             resources.enter_context(kernel_config_trace())
         benchmark(args, resources)

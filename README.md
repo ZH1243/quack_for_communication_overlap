@@ -493,7 +493,11 @@ lane commits a group even for a fully predicated window to preserve buffer/group
 age. A wait for all reads still protects reuse across persistent tiles, and full
 write completion still precedes wave-ready publication. More windows also mean
 more row-copy instructions; this is an opt-in performance experiment, not a
-measured speedup. It does not change the TMA epilogue or the default bulk path.
+default recommendation. For B300 BF16 R=32768, K=7168, N=2048, tile=(256,512),
+cluster M=2, splitting the 128-column budget regressed bulk latency from 819.36 us
+to 934.00 us. Same-run TMA-relative overhead increased from 21.25% to 47.75%.
+Keep one buffer for this workload. This result does not establish the cost of
+each individual wait: window count and row-copy count also doubled.
 
 First check partial output windows, buffer reuse and concurrent ready consumers:
 
@@ -515,6 +519,37 @@ for count in 1 2; do
     --stores --variants "single table" "bulk rows" \
     --bulk-smem-padding 16 --bulk-smem-cols 128 --bulk-smem-buffers "$count" \
     --print-kernel-config
+done
+```
+
+To isolate row-copy issuance, `--bulk-store-warps 1|2|4` distributes the same rows
+across existing epilogue warps. It keeps the window width, row-copy count, shared
+layout, A/B stages and block size fixed. With CTA M=128, one warp handles four
+rows per thread; four warps handle one each. The default is one warp. This is an
+opt-in experiment pending B300 performance validation, including possible
+register-allocation changes. It does not change the TMA store path.
+
+Scatter indices use the same row assignment. All issuing lanes drain their own
+async groups before SMEM reuse and kernel exit. With wave publication, an
+epilogue-wide barrier joins all issuing warps' full write waits before warp 0
+increments the completion counter; the original one-warp protocol is retained
+when `--bulk-store-warps 1` is selected.
+
+```bash
+QUACK_TEST_BULK_SMEM_COLS=128 QUACK_TEST_BULK_SMEM_BUFFERS=1 \
+QUACK_TEST_BULK_STORE_WARPS=4 QUACK_CACHE_ENABLED=0 CUDA_VISIBLE_DEVICES=0 \
+python -m pytest -q \
+  'run/test_blackwell_gemm_communication.py::test_bulk_store_padded_rows[bulk_rows-512]' \
+  'run/test_blackwell_gemm_communication.py::test_wide_tile_scatter_waves[128]' \
+  'run/test_blackwell_gemm_communication.py::test_wide_tile_scatter_waves[256]' -x
+
+for warps in 1 4; do
+  QUACK_CACHE_ENABLED=0 CUDA_VISIBLE_DEVICES=0 \
+  python run/blackwell_gemm_communication_bench.py \
+    --k 7168 --n 2048 --buffers 16 --tile-m 256 --tile-n 512 --cluster-m 2 \
+    --stores --variants "single table" "bulk rows" \
+    --bulk-smem-padding 16 --bulk-smem-cols 128 --bulk-smem-buffers 1 \
+    --bulk-store-warps "$warps" --print-kernel-config
 done
 ```
 

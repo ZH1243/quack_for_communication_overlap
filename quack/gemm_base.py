@@ -85,6 +85,7 @@ class GemmBase:
     bulk_row_double_buffer = False
     bulk_row_swizzle = False
     bulk_store_chunked = False
+    bulk_store_num_warps = 1
     # Elements between contiguous bulk-store rows; None keeps the dense tile pitch.
     bulk_store_smem_row_stride = None
     # Epilogue mixins that need a reduction over the full accumulator tile
@@ -296,6 +297,9 @@ class GemmBase:
         use_tma_epi = const_expr(epi_store_pipeline is not None)
         use_tma_c = const_expr(epi_pipeline is not None)
         inline_epi_load = const_expr(copy_C is not None)
+        is_bulk_store_warp = is_tma_warp
+        if const_expr(self.bulk_row_store and self.bulk_store_num_warps > 1):
+            is_bulk_store_warp = tidx < self.bulk_store_num_warps * cute.arch.WARP_SIZE
 
         # Store contexts — one per stored output, D first (when present), then
         # the aux TileStore outputs. Each is ``(op, quant, tiled_copy, tRS_s,
@@ -338,7 +342,7 @@ class GemmBase:
             # Only async reads must finish before the next R2S writes.
             # All issuing lanes must wait on their own per-thread groups.
             if const_expr(not self.pingpong or self.bulk_row_double_buffer):
-                if is_tma_warp:
+                if is_bulk_store_warp:
                     cute.arch.cp_async_bulk_wait_group(0, read=True)
                 epilogue_barrier.arrive_and_wait()
             # With private pingpong buffers, this drains the same WG's previous tile
@@ -498,7 +502,7 @@ class GemmBase:
                     # Only the group owning the buffer about to be reused must
                     # finish reading. Newer groups can keep draining other buffers.
                     # Every issuing lane waits on its own per-thread groups.
-                    if is_tma_warp:
+                    if is_bulk_store_warp:
                         cute.arch.cp_async_bulk_wait_group(
                             self.bulk_store_buffer_count - 1, read=True
                         )
@@ -546,7 +550,7 @@ class GemmBase:
                 ):
                     cute.arch.fence_view_async_shared()
                     epilogue_barrier.arrive_and_wait()
-                    if is_tma_warp:
+                    if is_bulk_store_warp:
                         copy_D(chunk_idx=epi_idx // (self.epi_stage // self.bulk_store_buffer_count))
                         # Commit even for an entirely predicated window: group
                         # age must continue to match the ring-buffer index.
@@ -566,7 +570,7 @@ class GemmBase:
             iket.range_push("epi_store_issue")
             cute.arch.fence_view_async_shared()
             epilogue_barrier.arrive_and_wait()
-            if is_tma_warp:
+            if is_bulk_store_warp:
                 copy_D()
                 cute.arch.cp_async_bulk_commit_group()
             iket.range_pop()
@@ -836,14 +840,15 @@ class GemmBase:
         smem_col_offset: cutlass.Constexpr = 0,
         store_cols: cutlass.Constexpr = None,
     ):
-        """Called by all 32 store-warp lanes after the output R2S fence/barrier.
+        """Called by all participating store lanes after the output R2S fence/barrier.
 
         Linear bulk copies do not apply a tensor descriptor's swizzle or OOB
         handling. Each row in sD is contiguous, with an optional padded row pitch;
         bulk_row_swizzle instead resolves each 16-byte chunk through the swizzled
         subtile layout.
         The caller supplies a batch-offset ordinary GMEM tensor, and each lane
-        predicates its sequence-local row.
+        predicates its sequence-local row. SM100 can distribute rows across
+        multiple epilogue warps; other architectures retain the one-warp default.
         With scatter_rows, gD is the global output base and each lane uses its
         prefetched destination indices, while keeping the same source bounds.
         In address mode these registers instead hold int64 destination-row
@@ -861,11 +866,12 @@ class GemmBase:
         col_start = tile_coord[1] * tile_n + col_offset
         copy_cols = const_expr(tile_n if store_cols is None else store_cols)
         store_bytes = cutlass.min(copy_cols, gD.shape[1] - col_start) * (self.d_dtype.width // 8)
-        lane = tidx % cute.arch.WARP_SIZE
+        store_threads = const_expr(self.bulk_store_num_warps * cute.arch.WARP_SIZE)
+        worker = tidx % store_threads
         # Diagnostic ablation: retain full MMA/R2S staging and only shorten store issuance.
         rows_to_store = const_expr(tile_m if self.bulk_store_rows is None else self.bulk_store_rows)
-        for row_block in cutlass.range_constexpr(cute.ceil_div(rows_to_store, cute.arch.WARP_SIZE)):
-            row = row_block * cute.arch.WARP_SIZE + lane
+        for row_block in cutlass.range_constexpr(cute.ceil_div(rows_to_store, store_threads)):
+            row = row_block * store_threads + worker
             if row < rows_to_store and row_start + row < len_m and store_bytes > 0:
                 dst_row = row_start + row
                 if const_expr(scatter_rows is not None and not self.scatter_addresses):
