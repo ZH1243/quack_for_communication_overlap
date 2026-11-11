@@ -139,7 +139,6 @@ class GemmSm90(GemmTmaBase):
     """
 
     arch = 90
-    gather_table = False
     # Base (pre-refinement) C-load stage depth in _compute_stages: SM90's TMA
     # epilogue dispatch policy StagesC = min(EpiTiles, 4). SM120 overrides to
     # 2 (its CUTLASS builder uses StagesC = StagesD = min(EpiTiles, 2) — the

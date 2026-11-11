@@ -79,6 +79,8 @@ class GemmBase:
     """Common non-mainloop pieces shared by GEMM architectures."""
 
     arch = 0
+    # Shared auxiliary stores inspect this flag; only SM90 enables table scheduling.
+    gather_table = False
     bulk_row_store = False
     bulk_row_double_buffer = False
     bulk_row_swizzle = False
