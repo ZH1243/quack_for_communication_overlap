@@ -1010,6 +1010,24 @@ class TileStore(EpiOp):
     def _make_tiled_copy_r2s(self, gemm, params, tiled_copy_r2s, tiled_copy_t2r):
         """Build the register-to-shared tiled copy for this output."""
         copy_atom_r2s = self._make_copy_atom_r2s(gemm, params, tiled_copy_t2r)
+        if self.gated and gemm.arch == 100 and gemm.epi_smem_warp_shape_mnk()[1] > 1:
+            # M=64 with 2-CTA MMA puts two epilogue warps along N. Reusing
+            # the full-width copy leaves their N offsets unhalved: partition_D
+            # on the smaller postact tile can then alias another row/stage.
+            # Each gated register consumes source values (2*v, 2*v+1).
+            # Select the even value and map (m, n) -> (m, n//2), including
+            # the N component of the thread mapping, not just value extents.
+            # These are compile-time layout operations; no shuffle is needed.
+            assert isinstance(copy_atom_r2s.op, cute.nvgpu.CopyUniversalOp)
+            tv = tiled_copy_r2s.layout_src_tv_tiled
+            tile_m, tile_n = (cute.size(t) for t in tiled_copy_r2s.tiler_mn)
+            threads, values = cute.size(tv, mode=[0]), cute.size(tv, mode=[1])
+            assert tile_n % 2 == 0 and values % 2 == 0
+            even_values = cute.make_layout((threads, values // 2), stride=(1, 2 * threads))
+            paired_tv = cute.composition(tv, even_values)
+            halve_n = cute.make_layout((tile_m, 2, tile_n // 2), stride=(1, 0, tile_m))
+            gated_tv = cute.composition(halve_n, paired_tv)
+            return cute.make_tiled_copy(copy_atom_r2s, gated_tv, (tile_m, tile_n // 2))
         if self.gated and gemm.arch == 120:
             # SM120 halved postact: retile through an N-doubled permuted MMA so
             # each warp's STSM lanes cover the halved tile contiguously. The

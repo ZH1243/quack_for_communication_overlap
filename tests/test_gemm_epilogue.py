@@ -619,7 +619,8 @@ def test_epi_mod_rms_fused(tile_N):
     _rel_check(sqsum, sqsum2, "sqsum vs handwritten", tol=1e-4)
 
 
-def test_epi_mod_gated_swiglu():
+@pytest.mark.parametrize("cluster_M", [1, 2])
+def test_epi_mod_gated_swiglu(cluster_M):
     """GemmGated as a mod, cross-checked against the hand-written kernel."""
     device = "cuda"
     torch.random.manual_seed(6)
@@ -635,10 +636,7 @@ def test_epi_mod_gated_swiglu():
         epi_args=dict(postact=postact),
         tile_M=128,
         tile_N=256,
-        # cluster_M=1: gated + cluster_M=2 miscomputes ~27% of postact on SM100 —
-        # pre-existing bug in the hand-written kernel (reproduces on main @8ff10ac
-        # via the raw gemm_act dispatch; see dbg_gated6 minimized repro).
-        cluster_M=1,
+        cluster_M=cluster_M,
         cluster_N=1,
     )
 
@@ -656,7 +654,7 @@ def test_epi_mod_gated_swiglu():
         epi_args=dict(mAuxOut=postact2),
         tile_M=128,
         tile_N=256,
-        cluster_M=1,
+        cluster_M=cluster_M,
         cluster_N=1,
     )
     _rel_check(postact, postact2.float(), "postact vs handwritten", tol=1e-3)
@@ -681,7 +679,7 @@ def test_epi_mod_gated_operands_and_d():
         epi_args=dict(rstd=rstd, bias=bias, postact=postact),
         tile_M=128,
         tile_N=256,
-        cluster_M=1,  # see cluster_M note in test_epi_mod_gated_swiglu
+        cluster_M=1,
         cluster_N=1,
     )
 

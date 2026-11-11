@@ -129,6 +129,48 @@ def test_swiglu_and_down(cluster_m):
     check(out, ref)
 
 
+@pytest.mark.parametrize("table_gather", [False, True])
+@pytest.mark.parametrize("store_preact", [False, True])
+def test_swiglu_two_cta_store_mapping(table_gather, store_preact):
+    """One expert and one N tile isolate the half-width epilogue warp mapping.
+
+    Distinct columns expose a displaced N warp; varying rows expose cross-row
+    aliasing. M=129 also checks a partial cluster with a fully predicated peer.
+    With preact enabled, verify the accumulator output before checking SwiGLU.
+    """
+    m, k, n = 129, 64, 128
+    a = torch.zeros(m, k, dtype=torch.bfloat16, device="cuda")
+    a[:, 0] = 1
+    a[:, 1] = (torch.arange(m, device=a.device) % 7) / 8
+    w = torch.zeros(1, n, k, dtype=a.dtype, device=a.device)
+    columns = torch.arange(n // 2, device=a.device)
+    w[0, :n // 2, 0] = 1 + (columns % 5) / 8
+    w[0, n // 2:, 0] = (columns - n // 4) / 16
+    w[0, n // 2:, 1] = 0.25
+    config = GemmConfig(
+        tile_m=128, tile_n=128, cluster_m=2, cluster_n=1, max_swizzle_size=1,
+        is_dynamic_persistent=False, pingpong=False, device_capacity=10,
+    )
+    table_args = {}
+    if table_gather:
+        rows, _ = make_table([[m]], n=n, tile_m=128, cluster_m=2)
+        table_args = dict(
+            A_idx=torch.arange(m, device=a.device, dtype=torch.int32),
+            gather_work_table=torch.tensor(rows, device=a.device, dtype=torch.int32),
+        )
+    preact, postact = gemm_act(
+        a, w.transpose(1, 2) if table_gather else w[0].T,
+        activation="swiglu", store_preact=store_preact, concat_layout=("B",),
+        tuned=False, config=config, **table_args,
+    )
+    reference = a.float() @ w[0].float().T
+    gate, up = reference.chunk(2, dim=-1)
+    if store_preact:
+        # B is physically [gate; up]; D without concat_layout=("D",) is interleaved.
+        check(preact, torch.stack((gate, up), dim=-1).flatten(1))
+    check(postact, F.silu(gate) * up)
+
+
 @pytest.mark.parametrize("store", ["bulk_rows", "bulk_rows_reduce"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("cluster_m", [1, 2])
