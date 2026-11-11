@@ -361,26 +361,46 @@ def test_streamed_table():
     xs, idx, w, table, ref, _, _ = inputs(16)
     ready = torch.full((1,), len(table), dtype=torch.int32, device="cuda")
     out = torch.empty(sum(i.numel() for i in idx), w.shape[1], dtype=xs[0].dtype, device="cuda")
+    print("streamed table: warming GEMM", flush=True)
     launch(xs, idx, w, table, out, gather_work_table_ready=ready, sm_count=8)
     torch.cuda.synchronize()
     host = table.cpu().pin_memory()
     producer = torch.cuda.Stream()
-    for _ in range(3):
+    chunks = []
+    for start in range(0, len(table), 7):
+        end = min(start + 7, len(table))
+        chunks.append((table[start:end], host[start:end], end))
+
+    def publish():
+        with torch.cuda.stream(producer):
+            for device_rows, host_rows, end in chunks:
+                torch.cuda._sleep(200_000)
+                device_rows.copy_(host_rows, non_blocking=True)
+                ready.fill_(end)
+
+    # Preload every producer kernel before launching a consumer that waits for it.
+    # First-use CUDA lazy loading (notably _sleep) can synchronize the context,
+    # blocking the host before it has enqueued the writes that release the GEMM.
+    # Warm the same publication path, including the short final chunk.
+    print("streamed table: warming producer", flush=True)
+    publish()
+    producer.synchronize()
+    print("streamed table: warmup complete", flush=True)
+    for iteration in range(3):
         out.fill_(float("nan"))
         table.fill_(-1)
         ready.zero_()
         producer.wait_stream(torch.cuda.current_stream())
         # Launch first: scheduler tile zero must wait without reading the poison.
+        print(f"streamed table: iteration {iteration + 1}, launching GEMM", flush=True)
         launch(xs, idx, w, table, out, gather_work_table_ready=ready, sm_count=8)
-        with torch.cuda.stream(producer):
-            for start in range(0, len(table), 7):
-                torch.cuda._sleep(200_000)
-                end = min(start + 7, len(table))
-                table[start:end].copy_(host[start:end], non_blocking=True)
-                ready.fill_(end)
+        print("streamed table: GEMM enqueued, publishing rows", flush=True)
+        publish()
+        print("streamed table: producer enqueued, checking output", flush=True)
         torch.cuda.current_stream().wait_stream(producer)
         check(out[:len(ref)], ref)
         assert torch.isnan(out[len(ref):]).all().item()
+        print(f"streamed table: iteration {iteration + 1} passed", flush=True)
 
 
 def test_row_address_scatter():
