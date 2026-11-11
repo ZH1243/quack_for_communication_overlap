@@ -544,6 +544,17 @@ class GemmSm100(GemmTmaBase):
                 (epi_tile_n // warp_n, warp_n), stride=(1, self.cta_tile_shape_mnk[1] // warp_n)
             )
             self.epi_tile = (self.epi_tile[0], cute.coalesce(epi_tile_n_layout))
+        # Two-CTA M=128 uses two 64-DP halves per instruction. The N-warp
+        # separation is half the instruction N, not half the entire CTA N.
+        # E.g. a 512-column CTA repeats a 256-column instruction: columns
+        # 0/128 occupy the two DP halves; columns 256/384 repeat them in COLs.
+        if self.cta_tile_shape_mnk[0] == 64 and self.use_2cta_instrs:
+            inst_n = self.mma_inst_shape_mnk[1]
+            epi_n = math.gcd(cute.size(self.epi_tile[1]), inst_n)
+            self.epi_tile = (
+                self.epi_tile[0],
+                cute.coalesce(cute.make_layout((epi_n // 2, 2), stride=(1, inst_n // 2))),
+            )
         # Quantized-output SF vectors must be produced within one epi subtile.
         # Widen the epi tile N when an active BlockScaleFactorStore needs a
         # larger run (e.g. fp4 D with a small tile may default to epi N below
@@ -573,14 +584,19 @@ class GemmSm100(GemmTmaBase):
         )
         self.bulk_store_smem_cols = self.cta_tile_shape_mnk[1]
         if self.bulk_row_store:
-            if self.bulk_store_smem_max_cols > 0:
-                self.bulk_store_smem_cols = math.gcd(
-                    self.cta_tile_shape_mnk[1], self.bulk_store_smem_max_cols
-                )
-            self.bulk_store_chunked = self.bulk_store_smem_cols < self.cta_tile_shape_mnk[1]
             self.bulk_store_stripes = (
                 2 if self.cta_tile_shape_mnk[0] == 64 and self.use_2cta_instrs else 1
             )
+            # A striped window must stay inside one instruction's N group.
+            self.bulk_store_group_n = (
+                self.mma_inst_shape_mnk[1] if self.bulk_store_stripes == 2
+                else self.cta_tile_shape_mnk[1]
+            )
+            if self.bulk_store_smem_max_cols > 0:
+                self.bulk_store_smem_cols = math.gcd(
+                    self.bulk_store_group_n, self.bulk_store_smem_max_cols
+                )
+            self.bulk_store_chunked = self.bulk_store_smem_cols < self.cta_tile_shape_mnk[1]
             epi_n = cute.size(self.epi_tile[1])
             assert self.bulk_store_smem_cols % epi_n == 0, (
                 "bulk SMEM window must contain whole epilogue subtiles"
@@ -590,7 +606,7 @@ class GemmSm100(GemmTmaBase):
                 assert self.epi_m_major, "bulk column windows require M-major epilogue traversal"
                 assert cute.cosize(self.epi_tile[1]) == (
                     (self.bulk_store_stripes - 1)
-                    * (self.cta_tile_shape_mnk[1] // self.bulk_store_stripes)
+                    * (self.bulk_store_group_n // self.bulk_store_stripes)
                     + epi_n // self.bulk_store_stripes
                 ), "unexpected SM100 epilogue N tiler"
         (
@@ -1810,6 +1826,7 @@ class GemmSm100(GemmTmaBase):
                     epi_tile_shape = cute.zipped_divide(
                         cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile
                     ).shape[1]
+                    epi_tile_shape = cute.product_each(epi_tile_shape)
                     epi_tile_num = const_expr(cute.size(epi_tile_shape))
                     # Hier subtile coords, ordered exactly as the epilogue store
                     # loop consumes stages (gemm_base.epilogue): every copy fn
@@ -2287,12 +2304,15 @@ class GemmSm100(GemmTmaBase):
     ):
         if const_expr(self.bulk_store_chunked):
             stripe_cols = const_expr(self.bulk_store_smem_cols // self.bulk_store_stripes)
+            windows_per_group = const_expr(self.bulk_store_group_n // self.bulk_store_smem_cols)
+            group_start = const_expr((chunk_idx // windows_per_group) * self.bulk_store_group_n)
+            window_start = const_expr((chunk_idx % windows_per_group) * stripe_cols)
             for stripe in cutlass.range_constexpr(self.bulk_store_stripes):
                 self.epilog_bulk_store_rows(
                     sD, gD, tile_coord, len_m, tidx, scatter_rows,
                     col_offset=(
-                        stripe * (self.cta_tile_shape_mnk[1] // self.bulk_store_stripes)
-                        + chunk_idx * stripe_cols
+                        group_start + stripe * (self.bulk_store_group_n // self.bulk_store_stripes)
+                        + window_start
                     ),
                     smem_col_offset=stripe * stripe_cols,
                     store_cols=stripe_cols,
@@ -2756,8 +2776,11 @@ class GemmSm100(GemmTmaBase):
             epi_tile,
             use_2cta_instrs,
         )
+        tAcc_mn = quack_sm100_utils.make_tmem_acc_mn_view(tAcc)
+        assert cute.size(tAcc_mn.shape[0]) == self.cta_tile_shape_mnk[0]
+        assert cute.size(tAcc_mn.shape[1]) == self.cta_tile_shape_mnk[1]
         # (EPI_TILE_M, EPI_TILE_N, EPI_M, EPI_N, STAGE)
-        tAcc_epi = cute.flat_divide(tAcc[((None, None), 0, 0, None)], epi_tile)
+        tAcc_epi = cute.flat_divide(tAcc_mn, epi_tile)
         # (EPI_TILE_M, EPI_TILE_N)
         tiled_copy_t2r = tcgen05.make_tmem_copy(copy_atom_t2r, tAcc_epi[(None, None, 0, 0, 0)])
 

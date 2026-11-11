@@ -1734,7 +1734,7 @@ class ColVecReduce(VecReduce):
         epi_tile_shape = cute.zipped_divide(
             cute.make_layout(gemm.cta_tile_shape_mnk[:2]), epi_tile
         ).shape[1]
-        if const_expr(epi_coord[1] == epi_tile_shape[1] - 1):
+        if const_expr(epi_coord[1] == cute.size(epi_tile_shape[1]) - 1):
             vals_cur = self._end_loop_values(state, epi_coord)
             sExch = self._end_loop_smem(state)
             tiled_copy = tiled_copy_t2r if tiled_copy_t2r is not None else tiled_copy_r2s
@@ -1947,7 +1947,7 @@ class RowVecReduce(VecReduce):
         epi_tile_shape = cute.zipped_divide(
             cute.make_layout(gemm.cta_tile_shape_mnk[:2]), epi_tile
         ).shape[1]
-        if const_expr(epi_coord[0] == epi_tile_shape[0] - 1):
+        if const_expr(epi_coord[0] == cute.size(epi_tile_shape[0]) - 1):
             tDrReduce, sDrReduce = state[0], state[1]
             tDrReduce_cur = tDrReduce[None, None, None, epi_coord[0], epi_coord[1]]
             tiled_copy = tiled_copy_t2r if tiled_copy_t2r is not None else tiled_copy_r2s

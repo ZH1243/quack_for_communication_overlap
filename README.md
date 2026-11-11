@@ -440,7 +440,8 @@ of padded output storage per CTA. The tradeoff is additional row-copy instructio
 and synchronization. Full-tile staging remains the default until GPU measurements
 establish which is faster. A limit of 0 explicitly selects that default; for other
 tile widths, the actual window is the GCD of the limit and tile N and must contain
-whole epilogue subtiles.
+whole epilogue subtiles. For the two-stripe M=128 MMA layout, windows also stay
+inside one instruction's N group, so its instruction N replaces tile N in that GCD.
 
 The window path preserves the two separated N stripes used by two-CTA M=128 GEMMs,
 row/scatter destination offsets, and compact N-tile-major strides. Before shared
@@ -494,10 +495,20 @@ python -m pytest -s -vv \
 
 `test_two_cta_wide_tmem_mapping` is a smaller numerical repro with dense inputs,
 no gather/scatter/wave signaling, distinct column bands, and TMA/bulk output
-parametrizations at tile N=256 and 512. For example, run
+parametrizations at tile N=256, 384 and 512, including a separate C-load case.
+For example, run
 `test_two_cta_wide_tmem_mapping[tma-512]` separately to check whether the partition
 failure also occurs without bulk stores. Keep each native-crash repro in a separate
 pytest invocation so a process abort cannot prevent the other cases from running.
+
+For two-CTA tile M=128/N=512, the accumulator view must retain both MMA-N repeats:
+its M/N sizes should be `(64, 512)`. The two N warps address halves of a 256-column
+MMA instruction, so the BF16 epilogue tiler is `(64:1, (32,2):(1,128))`. The old
+view selected only the first 256 columns and used stride 256, extrapolating to
+TMEM datapath 128 (offset 8388608) before native `partition_S` crashed. Folding
+MMA repeats into the view and using instruction-based stripe spacing keeps the
+second warp at datapath 64 (offset 4194304). Window stores advance through both
+stripes of one instruction before moving to the next instruction's column group.
 
 For hardware profiling, `--profile-variant` checks and warms one enabled variant,
 then performs one eager call in the `quack_profile` NVTX push/pop range. It checks the

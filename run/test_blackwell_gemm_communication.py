@@ -355,9 +355,14 @@ def test_wide_tile_scatter_waves(tile_m):
     _check_multi_buffer_scatter_waves(cluster_m=2, tile_m=tile_m, tile_n=512)
 
 
-@pytest.mark.parametrize("tile_n", [256, 512])
+@pytest.mark.parametrize("tile_n,with_c", [
+    pytest.param(256, False, id="256"),
+    pytest.param(384, False, id="384"),
+    pytest.param(512, False, id="512"),
+    pytest.param(512, True, id="512-c"),
+])
 @pytest.mark.parametrize("store", ["tma", "bulk_rows"])
-def test_two_cta_wide_tmem_mapping(tile_n, store):
+def test_two_cta_wide_tmem_mapping(tile_n, with_c, store):
     """Isolate two-CTA TMEM partitioning without gather, scatter or wave barriers.
 
     One full M cluster and one fully predicated peer in the last cluster. Column
@@ -374,9 +379,15 @@ def test_two_cta_wide_tmem_mapping(tile_n, store):
     storage = torch.full((m + 2, n), -123, device="cuda", dtype=a.dtype)
     out = storage[1:-1]
     reference = a.float() @ w.float().T
+    c = None
+    if with_c:
+        # Exercise the separate C-load warp's subtile ordering too.
+        c = ((torch.arange(m, device="cuda")[:, None] % 5) / 8
+             + columns[None, :] / 512).to(a.dtype).contiguous()
+        reference = reference + 0.5 * c.float()
     for _ in range(2):
         out.fill_(float("nan"))
-        gemm(a, w, out, None, None, tile_M=128, tile_N=tile_n,
+        gemm(a, w, out, c, None, tile_M=128, tile_N=tile_n, beta=0.5,
              cluster_M=2, cluster_N=1, tile_K=64, max_swizzle_size=1,
              is_dynamic_persistent=False, epilogue_store=store)
         check(out, reference)

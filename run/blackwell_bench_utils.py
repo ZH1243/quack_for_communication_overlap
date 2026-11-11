@@ -81,6 +81,7 @@ def kernel_config_trace():
     from quack.cache import CACHE_ENABLED
     from quack.gemm_sm100 import GemmSm100
     from cutlass.cute.nvgpu import tcgen05
+    from quack.sm100_utils import make_tmem_acc_mn_view
 
     if CACHE_ENABLED:
         raise ValueError(
@@ -134,7 +135,7 @@ def kernel_config_trace():
         print(f"  accumulator mode sizes={cute.product_each(tAcc.shape)}", flush=True)
         print(f"  epilogue tiler={epi_tile}", flush=True)
         # Show precisely the source view currently used by the kernel.
-        view = tAcc[((None, None), 0, 0, None)]
+        view = make_tmem_acc_mn_view(tAcc)
         print(f"  selected accumulator view={view.layout}", flush=True)
         print(f"  selected M/N sizes={cute.product_each(view.shape)[:2]}", flush=True)
         result = tmem_partition(self, tidx, tAcc, epi_tile, use_2cta_instrs)

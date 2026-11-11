@@ -122,6 +122,7 @@ class RotaryCosSinLoad(EpiOp):
         epi_tile_shape = cute.zipped_divide(
             cute.make_layout(gemm.cta_tile_shape_mnk[:2]), ctx.epi_tile
         ).shape[1]
+        epi_tile_shape = cute.product_each(epi_tile_shape)
         epi_tile_layout = cute.make_ordered_layout(
             epi_tile_shape, order=(0, 1) if const_expr(gemm.epi_m_major) else (1, 0)
         )
@@ -262,6 +263,7 @@ class RotaryCosSinTMALoad(TileLoad):
             epi_tile_shape = cute.zipped_divide(
                 cute.make_layout(gemm.cta_tile_shape_mnk[:2]), epi_tile
             ).shape[1]
+            epi_tile_shape = cute.product_each(epi_tile_shape)
             epi_tile_layout = cute.make_ordered_layout(
                 epi_tile_shape, order=(0, 1) if const_expr(gemm.epi_m_major) else (1, 0)
             )

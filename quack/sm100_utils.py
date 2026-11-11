@@ -9,6 +9,30 @@ from cutlass.cutlass_dsl import Numeric, dsl_user_op
 from cutlass.cute.nvgpu import OperandMajorMode, tcgen05
 
 
+def make_tmem_acc_mn_view(acc: cute.Tensor) -> cute.Tensor:
+    """Fold ((M_atom, N_atom), MMA_M, MMA_N, ...) into (M, N, ...).
+
+    Preserve the physical TMEM strides, including the N-to-datapath mapping
+    inside a two-CTA M=128 instruction. Slicing MMA_N=0 loses the other atoms
+    when the CTA tile is wider than one instruction.
+    """
+    shape, stride = acc.shape, acc.stride
+    modes = [
+        cute.coalesce(
+            cute.make_layout(
+                (shape[0][axis], shape[axis + 1]),
+                stride=(stride[0][axis], stride[axis + 1]),
+            )
+        )
+        for axis in (0, 1)
+    ]
+    layout = cute.make_layout(
+        (modes[0].shape, modes[1].shape, *shape[3:]),
+        stride=(modes[0].stride, modes[1].stride, *stride[3:]),
+    )
+    return cute.make_tensor(acc.iterator, layout)
+
+
 class MmaMXF4NVF4Op(tcgen05.MmaMXF4NVF4Op):
     """tcgen05 kind::mxf4nvf4 MMA op with the scale config as a parameter.
 
