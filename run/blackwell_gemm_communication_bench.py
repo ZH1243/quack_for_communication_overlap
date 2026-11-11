@@ -71,7 +71,16 @@ def main():
         start += count
     common = dict(tile_M=args.tile_m, tile_N=args.tile_n, cluster_M=args.cluster_m,
                   cluster_N=1, max_swizzle_size=args.group_size,
-                  is_dynamic_persistent=False, sm_count=args.sm_count)
+                  persistent=True, is_dynamic_persistent=False, pingpong=False,
+                  use_tma_gather=False, sm_count=args.sm_count)
+    print(f"{torch.cuda.get_device_name()}: dtype={dtype}, R={r} N={args.n} K={args.k}, "
+          f"experts={args.experts}, buffers={args.buffers}", flush=True)
+    print(f"Routes per expert: {expert_counts}", flush=True)
+    print(f"Shared config: MMA tile=({args.tile_m},{args.tile_n}), tile_K=auto, "
+          f"cluster=({args.cluster_m},1), group_size={args.group_size}, "
+          f"sm_count={args.sm_count if args.sm_count is not None else 'device default'}", flush=True)
+    print("Shared config: static persistent, swap_ab=False, pingpong=False, "
+          "cp.async gather; all variants use the same source data and weights", flush=True)
     variants = {}
     outputs = {}
 
@@ -141,8 +150,6 @@ def main():
                 per_round.append(us)
         round_baselines.append(statistics.median(per_round))
     base = statistics.median(samples[names[0]])
-    print(f"{torch.cuda.get_device_name()}: R={r} N={args.n} K={args.k}, "
-          f"MMA tile=({args.tile_m},{args.tile_n}), cluster_m={args.cluster_m}")
     print("variant                 median us    TFLOPS   time/baseline")
     for name, times in samples.items():
         us = statistics.median(times)

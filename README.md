@@ -283,6 +283,24 @@ CUDA_VISIBLE_DEVICES=0 python run/blackwell_gemm_communication_bench.py \
   --k 512 --n 4096 --buffers 16 --cluster-m 1 --sm-count 70 --stores
 ```
 
+Every variant in one invocation uses the same MMA tile, cluster, static persistence,
+group size, SM limit, BF16 source data, and expert weights. To compare larger tiles,
+keep the workload fixed and change the tile for all variants together:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python run/blackwell_gemm_communication_bench.py \
+  --k 4096 --n 1024 --buffers 16 --cluster-m 2 \
+  --tile-m 256 --tile-n 512 --group-size 1
+```
+
+The default workload has 32768 routes across 8 experts (4096 rows per expert),
+N=1024 and K=4096. Its absolute TFLOPS are not directly comparable to a single dense
+8192-by-8192-by-8192 GEMM. Matching tile sizes alone does not match the workload or
+kernel path: table gather requires static persistence and does not support
+`swap_ab=True`. Use the indexed baseline in the same invocation to quantify the
+table-path overhead; compare identical configurations across revisions to check
+for regressions.
+
 The benchmark verifies every variant before timing, interleaves launches inside CUDA
 graphs, rotates variant order, and reports median microseconds, dense TFLOPS, and baseline
 drift. Variants share the same source allocation to control L2 effects; the numerical
