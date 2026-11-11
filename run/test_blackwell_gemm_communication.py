@@ -1,6 +1,7 @@
 """Numerical B300 tests; run with pytest on the GPU node (see BLACKWELL_GEMM.md)."""
 
 import math
+import os
 
 import pytest
 import torch
@@ -21,11 +22,18 @@ from wave_ready import build_wave_ready_prefix
 
 
 @pytest.fixture(autouse=True)
-def blackwell_device():
+def blackwell_device(monkeypatch):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("requires a Blackwell datacenter GPU (B200/B300, SM100/SM103)")
     torch.manual_seed(1234)
     torch.backends.cuda.matmul.allow_tf32 = False
+    if os.environ.get("QUACK_DEBUG_GATED_STORE") == "1":
+        from importlib.metadata import version
+
+        from blackwell_gated_debug import install_gated_store_trace
+
+        print("CUTLASS DSL:", version("nvidia-cutlass-dsl"))
+        install_gated_store_trace(monkeypatch)
 
 
 def inputs(buffers, *, k=144, n=384, dtype=torch.bfloat16, cluster_m=2, tile_m=128):
@@ -165,6 +173,10 @@ def test_swiglu_two_cta_store_mapping(table_gather, store_preact):
     )
     reference = a.float() @ w[0].float().T
     gate, up = reference.chunk(2, dim=-1)
+    if os.environ.get("QUACK_DEBUG_GATED_STORE") == "1":
+        torch.cuda.synchronize()
+        print("gated global row 0:", postact[0].float().tolist())
+        print("gated reference row 0:", (F.silu(gate) * up)[0].tolist())
     if store_preact:
         # B is physically [gate; up]; D without concat_layout=("D",) is interleaved.
         check(preact, torch.stack((gate, up), dim=-1).flatten(1))
