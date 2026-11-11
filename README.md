@@ -479,6 +479,26 @@ Inspect the compiled A/B stages and buffered-column counts, then compare each bu
 timing against its TMA control. Repeat in reverse order to assess clock drift. The
 same window flag also applies to `--host-ready` for testing all store features.
 
+For a native compiler crash during TMEM partitioning, set
+`QUACK_PRINT_KERNEL_CONFIG=1` and disable pytest output capture (`-s`). The trace
+prints and flushes the MMA instruction shape, full accumulator layout, selected
+accumulator view, epilogue tiler, load atom, and tiled copy **before** `partition_S`.
+This retains the relevant layouts even if the compiler terminates with SIGFPE:
+
+```bash
+QUACK_PRINT_KERNEL_CONFIG=1 QUACK_TEST_BULK_SMEM_COLS=128 \
+QUACK_CACHE_ENABLED=0 CUDA_VISIBLE_DEVICES=0 \
+python -m pytest -s -vv \
+  'run/test_blackwell_gemm_communication.py::test_wide_tile_scatter_waves[128]' -x
+```
+
+`test_two_cta_wide_tmem_mapping` is a smaller numerical repro with dense inputs,
+no gather/scatter/wave signaling, distinct column bands, and TMA/bulk output
+parametrizations at tile N=256 and 512. For example, run
+`test_two_cta_wide_tmem_mapping[tma-512]` separately to check whether the partition
+failure also occurs without bulk stores. Keep each native-crash repro in a separate
+pytest invocation so a process abort cannot prevent the other cases from running.
+
 For hardware profiling, `--profile-variant` checks and warms one enabled variant,
 then performs one eager call in the `quack_profile` NVTX push/pop range. It checks the
 output again after the profiled call. For example, on the B300 node with Nsight Compute:

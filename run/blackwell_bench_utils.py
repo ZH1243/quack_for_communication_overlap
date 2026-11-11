@@ -80,6 +80,7 @@ def kernel_config_trace():
     """Print specialization/layout metadata during compilation; no device tracing."""
     from quack.cache import CACHE_ENABLED
     from quack.gemm_sm100 import GemmSm100
+    from cutlass.cute.nvgpu import tcgen05
 
     if CACHE_ENABLED:
         raise ValueError(
@@ -87,6 +88,8 @@ def kernel_config_trace():
         )
     setup = GemmSm100._setup_attributes
     partition = GemmSm100.epilog_smem_store_and_partition
+    tmem_partition = GemmSm100.epilog_tmem_copy_and_partition
+    make_tmem_copy = tcgen05.make_tmem_copy
 
     def traced_setup(self, epilogue_args, varlen_args):
         result = setup(self, epilogue_args, varlen_args)
@@ -97,7 +100,8 @@ def kernel_config_trace():
         print(f"kernel config: {type(self).__name__}, gather={self.gather_A}, "
               f"table={self.gather_table}, bulk={self.bulk_row_store}, "
               f"reduce={self.bulk_row_reduce}", flush=True)
-        print(f"  MMA tile={self.mma_tiler}, CTA tile={self.cta_tile_shape_mnk}, "
+        print(f"  MMA instruction={self.mma_inst_shape_mnk}, "
+              f"MMA tile={self.mma_tiler}, CTA tile={self.cta_tile_shape_mnk}, "
               f"A/B stages={self.ab_stage}, accumulator stages={self.num_acc_stage}, "
               f"epilogue stages={self.epi_stage}, TMEM columns={self.num_tmem_alloc_cols}",
               flush=True)
@@ -121,13 +125,42 @@ def kernel_config_trace():
             print(f"  shared partition layout={result[2].layout}", flush=True)
         return result
 
+    def traced_tmem_partition(self, tidx, tAcc, epi_tile, use_2cta_instrs):
+        # Flush before the native layout builders: SIGFPE cannot be caught as
+        # a Python exception, and pytest capture would otherwise hide this data.
+        print(f"kernel T2R: CTA={self.cta_tile_shape_mnk}, 2CTA={use_2cta_instrs}, "
+              f"bulk={self.bulk_row_store}, windowed={self.bulk_store_chunked}", flush=True)
+        print(f"  accumulator layout={tAcc.layout}", flush=True)
+        print(f"  accumulator mode sizes={cute.product_each(tAcc.shape)}", flush=True)
+        print(f"  epilogue tiler={epi_tile}", flush=True)
+        # Show precisely the source view currently used by the kernel.
+        view = tAcc[((None, None), 0, 0, None)]
+        print(f"  selected accumulator view={view.layout}", flush=True)
+        print(f"  selected M/N sizes={cute.product_each(view.shape)[:2]}", flush=True)
+        result = tmem_partition(self, tidx, tAcc, epi_tile, use_2cta_instrs)
+        print(f"  partition_S completed: {result[1].layout}", flush=True)
+        return result
+
+    def traced_make_tmem_copy(atom, tensor, *args, **kwargs):
+        # Observe the actual constructor call rather than reconstructing its
+        # arguments in the diagnostic (which could obscure the original bug).
+        print(f"  TMEM load atom={atom}", flush=True)
+        print(f"  make_tmem_copy source={tensor.layout}", flush=True)
+        result = make_tmem_copy(atom, tensor, *args, **kwargs)
+        print(f"  TMEM tiled copy before partition_S: {result}", flush=True)
+        return result
+
     GemmSm100._setup_attributes = traced_setup
     GemmSm100.epilog_smem_store_and_partition = traced_partition
+    GemmSm100.epilog_tmem_copy_and_partition = traced_tmem_partition
+    tcgen05.make_tmem_copy = traced_make_tmem_copy
     try:
         yield
     finally:
         GemmSm100._setup_attributes = setup
         GemmSm100.epilog_smem_store_and_partition = partition
+        GemmSm100.epilog_tmem_copy_and_partition = tmem_partition
+        tcgen05.make_tmem_copy = make_tmem_copy
 
 
 def profile_variant(variant, *, name, warmup):

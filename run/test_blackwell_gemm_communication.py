@@ -2,6 +2,7 @@
 
 import math
 import os
+from contextlib import ExitStack
 
 import pytest
 import torch
@@ -24,16 +25,20 @@ from wave_ready import build_wave_ready_prefix
 
 
 @pytest.fixture(scope="module", autouse=True)
-def bulk_column_window():
-    """Run the same numerical tests against an explicitly selected store window."""
+def blackwell_compile_settings():
+    """Apply process-local layout experiments and tracing before plans compile."""
     cols = os.environ.get("QUACK_TEST_BULK_SMEM_COLS")
-    if cols is None:
-        yield
-    else:
-        from blackwell_bench_utils import bulk_smem_cols
+    trace = os.environ.get("QUACK_PRINT_KERNEL_CONFIG") == "1"
+    with ExitStack() as contexts:
+        if cols is not None:
+            from blackwell_bench_utils import bulk_smem_cols
 
-        with bulk_smem_cols(int(cols)):
-            yield
+            contexts.enter_context(bulk_smem_cols(int(cols)))
+        if trace:
+            from blackwell_bench_utils import kernel_config_trace
+
+            contexts.enter_context(kernel_config_trace())
+        yield
 
 
 @pytest.fixture(autouse=True)
@@ -348,6 +353,35 @@ def test_multi_buffer_scatter_waves(cluster_m):
 def test_wide_tile_scatter_waves(tile_m):
     """Check every column after acquire, including the two-stripe N-warp mapping."""
     _check_multi_buffer_scatter_waves(cluster_m=2, tile_m=tile_m, tile_n=512)
+
+
+@pytest.mark.parametrize("tile_n", [256, 512])
+@pytest.mark.parametrize("store", ["tma", "bulk_rows"])
+def test_two_cta_wide_tmem_mapping(tile_n, store):
+    """Isolate two-CTA TMEM partitioning without gather, scatter or wave barriers.
+
+    One full M cluster and one fully predicated peer in the last cluster. Column
+    bands distinguish both halves of each MMA instruction and repeated MMA-N tiles.
+    """
+    m, k, n = 129, 64, tile_n
+    a = torch.zeros(m, k, device="cuda", dtype=torch.bfloat16)
+    a[:, 0] = 1
+    a[:, 1] = (torch.arange(m, device="cuda") % 7) / 8
+    w = torch.zeros(n, k, device="cuda", dtype=a.dtype)
+    columns = torch.arange(n, device="cuda")
+    w[:, 0] = (columns // 64 - 4) / 2 + (columns % 11) / 32
+    w[:, 1] = (columns % 5 + 1) / 4
+    storage = torch.full((m + 2, n), -123, device="cuda", dtype=a.dtype)
+    out = storage[1:-1]
+    reference = a.float() @ w.float().T
+    for _ in range(2):
+        out.fill_(float("nan"))
+        gemm(a, w, out, None, None, tile_M=128, tile_N=tile_n,
+             cluster_M=2, cluster_N=1, tile_K=64, max_swizzle_size=1,
+             is_dynamic_persistent=False, epilogue_store=store)
+        check(out, reference)
+        assert (storage[0] == -123).all().item()
+        assert (storage[-1] == -123).all().item()
 
 
 def _check_multi_buffer_scatter_waves(*, cluster_m, tile_m=128, tile_n=128):
