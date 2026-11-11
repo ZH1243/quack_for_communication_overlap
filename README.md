@@ -301,15 +301,85 @@ kernel path: table gather requires static persistence and does not support
 table-path overhead; compare identical configurations across revisions to check
 for regressions.
 
-The benchmark verifies every variant before timing, interleaves launches inside CUDA
-graphs, rotates variant order, and reports median microseconds, dense TFLOPS, and baseline
-drift. Variants share the same source allocation to control L2 effects; the numerical
-suite uses independent source allocations. Packing, table construction, and destination
-zeroing are excluded. The up-like
-benchmark measures plain projection to isolate gathering; fused SwiGLU is covered by the
-numerical suite. It does not measure RDMA/NVLink overlap. Use `--baseline-only` to measure
-the existing indexed-gather path separately, and compare the same configuration, data,
-and node conditions across revisions. No TFLOPS preservation claim has been measured yet.
+Additional feature comparisons are opt-in:
+
+| Flag | Comparison |
+| --- | --- |
+| `--packed-baseline` | Non-gather grouped GEMM on prepacked inputs, with the same expert shapes and weights; packing is outside timing. |
+| `--inline-indices` | Token indices embedded in descriptors versus the four-column table with separate indices. |
+| `--readiness` | Single/multi-buffer gather with ready-counter acquire checks versus the same path without checks. All rows are already available. |
+| `--stores` | TMA output versus bulk rows, row permutation, reduction with unique destinations, duplicate-destination reduction, multi-buffer addresses, and compact N-tile-major layout. |
+| `--waves` | Compact scatter-add with a completion barrier, then GPU ready-prefix publication; implies `--stores`. |
+| `--host-ready` | Adds mapped-host ready-prefix publication to GPU publication; implies `--waves`. |
+| `--swiglu` | Fused indexed/single-table/multi-table SwiGLU, without preactivation storage. `--n` is the full projection width; postactivation width is `N/2`. |
+
+Before collecting larger timings, exercise all comparisons on one small, ragged
+configuration. This checks values and graph replays; its timings are not a throughput
+benchmark:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python run/blackwell_gemm_communication_bench.py \
+  --k 64 --n 256 --buffers 3 --experts 2 \
+  --routes-per-buffer 129 --tokens-per-buffer 257 \
+  --tile-m 128 --tile-n 128 --cluster-m 2 \
+  --packed-baseline --inline-indices --readiness --host-ready --swiglu \
+  --warmup 1 --rounds 1 --repetitions 1
+```
+
+For example, measure the additional gather metadata and readiness checks with the
+same workload and tile as the larger-tile comparison:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python run/blackwell_gemm_communication_bench.py \
+  --k 4096 --n 1024 --buffers 16 --tile-m 256 --tile-n 512 --cluster-m 2 \
+  --packed-baseline --inline-indices --readiness
+```
+
+Measure down-like output stores and completion signaling together. Every variant,
+including both baselines, uses the specified `(256,256)` tile:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python run/blackwell_gemm_communication_bench.py \
+  --k 512 --n 4096 --buffers 16 --tile-m 256 --tile-n 256 --cluster-m 2 \
+  --packed-baseline --host-ready
+```
+
+For just the output-store comparisons, replace `--host-ready` with `--stores`.
+An explicit `--sm-count` applies to every variant in these comparisons. Wave group
+size must divide the resident cluster count; the benchmark reports the exact wave
+geometry and does not silently adjust the launch budget.
+
+Measure fused SwiGLU using the same projection width and weights for all paths:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python run/blackwell_gemm_communication_bench.py \
+  --k 4096 --n 1024 --buffers 16 --tile-m 256 --tile-n 512 --cluster-m 2 \
+  --packed-baseline --swiglu
+```
+
+The benchmark verifies numerical outputs on repeated eager launches and after graph
+replay, including completion counts and host flags. It interleaves individual launches
+inside CUDA graphs, rotates variant order, and reports median microseconds, useful
+GEMM TFLOPS, baseline drift, and two comparisons: `time/base` is relative to the first
+baseline; `vs control` is the percentage latency change relative to the named control.
+For example, `host ready prefix` uses `GPU ready prefix` as its control to isolate the
+added publication path. `indexed swiglu` versus plain GEMM includes both activation
+and the smaller output store; table SwiGLU variants have a fused SwiGLU control.
+
+Gather variants share the same physical source allocation; multi-destination outputs
+are views of one allocation to control allocation-placement effects. Independent
+allocations are covered by the numerical suite. Reductions pair randomly permuted
+routes into duplicate destinations; contention depends on this mapping. Packing,
+table construction, destination zeroing, and mapped-host flag resets are excluded.
+The wave path's mandatory GPU counter reset remains inside the measured call. TFLOPS
+counts `2 * total_routes * N * K`, including the full preactivation N for SwiGLU.
+
+Ready checks here measure the already-ready path, and completion tests have no
+concurrent consumer. Producer arrival delays, CPU polling, and RDMA/NVLink overlap
+require the two-node proxy benchmark. `--swiglu` does not accept `--sm-count` because
+the activation API does not expose that limit. Use `--baseline-only` to measure the
+existing indexed-gather path separately; compare identical configurations, data, and
+node conditions across revisions to check for regressions in ordinary GEMM.
 
 For proxy integration, use `device_capacity=10`, static persistence, `use_tma_gather=False`,
 and `pingpong=False`. The ready/table/scatter ABIs are the same as Hopper's. **MMA tile M
