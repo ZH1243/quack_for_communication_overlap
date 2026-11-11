@@ -801,8 +801,10 @@ class EpiMod:
         if gather_table:
             import torch
 
-            if get_device_capacity(A.device)[0] != 9:
-                raise ValueError("gather_work_table is currently supported only on Hopper (SM90)")
+            if get_device_capacity(A.device)[0] not in (9, 10, 11):
+                raise ValueError("gather_work_table requires SM90, SM100, or SM110")
+            if use_tma_gather:
+                raise ValueError("gather_work_table uses cp.async gather; disable use_tma_gather")
             if cu_seqlens_m is not None:
                 raise ValueError("cu_seqlens_m and gather_work_table are mutually exclusive")
             if not gather_A:
@@ -830,7 +832,7 @@ class EpiMod:
                 and gather_work_table.shape[1] != 4
             )
             expected_width = (
-                4 + tile_M * cluster_M
+                4 + cta_tile_shape_m(tile_M, cluster_M, get_device_capacity(A.device)[0]) * cluster_M
                 if indexed_gather
                 else (4 if gather_table_num_buffers == 1 else 2 + 2 * gather_table_num_buffers)
             )

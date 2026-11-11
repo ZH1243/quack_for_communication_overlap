@@ -2184,10 +2184,10 @@ def gemm_act(
     (``postact = act(alpha * A @ B + C + bias)``). It is applied in fp32 and
     may be a float or a 1-element CUDA tensor; 1.0 keeps the alpha-free epilogue.
 
-    On Hopper, ``gather_work_table`` selects the table-scheduled gather-A path.
+    On SM90/SM100, ``gather_work_table`` selects the table-scheduled gather-A path.
     Pass tensor sequences for ``A`` and ``A_idx`` together with
     ``multi_buffer_gather=True`` to gather from multiple independent buffers.
-    Single-buffer tables of width ``4 + tile_m * cluster_m`` instead contain
+    Single-buffer tables of width ``4 + cta_tile_m * cluster_m`` instead contain
     (expert_id, cid_n_base, output_start, output_end, token indices...).
     Consecutive N-group rows form each M-cluster bundle. Token slots have
     trailing -1 padding; output ranges are packed. A_idx supplies the actual

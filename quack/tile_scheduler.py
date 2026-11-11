@@ -1129,7 +1129,7 @@ class GatherTableTileSchedulerArguments:
 
 
 class GatherTableTileScheduler(TileScheduler):
-    """Persistent scheduler for Hopper grouped GEMM with fused gather-A.
+    """Persistent scheduler for SM90/SM100 grouped GEMM with fused gather-A.
 
     The ordinary scheduler record is ``(pid_m, pid_n, batch, valid)``. This
     specialization keeps the same 16-byte transport in legacy mode and publishes

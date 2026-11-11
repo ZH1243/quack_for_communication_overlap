@@ -240,9 +240,76 @@ PY
 The first run compiles the kernel and takes longer. This check passed on the B300 node
 with a maximum absolute error of approximately `4.88e-4`.
 
-This validates basic Blackwell GEMM. The custom gather-work-table, streaming-table, and
-bulk-row scatter paths used by `run/hopper_*.py` remain Hopper-only and require a separate
-Blackwell port.
+This validates basic Blackwell GEMM. The communication extensions below have a native
+Blackwell implementation, but still require compilation, numerical validation, and
+performance measurement on B300. The earlier basic-GEMM result does not validate them.
+
+### Blackwell communication GEMM validation
+
+The native SM100 kernel now accepts single-buffer/indexed and multi-buffer gather tables,
+streamed table readiness, fused table-gather SwiGLU, bulk-row copy/reduction, row scatter,
+multi-buffer destination addresses, compact N-tile-major output, and store-wave completion
+with GPU or mapped-host ready-prefix publication. These options retain the native
+`tcgen05`/TMEM mainloop. Table gathering uses `cp.async` for A and TMA for B; ordinary
+GEMMs keep their existing scheduler, index-prefetch pipeline, and TMA output path.
+
+Run these commands in the Blackwell Conda environment, from this repository root. Start
+with one numerical case, then run the suite (the first invocation compiles kernels):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m pytest -q run/test_blackwell_gemm_communication.py \
+  -k 'test_gather_table and 1-2-128' -x
+CUDA_VISIBLE_DEVICES=0 python -m pytest -q run/test_blackwell_gemm_communication.py -x
+```
+
+The suite compares output values to FP32 PyTorch references. It exercises empty experts,
+ragged routes, unused index capacity, 1/3/16 source buffers, 1-CTA and 2-CTA MMA, SwiGLU
+followed by down GEMM, duplicate scatter destinations, compact buffer strides, partial
+waves, repeated launches, graph replays, delayed H2D table publication, and concurrent
+GPU consumption after acquiring ready flags. `test_mapped_host_ready` also checks the
+mapped host flag. A hang or a compiler failure is a failure; retain the full traceback
+and test ID for diagnosis. For synchronization debugging, run the streaming and wave
+cases individually under a job timeout and Compute Sanitizer.
+
+Compare GEMM throughput after the numerical tests pass:
+
+```bash
+# Up-like GEMM; compares existing indexed gather, a single table, and 16-buffer gather.
+CUDA_VISIBLE_DEVICES=0 python run/blackwell_gemm_communication_bench.py \
+  --k 4096 --n 1024 --buffers 16 --cluster-m 2
+
+# Down-like GEMM; adds bulk-row copy and scatter-add, capped at 70 CTAs.
+CUDA_VISIBLE_DEVICES=0 python run/blackwell_gemm_communication_bench.py \
+  --k 512 --n 4096 --buffers 16 --cluster-m 1 --sm-count 70 --stores
+```
+
+The benchmark verifies every variant before timing, interleaves launches inside CUDA
+graphs, rotates variant order, and reports median microseconds, dense TFLOPS, and baseline
+drift. Variants share the same source allocation to control L2 effects; the numerical
+suite uses independent source allocations. Packing, table construction, and destination
+zeroing are excluded. The up-like
+benchmark measures plain projection to isolate gathering; fused SwiGLU is covered by the
+numerical suite. It does not measure RDMA/NVLink overlap. Use `--baseline-only` to measure
+the existing indexed-gather path separately, and compare the same configuration, data,
+and node conditions across revisions. No TFLOPS preservation claim has been measured yet.
+
+For proxy integration, use `device_capacity=10`, static persistence, `use_tma_gather=False`,
+and `pingpong=False`. The ready/table/scatter ABIs are the same as Hopper's. **MMA tile M
+and per-CTA M differ on Blackwell:** `tile_m=128, cluster_m=2` processes 64 rows per CTA
+and 128 per cluster; `tile_m=256, cluster_m=2` processes 128 per CTA and 256 per cluster.
+Use `quack.gemm_config.cta_tile_shape_m` when building descriptors and mapping rows.
+`run/blackwell_gemm_tables.py` demonstrates the conversion. Do not reuse a Hopper table
+whose cluster row span exceeds the selected Blackwell cluster's row span.
+
+Store-wave launches must use the same resident cluster count as the ready-prefix builder;
+the kernel launches cooperatively. Keep scatter destinations and mapped-host allocations
+alive until completion, and reset additive outputs and the host flag each iteration.
+The GEMM wrapper resets its GPU wave counter. Publication of streamed table rows requires
+the corresponding input data to be visible first, including the proxy's existing RDMA
+visibility handling. SM90 bulk-store diagnostic options (partial-row stores, double
+buffering, and swizzled bulk stores) remain SM90-only. The C++ proxy and its Hopper-named
+launch scripts have not been changed; their geometry/configuration migration and the
+two-node integration test remain separate validation steps.
 
 ## Bitmask token exchange on Hopper
 

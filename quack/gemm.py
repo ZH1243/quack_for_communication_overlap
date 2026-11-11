@@ -12,7 +12,7 @@ from cutlass.cute.runtime import make_ptr
 
 from quack.cache import jit_cache
 from quack.split_k_reduce import split_k_reduce
-from quack.gemm_config import SplitKMode
+from quack.gemm_config import SplitKMode, cta_tile_shape_m
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters, torch2cute_dtype_map
 from quack.gemm_default_epi import (
@@ -611,17 +611,17 @@ def gemm(
     # num_shards, first_shard) drive the shard-major rotated schedule and the
     # load-warp arrival gate.
     ag_args: Optional[AllGatherArguments] = None,
-    # Hopper table-scheduled gather-A. The legacy format is contiguous int32
+    # SM90/SM100 table-scheduled gather-A. The legacy format is contiguous int32
     # [Q, 4] rows containing (expert_id, route_start, route_end, cid_n_base).
     # See multi_buffer_gather below for the opt-in wider row format. Each row
     # expands to min(max_swizzle_size, ceil(N / tile_N)) AlongN work IDs.
-    # Single-buffer int32[Q, 4 + tile_M * cluster_M] selects direct X indices:
+    # Single-buffer int32[Q, 4 + cta_tile_M * cluster_M] selects direct X indices:
     # (expert_id, cid_n_base, output_start, output_end, token_idx_0, ...).
     # Consecutive N-group rows form one M-cluster bundle. Only token slots
     # have trailing -1 padding; output ranges are packed. A_idx is still
     # required for output sizing (length D.shape[0]), but its values are unused.
     gather_work_table: Optional[Tensor] = None,
-    # Opt-in Hopper table gather from separately allocated A/A_idx buffers.
+    # Opt-in table gather from separately allocated A/A_idx buffers.
     # When enabled, A and A_idx are tuples of equal length b >= 2. The table
     # format becomes (expert_id, cid_n_base, start_0, end_0, ..., start_b-1,
     # end_b-1), and D has sum_j len(A_idx_j) rows. The ordinary single-buffer
@@ -640,7 +640,7 @@ def gemm(
     # CUDA int64[1] containing a mapped host int32 pointer. Caller owns its lifetime
     # and resets it before launch. Publication uses system-scope release stores.
     wave_ready_host_address: Optional[Tensor] = None,
-    # SM90: stage the full D tile and issue one linear bulk copy/reduction per row.
+    # SM90/SM100: stage the full D tile and issue one linear bulk copy/reduction per row.
     # bulk_rows_reduce adds the converted epilogue result to D; callers must
     # initialize D (zero it before every launch for ordinary GEMM semantics).
     epilogue_store: str = "tma",
@@ -649,13 +649,13 @@ def gemm(
     # Values must be in [0, R). Duplicates require bulk_rows_reduce; bulk_rows
     # requires a permutation. Callers validate contents outside capture/timing.
     # Unreferenced rows retain their initial values (zero when D is zeroed).
-    # Only plain SM90 grouped bulk-row GEMM is supported.
+    # Only plain grouped bulk-row GEMM is supported.
     scatter_table: Optional[Tensor] = None,
     # D is a sequence of output buffers; scatter_table is int64[R] row addresses,
     # or int64[R, 2] (tile-0 address, tile stride bytes) for N-tile-major output,
     # from build_scatter_row_addresses. Keep all buffers alive through completion.
     multi_buffer_scatter: bool = False,
-    # SM90 scatter: each buffer is contiguous [ceil(N/tile_N), rows*tile_N].
+    # N-tile-major scatter: each buffer is contiguous [ceil(N/tile_N), rows*tile_N].
     # D.view(-1, R, tile_N).permute(1, 0, 2).reshape(R, -1)[:, :N]
     # restores logical values (may copy); reshaping alone does not. Padding
     # is untouched. N and the final segment must satisfy bulk's 16-byte alignment.
@@ -1117,7 +1117,7 @@ def _build_gemm_plan(
     if wave_store_counter is not None:
         if (
             gather_work_table is None
-            or not pingpong
+            or (get_device_capacity(A.device)[0] == 9 and not pingpong)
             or not persistent
             or is_dynamic_persistent
             or epilogue_store not in ("bulk_rows", "bulk_rows_reduce")
@@ -1128,7 +1128,7 @@ def _build_gemm_plan(
         ):
             raise ValueError(
                 "wave_store_counter requires a non-streaming, four-column gather table, "
-                "single-buffer gather, static persistence, pingpong, and bulk-row stores"
+                "single-buffer gather, static persistence, bulk-row stores, and pingpong on SM90"
             )
         if (
             wave_store_counter.shape != ((2,) if wave_ready_prefix is not None else (1,))
@@ -1193,8 +1193,10 @@ def _build_gemm_plan(
     if gather_work_table_ready is not None and not gather_table:
         raise ValueError("gather_work_table_ready requires gather_work_table")
     if gather_table:
-        if get_device_capacity(A.device)[0] != 9:
-            raise ValueError("gather_work_table is currently supported only on Hopper (SM90)")
+        if get_device_capacity(A.device)[0] not in (9, 10, 11):
+            raise ValueError("gather_work_table requires SM90, SM100, or SM110")
+        if use_tma_gather:
+            raise ValueError("gather_work_table uses cp.async gather; disable use_tma_gather")
         if not gather_A:
             raise ValueError("gather_work_table requires A_idx")
         if not persistent or is_dynamic_persistent:
@@ -1225,7 +1227,7 @@ def _build_gemm_plan(
             and gather_work_table.shape[1] != 4
         )
         expected_table_width = (
-            4 + tile_M * cluster_M
+            4 + cta_tile_shape_m(tile_M, cluster_M, get_device_capacity(A.device)[0]) * cluster_M
             if indexed_gather
             else (4 if gather_table_num_buffers == 1 else 2 + 2 * gather_table_num_buffers)
         )
@@ -1335,6 +1337,10 @@ def _build_gemm_plan(
         assert B.stride(-2) == 1, "varlen_k requires B to be n-major"
 
     device_capacity = get_device_capacity(A.device)
+    if device_capacity[0] != 9 and (
+        bulk_store_rows is not None or bulk_row_swizzle or bulk_row_double_buffer
+    ):
+        raise ValueError("bulk-row diagnostic options are SM90-only")
     if bulk_store_rows is not None:
         if epilogue_store not in ("bulk_rows", "bulk_rows_reduce"):
             raise ValueError("bulk_store_rows requires bulk-row stores")
@@ -1349,8 +1355,8 @@ def _build_gemm_plan(
     if epilogue_store not in ("tma", "bulk_rows", "bulk_rows_reduce"):
         raise ValueError("epilogue_store must be 'tma', 'bulk_rows', or 'bulk_rows_reduce'")
     if epilogue_store in ("bulk_rows", "bulk_rows_reduce"):
-        if device_capacity[0] != 9:
-            raise ValueError(f"{epilogue_store} epilogue requires SM90")
+        if device_capacity[0] not in (9, 10, 11):
+            raise ValueError(f"{epilogue_store} epilogue requires SM90, SM100, or SM110")
         if add_to_output or split_k != 1 or concat_layout:
             raise ValueError(
                 f"{epilogue_store} does not support add_to_output, split-K, or concat"

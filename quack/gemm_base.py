@@ -8,7 +8,7 @@ from typing import Callable, Dict, Literal, Optional, Sequence, Tuple, Type
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
-from cutlass import Boolean, Int32, const_expr
+from cutlass import Boolean, Int32, Int64, const_expr
 from cutlass.cute.nvgpu import cpasync
 from cutlass.utils import LayoutEnum
 
@@ -46,7 +46,7 @@ class NamedBarrierGemm(enum.IntEnum):
     # CLC-multicast throttle: CTA0 load warp arrives once per tile started,
     # CTA0 scheduler warp syncs once per CLC query (2 warps, 64 threads).
     ClcThrottle = enum.auto()
-    # The four Hopper gather-A load warps cooperatively publish and consume
+    # The four gather-A load warps cooperatively publish and consume
     # one prepared source-row address per destination row.
     GatherAddress = enum.auto()
 
@@ -79,7 +79,7 @@ class GemmBase:
     """Common non-mainloop pieces shared by GEMM architectures."""
 
     arch = 0
-    # Shared auxiliary stores inspect this flag; only SM90 enables table scheduling.
+    # Shared auxiliary stores inspect this flag for table-local output coordinates.
     gather_table = False
     bulk_row_store = False
     bulk_row_double_buffer = False
@@ -794,6 +794,81 @@ class GemmBase:
                         epi_store_pipeline.producer_tail()
         return epi_read_state, epi_producer_state
 
+    @cute.jit
+    def epilog_bulk_store_rows(self, sD, gD, tile_coord, len_m, tidx, scatter_rows=None):
+        """Called by all 32 store-warp lanes after the full-tile R2S fence/barrier.
+
+        Linear bulk copies do not apply a tensor descriptor's swizzle or OOB
+        handling. By default rows in sD are contiguous; bulk_row_swizzle instead
+        resolves each 16-byte chunk through the swizzled subtile layout.
+        The caller supplies a batch-offset ordinary GMEM tensor, and each lane
+        predicates its sequence-local row.
+        With scatter_rows, gD is the global output base and each lane uses its
+        prefetched destination indices, while keeping the same source bounds.
+        In address mode these registers instead hold int64 destination-row
+        pointers (already offset to this N tile for N-tile-major storage);
+        gD supplies only the dtype and column extent.
+        The host validates 16-byte alignment, including the final N tile width.
+        """
+        tile_m, tile_n = self.cta_tile_shape_mnk[:2]
+        row_start = tile_coord[0] * tile_m
+        col_start = tile_coord[1] * tile_n
+        store_bytes = cutlass.min(tile_n, gD.shape[1] - col_start) * (self.d_dtype.width // 8)
+        lane = tidx % cute.arch.WARP_SIZE
+        # Diagnostic ablation: retain full MMA/R2S staging and only shorten store issuance.
+        rows_to_store = const_expr(tile_m if self.bulk_store_rows is None else self.bulk_store_rows)
+        for row_block in cutlass.range_constexpr(cute.ceil_div(rows_to_store, cute.arch.WARP_SIZE)):
+            row = row_block * cute.arch.WARP_SIZE + lane
+            if row < rows_to_store and row_start + row < len_m and store_bytes > 0:
+                dst_row = row_start + row
+                if const_expr(scatter_rows is not None and not self.scatter_addresses):
+                    dst_row = scatter_rows[row_block]
+                if const_expr(self.n_tile_major_output and not self.scatter_addresses):
+                    # gD carries logical (routes, N), but storage is [ntiles, routes, tile_n].
+                    # Widen before multiplication for allocations exceeding 2 Gi elements.
+                    dst_ptr = gD.iterator + (
+                        Int64(tile_coord[1]) * gD.shape[0] + Int64(dst_row)
+                    ) * tile_n
+                elif const_expr(self.scatter_addresses):
+                    dst_ptr = cute.make_ptr(
+                        self.d_dtype,
+                        scatter_rows[row_block],
+                        gD.iterator.memspace,
+                        assumed_align=16,
+                    )
+                    if const_expr(not self.n_tile_major_output):
+                        dst_ptr = dst_ptr + col_start
+                else:
+                    dst_ptr = gD.iterator + cute.crd2idx((dst_row, col_start), gD.layout)
+                if const_expr(self.bulk_row_swizzle):
+                    # Standard TMA swizzles preserve order inside each 16-byte chunk.
+                    # All subtiles remain live, with N-subtile varying fastest.
+                    epi_m, epi_n = self.epi_tile
+                    chunk_elems = const_expr(128 // self.d_dtype.width)
+                    for chunk in cutlass.range(tile_n // chunk_elems):
+                        col = chunk * chunk_elems
+                        if chunk * 16 < store_bytes:
+                            stage = (row // epi_m) * (tile_n // epi_n) + col // epi_n
+                            offset = cute.crd2idx((row % epi_m, col % epi_n, stage), sD.layout)
+                            # Materialize the pointer swizzle before passing a raw address
+                            # to the linear bulk instruction (which cannot unswizzle).
+                            src_ptr = copy_utils.swizzle_ptr(sD.iterator + offset)
+                            copy_utils.cpasync_bulk_s2g(
+                                src_ptr,
+                                dst_ptr + col,
+                                16,
+                                reduction_kind="add" if const_expr(self.bulk_row_reduce) else None,
+                                dtype=self.d_dtype,
+                            )
+                else:
+                    copy_utils.cpasync_bulk_s2g(
+                        sD.iterator + row * tile_n,
+                        dst_ptr,
+                        store_bytes,
+                        reduction_kind="add" if const_expr(self.bulk_row_reduce) else None,
+                        dtype=self.d_dtype,
+                    )
+
     def get_scheduler_class(self, varlen_m: bool = False, gather_table: bool = False):
         """Return the scheduler class to use. Override in subclasses for custom schedulers."""
         if gather_table:
@@ -823,7 +898,7 @@ class GemmBase:
             else:
                 persistence_mode = PersistenceMode.STATIC
         if const_expr(scheduler_args.gather_table is not None):
-            assert self.arch == 90 and self.gather_A and self.is_persistent
+            assert self.arch in (90, 100, 110) and self.gather_A and self.is_persistent
             assert persistence_mode == PersistenceMode.STATIC
             num_clusters_n = cute.ceil_div(
                 cute.size(mB, mode=[0]),

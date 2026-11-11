@@ -823,10 +823,11 @@ def compile_gemm_kernel(
     if n_tile_major_output:
         split_k_kwargs["n_tile_major_output"] = True
     if epilogue_store != "tma":
-        assert device_capacity[0] == 9, "bulk_rows epilogue requires SM90"
+        assert device_capacity[0] in (9, 10, 11), "bulk_rows requires SM90, SM100, or SM110"
         assert split_k == 1, "bulk_rows epilogue does not support split-K"
         split_k_kwargs["epilogue_store"] = epilogue_store
     if bulk_store_rows is not None:
+        assert device_capacity[0] == 9, "bulk_store_rows diagnostic is SM90-only"
         split_k_kwargs["bulk_store_rows"] = bulk_store_rows
     if bulk_row_swizzle:
         assert device_capacity[0] == 9 and epilogue_store != "tma"
@@ -879,7 +880,7 @@ def compile_gemm_kernel(
             "gather_table": gather_table,
             "gather_table_num_buffers": gather_table_num_buffers,
         }
-        if device_capacity[0] == 9
+        if device_capacity[0] in (9, 10, 11)
         else {}
     )
     gemm_obj = GemmCls(
