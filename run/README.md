@@ -1,11 +1,58 @@
-# Hopper gather GEMM runners
+# Gather GEMM runners
 
-This directory contains four standalone benchmark runners for QuACK's grouped
-GEMM on NVIDIA Hopper GPUs (SM90). The original pair uses uniform
-Mixture-of-Experts (MoE) routing; the table-scheduled runner also supports
-uneven expert lengths.
+This directory contains standalone benchmark runners for QuACK's grouped GEMM.
+The Hopper runners target SM90; `blackwell_gather_gemm.py` targets B200/B300
+(SM10x). The indexed-gather runners use uniform Mixture-of-Experts (MoE) routing;
+the Hopper table-scheduled runner also supports uneven expert lengths.
 
 ## Scripts
+
+### `blackwell_gather_gemm.py`
+
+The Blackwell counterpart of the indexed Hopper gather runner. It shares input
+preparation, per-expert FP32 numerical references, and CUDA-graph timing with
+`hopper_gather_gemm.py`. It uses `A_idx` and `cu_seqlens_m`, with `cluster_n=1`
+and no A/B swapping. The runner constructs routing metadata automatically;
+there is no need to pass `--varlen_m` or `--gather_A`.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python run/blackwell_gather_gemm.py \
+    --tokens 8192 --hidden 2048 --output-dim 7168 \
+    --experts 1 --routes 8192 \
+    --tile-m 256 --tile-n 256 --cluster-m 2 \
+    --warmup 20 --iterations 100 --timing-samples 5
+```
+
+The default gather loader uses `cp.async`. Add `--use-tma-gather` (alias
+`--use_tma_gather`) to use Blackwell TMA gather4 with the same routing and math.
+Dynamic persistent scheduling is enabled by default; use
+`--no-dynamic-persistent` to compare static scheduling. Both modes use the
+SM100-family kernel, including on B300 devices reporting compute capability 10.3.
+
+Fused activations and an optional expert down projection are also available:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python run/blackwell_gather_gemm.py \
+    --tokens 4096 --hidden 2048 --output-dim 4096 \
+    --experts 8 --routes 8192 --activation swiglu --down-projection \
+    --use-tma-gather --warmup 20 --iterations 100 --timing-samples 5
+```
+
+For SwiGLU, the up weights have shape `[E, K, 2N]`; the activation output is
+`[R, N]`, and the down projection produces `[R, K]`. The down GEMM reads the
+expert-contiguous up output without gathering again. Output is not scattered
+or combined back into token order. Reported effective TFLOPS counts the up GEMM
+(including both gated projections) and, when enabled, the down GEMM; elapsed
+time also includes the fused activation. `--iterations` counts launches here,
+not milliseconds. Graph timing reuses the same buffers and excludes routing,
+compilation, warmup, and numerical validation.
+
+Hopper-only `--pingpong`, bulk-row stores, gather/scatter work tables, and
+streamed table readiness are not exposed by this runner. Numerical GPU coverage:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m pytest tests/test_blackwell_gather_runner.py -q
+```
 
 ### `hopper_gather_gemm.py`
 
@@ -184,7 +231,8 @@ not alter the ready-row prefix.
 
 ## Requirements
 
-- An NVIDIA Hopper GPU with compute capability 9.x (for example, H100)
+- Hopper scripts: an NVIDIA GPU with compute capability 9.x (for example, H100)
+- `blackwell_gather_gemm.py`: an NVIDIA B200/B300 GPU with compute capability 10.x
 - A working CUDA-enabled PyTorch installation
 - QuACK installed from this repository
 

@@ -84,12 +84,20 @@ class GatherInputs:
     output: torch.Tensor
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None, *, blackwell: bool = False) -> argparse.Namespace:
+    target = "Blackwell SM100-family" if blackwell else "Hopper SM90"
     parser = argparse.ArgumentParser(
         description=(
-            "Benchmark QuACK's SM90 GEMM with fused gather-A and an optional "
+            f"Benchmark QuACK's {target} GEMM with fused gather-A and an optional "
             "down projection for uniform MoE routing."
         )
+    )
+    parser.set_defaults(
+        device_capacity=10 if blackwell else 9,
+        use_tma_gather=False,
+        dynamic_persistent=False,
+        pingpong=False,
+        epilogue_store="tma",
     )
     parser.add_argument("--tokens", "-T", type=int, default=4096, help="Number of X rows (T)")
     parser.add_argument("--hidden", "-K", type=int, default=4096, help="Input dimension (K)")
@@ -130,18 +138,28 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--cluster-m", type=int, default=2)
     parser.add_argument("--max-swizzle-size", type=int, default=8)
-    parser.add_argument("--pingpong", action="store_true")
-    parser.add_argument(
-        "--epilogue-store",
-        choices=("tma", "bulk_rows", "bulk_rows_reduce"),
-        default="tma",
-        help=(
-            "Output I/O: tma uses the existing subtile tensor stores; bulk_rows stages "
-            "the full tile in SMEM and issues one linear cp.async.bulk per valid row "
-            "(plain GEMM only; supports --pingpong). bulk_rows_reduce uses per-row "
-            "reduce-add instead, with output zeroing excluded from timing."
-        ),
-    )
+    if blackwell:
+        parser.add_argument(
+            "--use-tma-gather", "--use_tma_gather", action="store_true",
+            help="Gather token rows using TMA gather4 instead of cp.async",
+        )
+        parser.add_argument(
+            "--dynamic-persistent", action=argparse.BooleanOptionalAction, default=True,
+            help="Use dynamic persistent scheduling (default); disable for static scheduling",
+        )
+    else:
+        parser.add_argument("--pingpong", action="store_true")
+        parser.add_argument(
+            "--epilogue-store",
+            choices=("tma", "bulk_rows", "bulk_rows_reduce"),
+            default="tma",
+            help=(
+                "Output I/O: tma uses the existing subtile tensor stores; bulk_rows stages "
+                "the full tile in SMEM and issues one linear cp.async.bulk per valid row "
+                "(plain GEMM only; supports --pingpong). bulk_rows_reduce uses per-row "
+                "reduce-add instead, with output zeroing excluded from timing."
+            ),
+        )
 
     parser.add_argument(
         "--routing-with-replacement",
@@ -166,7 +184,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--atol", type=float, default=3e-2)
     parser.add_argument("--rtol", type=float, default=1e-3)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -286,13 +304,13 @@ def make_launch(args: argparse.Namespace, inputs: GatherInputs):
             tile_n=args.tile_n,
             tile_k=args.tile_k,
             pingpong=args.pingpong,
-            is_dynamic_persistent=False,
+            is_dynamic_persistent=args.dynamic_persistent,
             cluster_m=args.cluster_m,
             cluster_n=1,  # Required by gather_A.
             cluster_k=1,
             max_swizzle_size=args.max_swizzle_size,
-            device_capacity=9,
-            use_tma_gather=False,
+            device_capacity=args.device_capacity,
+            use_tma_gather=args.use_tma_gather,
         )
 
     def launch() -> None:
@@ -305,7 +323,7 @@ def make_launch(args: argparse.Namespace, inputs: GatherInputs):
                 cu_seqlens_m=inputs.cu_seqlens_m,
                 A_idx=inputs.A_idx,
                 store_preact=False,
-                dynamic_scheduler=False,
+                dynamic_scheduler=args.dynamic_persistent,
                 tuned=False,
                 config=config,
                 # Use the common [all gate | all up] weight layout. QuACK
@@ -327,13 +345,11 @@ def make_launch(args: argparse.Namespace, inputs: GatherInputs):
                 cluster_K=1,
                 pingpong=args.pingpong,
                 persistent=True,
-                is_dynamic_persistent=False,
+                is_dynamic_persistent=args.dynamic_persistent,
                 max_swizzle_size=args.max_swizzle_size,
                 cu_seqlens_m=inputs.cu_seqlens_m,
                 A_idx=inputs.A_idx,
-                # Hopper gather-A uses QuACK's cp.async path. TMA gather4 is an
-                # SM100/SM110-only implementation in this repository.
-                use_tma_gather=False,
+                use_tma_gather=args.use_tma_gather,
                 epilogue_store=args.epilogue_store,
             )
 
@@ -356,7 +372,7 @@ def make_launch(args: argparse.Namespace, inputs: GatherInputs):
                 cluster_K=1,
                 pingpong=args.pingpong,
                 persistent=True,
-                is_dynamic_persistent=False,
+                is_dynamic_persistent=args.dynamic_persistent,
                 max_swizzle_size=args.max_swizzle_size,
                 cu_seqlens_m=inputs.cu_seqlens_m,
                 A_idx=None,
@@ -539,8 +555,8 @@ def gib(nbytes: int) -> float:
 
 
 @torch.inference_mode()
-def main() -> None:
-    args = parse_args()
+def run(args: argparse.Namespace) -> None:
+    """Shared routing, launch, validation and timing driver for SM90 and SM100."""
     validate_args(args)
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -548,9 +564,9 @@ def main() -> None:
     torch.cuda.set_device(args.device)
     device = torch.device("cuda", args.device)
     capability = torch.cuda.get_device_capability(device)
-    if capability[0] != 9:
+    if capability[0] != args.device_capacity:
         raise RuntimeError(
-            "This runner targets Hopper (SM90), but "
+            f"This runner targets compute capability {args.device_capacity}.x, but "
             f"device {args.device} has capability {capability}"
         )
 
@@ -582,14 +598,14 @@ def main() -> None:
         f"Routes: {args.routes} total, {routes_per_expert} per expert, "
         f"sampling {'with' if args.routing_with_replacement else 'without'} replacement"
     )
-    kernel_description = (
-        "up gather=cp.async, down input=expert-contiguous"
-        if args.down_projection
-        else "gather=cp.async"
-    )
+    gather_kind = "TMA gather4" if args.use_tma_gather else "cp.async"
+    kernel_description = f"gather={gather_kind}"
+    if args.down_projection:
+        kernel_description += ", down input=expert-contiguous"
     print(
         f"Kernel: tile=({args.tile_m}, {args.tile_n}, {args.tile_k or 'auto'}), "
-        f"cluster=({args.cluster_m}, 1, 1), persistent=True; {kernel_description}"
+        f"cluster=({args.cluster_m}, 1, 1), persistent=True, "
+        f"dynamic={args.dynamic_persistent}; {kernel_description}"
     )
     print(f"Fused activation: {args.activation or 'disabled'}")
     print(f"Epilogue store: {args.epilogue_store}, pingpong: {args.pingpong}")
@@ -649,6 +665,10 @@ def main() -> None:
                 "Reference check: PASSED "
                 f"(max error {max_up_error:.6g}, permitted {max_up_allowed:.6g})"
             )
+
+
+def main() -> None:
+    run(parse_args())
 
 
 if __name__ == "__main__":
