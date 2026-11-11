@@ -135,6 +135,115 @@ print("QuACK works:", y.shape, torch.cuda.get_device_name())
 PY
 ```
 
+## Blackwell node development environment (CUDA 12.9)
+
+The following setup was validated on a Linux x86_64 node with eight NVIDIA B300 GPUs
+(compute capability 10.3), driver 590.48.01, Python 3.12, PyTorch 2.13.0+cu129,
+and CUTLASS DSL 4.7.0. Run these commands on the remote Blackwell node.
+
+Check the GPUs and CPU architecture:
+
+```bash
+nvidia-smi
+uname -m
+```
+
+The `CUDA Version` shown by `nvidia-smi` describes the driver's CUDA support, not the
+CUDA version installed in the Python environment. The validated node reports CUDA 13.1
+there and runs this CUDA 12.9 environment successfully.
+
+Initialize Conda for the current shell and create a clean environment. Adjust the Miniconda
+path if necessary:
+
+```bash
+source ~/miniconda3/etc/profile.d/conda.sh
+conda create --name zh_quack_blackwell312 python=3.12 pip -y
+conda activate zh_quack_blackwell312
+python -m pip install --upgrade pip
+```
+
+Install the CUDA 12.9 PyTorch build and matching CUDA Python bindings:
+
+```bash
+python -m pip install "torch==2.13.0" \
+  --index-url https://download.pytorch.org/whl/cu129
+python -m pip install \
+  "cuda-python==12.9.4" \
+  "cuda-bindings==12.9.4"
+```
+
+Install this repository checkout in editable mode, replacing the path below with its
+location on the node. This installs the pinned CUTLASS DSL 4.7.0 dependency and uses source
+changes in new Python processes:
+
+```bash
+cd /path/to/quack_for_communication_overlap
+python -m pip install -e '.[dev]'
+python -m pip check
+```
+
+Optionally enable the development Git hooks with `pre-commit install`.
+
+Verify the package versions, source location, and GPU visibility:
+
+```bash
+python - <<'PY'
+from importlib.metadata import version
+
+import torch
+import quack
+
+assert torch.cuda.is_available(), "CUDA is unavailable"
+print("PyTorch:", torch.__version__)
+print("PyTorch CUDA:", torch.version.cuda)
+print("CUTLASS DSL:", version("nvidia-cutlass-dsl"))
+print("QuACK:", quack.__file__)
+print("Visible GPUs:", torch.cuda.device_count())
+print("GPU:", torch.cuda.get_device_name(0))
+print("Compute capability:", torch.cuda.get_device_capability(0))
+PY
+```
+
+Confirm that PyTorch reports CUDA `12.9` and that `quack.__file__` points into this checkout.
+Then run a numerical GEMM check on GPU 0, comparing against an FP32 reference with a BF16
+PyTorch baseline for tolerance:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python - <<'PY'
+import math
+
+import torch
+from quack.gemm_interface import gemm
+
+torch.manual_seed(0)
+m, n, k = 512, 512, 512
+a = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) / math.sqrt(k)
+b = torch.randn(k, n, device="cuda", dtype=torch.bfloat16) / math.sqrt(k)
+
+with torch.inference_mode():
+    out = gemm(a, b, tuned=False)
+    reference = a.float() @ b.float()
+    baseline = (a @ b).float()
+
+baseline_error = (baseline - reference).abs().max().item()
+torch.testing.assert_close(
+    out.float(), reference,
+    atol=max(1e-3, 2 * baseline_error),
+    rtol=1e-2,
+)
+
+print("QuACK GEMM: PASS")
+print("Max absolute error:", (out.float() - reference).abs().max().item())
+PY
+```
+
+The first run compiles the kernel and takes longer. This check passed on the B300 node
+with a maximum absolute error of approximately `4.88e-4`.
+
+This validates basic Blackwell GEMM. The custom gather-work-table, streaming-table, and
+bulk-row scatter paths used by `run/hopper_*.py` remain Hopper-only and require a separate
+Blackwell port.
+
 ## Bitmask token exchange on Hopper
 
 `run/hopper_stream_gather_table_gemm.py` supports an opt-in, one-time variable-size
