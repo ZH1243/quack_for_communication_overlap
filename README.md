@@ -525,9 +525,23 @@ done
 To isolate row-copy issuance, `--bulk-store-warps 1|2|4` distributes the same rows
 across existing epilogue warps. It keeps the window width, row-copy count, shared
 layout, A/B stages and block size fixed. With CTA M=128, one warp handles four
-rows per thread; four warps handle one each. The default is one warp. This is an
-opt-in experiment pending B300 performance validation, including possible
-register-allocation changes. It does not change the TMA store path.
+rows per thread; four warps handle one each. The default is one warp. On B300 BF16
+R=32768, K=7168, N=2048, tile=(256,512), cluster M=2, one padded 128-column buffer,
+the measured results were:
+
+| Issuing warps | TMA control (us) | Bulk rows (us) | Bulk TFLOPS | Overhead vs control |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 660.24 | 803.90 | 1196.8 | +21.76% |
+| 4 | 705.09 | 732.53 | 1313.4 | +3.89% |
+
+Both benchmark variants passed numerical checks. Bulk latency decreased 8.9%;
+normalizing against each run's TMA control gives a 14.7% decrease. The separate
+runs had different control timings and up to 6.7% within-run baseline drift, so
+the exact gain needs repeated measurements. Four issuing warps are the leading
+candidate for this shape; the feature benchmark below also passed. Broader
+numerical regression coverage and other shapes remain necessary before changing
+defaults. The TMA store path is
+unaffected. Register-allocation changes are still possible in bulk specializations.
 
 Scatter indices use the same row assignment. All issuing lanes drain their own
 async groups before SMEM reuse and kernel exit. With wave publication, an
@@ -552,6 +566,58 @@ for warps in 1 4; do
     --bulk-store-warps "$warps" --print-kernel-config
 done
 ```
+
+After the focused cases pass, validate the full communication test module with
+this specialization, then measure the scatter/reduction and publication paths:
+
+```bash
+QUACK_TEST_BULK_SMEM_COLS=128 QUACK_TEST_BULK_SMEM_BUFFERS=1 \
+QUACK_TEST_BULK_STORE_WARPS=4 QUACK_CACHE_ENABLED=0 CUDA_VISIBLE_DEVICES=0 \
+python -m pytest -q run/test_blackwell_gemm_communication.py -x
+
+QUACK_CACHE_ENABLED=0 CUDA_VISIBLE_DEVICES=0 \
+python run/blackwell_gemm_communication_bench.py \
+  --k 7168 --n 2048 --buffers 16 --tile-m 256 --tile-n 512 --cluster-m 2 \
+  --packed-baseline --host-ready \
+  --bulk-smem-padding 16 --bulk-smem-cols 128 --bulk-smem-buffers 1 \
+  --bulk-store-warps 4
+```
+
+The full benchmark compares 13 variants, including multi-destination reductions,
+compact output and GPU/mapped-host ready publication. These measurements exclude
+the proxy's network transfer and do not establish end-to-end proxy throughput.
+
+For the configuration above, the reported B300 run passed all 13 variants,
+including numerical checks after graph replays. Baseline round drift was 1.011:
+
+| Variant | Median us | TFLOPS | Latency vs packed baseline |
+| --- | ---: | ---: | ---: |
+| Packed baseline | 695.68 | 1382.9 | 1.000 |
+| Indexed baseline | 701.47 | 1371.5 | 1.008 |
+| Single table | 700.53 | 1373.4 | 1.007 |
+| Multi table | 700.82 | 1372.8 | 1.007 |
+| Bulk rows | 729.28 | 1319.2 | 1.048 |
+| Row scatter | 730.72 | 1316.6 | 1.050 |
+| Reduce unique | 724.99 | 1327.0 | 1.042 |
+| Scatter add | 723.97 | 1328.9 | 1.041 |
+| Multi-dest scatter add | 725.02 | 1327.0 | 1.042 |
+| Compact scatter add | 728.61 | 1320.4 | 1.047 |
+| Wave barrier | 736.16 | 1306.9 | 1.058 |
+| GPU ready prefix | 739.44 | 1301.1 | 1.063 |
+| Host ready prefix | 749.54 | 1283.6 | 1.077 |
+
+Bulk row stores add 4.10% latency relative to single-table TMA output. The final
+host-ready variant adds 7.74% relative to packed GEMM, retaining about 92.8% of its
+effective GEMM throughput. Wave synchronization plus GPU/host publication add
+20.93 us (2.87%) over compact scatter-add. Small negative adjacent differences
+do not establish that reductions are faster or free.
+
+The output-feature chain uses single-buffer input gather and multi-destination
+output; multi-buffer input gather is timed separately as `multi table`. This run
+does not include SwiGLU, delayed input readiness, packing, destination zeroing or
+network transfer. It also does not replace the regression tests with concurrent
+ready consumers or the two-node RDMA proxy test. The measured store settings are
+still explicit benchmark overrides, not new library defaults.
 
 For a native compiler crash during TMEM partitioning, set
 `QUACK_PRINT_KERNEL_CONFIG=1` and disable pytest output capture (`-s`). The trace
