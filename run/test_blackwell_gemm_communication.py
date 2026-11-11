@@ -23,6 +23,19 @@ from blackwell_gemm_tables import make_table
 from wave_ready import build_wave_ready_prefix
 
 
+@pytest.fixture(scope="module", autouse=True)
+def bulk_column_window():
+    """Run the same numerical tests against an explicitly selected store window."""
+    cols = os.environ.get("QUACK_TEST_BULK_SMEM_COLS")
+    if cols is None:
+        yield
+    else:
+        from blackwell_bench_utils import bulk_smem_cols
+
+        with bulk_smem_cols(int(cols)):
+            yield
+
+
 @pytest.fixture(autouse=True)
 def blackwell_device(monkeypatch):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
@@ -38,7 +51,8 @@ def blackwell_device(monkeypatch):
         install_gated_store_trace(monkeypatch)
 
 
-def inputs(buffers, *, k=144, n=384, dtype=torch.bfloat16, cluster_m=2, tile_m=128):
+def inputs(buffers, *, k=144, n=384, dtype=torch.bfloat16, cluster_m=2, tile_m=128,
+           tile_n=128):
     # Empty experts/buffers, nonaligned boundaries, repeated routes, partially
     # occupied two-CTA tiles, and poisoned capacity beyond valid index prefixes.
     counts = [[0, 0, 0, 0] if b == 1 else [1 + b % 3, 0, 67 + b, 131 - b]
@@ -52,7 +66,7 @@ def inputs(buffers, *, k=144, n=384, dtype=torch.bfloat16, cluster_m=2, tile_m=1
         idx = torch.full((capacity,), -987654, dtype=torch.int32, device="cuda")
         idx[:sum(cs)] = torch.randint(xs[b].shape[0], (sum(cs),), device="cuda", dtype=torch.int32)
         indices.append(idx)
-    rows, offsets = make_table(counts, n=n, tile_m=tile_m, cluster_m=cluster_m)
+    rows, offsets = make_table(counts, n=n, tile_m=tile_m, tile_n=tile_n, cluster_m=cluster_m)
     table = torch.tensor(rows, dtype=torch.int32, device="cuda")
     w = torch.randn(4, n, k, device="cuda", dtype=dtype) / math.sqrt(k)
     packed = []
@@ -65,10 +79,10 @@ def inputs(buffers, *, k=144, n=384, dtype=torch.bfloat16, cluster_m=2, tile_m=1
     return xs, tuple(indices), w, table, torch.cat(reference), packed, counts
 
 
-def launch(xs, indices, w, table, out, *, cluster_m=2, tile_m=128, **kw):
+def launch(xs, indices, w, table, out, *, cluster_m=2, tile_m=128, tile_n=128, **kw):
     multi = len(xs) > 1
     gemm(xs if multi else xs[0], w, out, None, None,
-         tile_M=tile_m, tile_N=128, cluster_M=cluster_m, cluster_N=1,
+         tile_M=tile_m, tile_N=tile_n, cluster_M=cluster_m, cluster_N=1,
          max_swizzle_size=1, is_dynamic_persistent=False, pingpong=False,
          A_idx=indices if multi else indices[0], gather_work_table=table,
          multi_buffer_gather=multi, **kw)
@@ -327,8 +341,20 @@ def _observe_ready(buffers: tuple, snapshots: tuple, ready: cute.Tensor, stream:
 
 @pytest.mark.parametrize("cluster_m", [1, 2])
 def test_multi_buffer_scatter_waves(cluster_m):
-    xs, idx, w, table, ref, _, _ = inputs(1, cluster_m=cluster_m)
-    r, n, tile_n = idx[0].numel(), w.shape[1], 128
+    _check_multi_buffer_scatter_waves(cluster_m=cluster_m)
+
+
+@pytest.mark.parametrize("tile_m", [128, 256])
+def test_wide_tile_scatter_waves(tile_m):
+    """Check every column after acquire, including the two-stripe N-warp mapping."""
+    _check_multi_buffer_scatter_waves(cluster_m=2, tile_m=tile_m, tile_n=512)
+
+
+def _check_multi_buffer_scatter_waves(*, cluster_m, tile_m=128, tile_n=128):
+    xs, idx, w, table, ref, _, _ = inputs(
+        1, cluster_m=cluster_m, tile_m=tile_m, tile_n=tile_n, n=3 * tile_n,
+    )
+    r, n = idx[0].numel(), w.shape[1]
     used = (17, 23, 31)  # Deliberately different logical sizes and allocation capacities.
     outputs = tuple(torch.zeros(n // tile_n, (rows + 7) * tile_n, dtype=xs[0].dtype,
                                  device="cuda") for rows in used)
@@ -351,7 +377,8 @@ def test_multi_buffer_scatter_waves(cluster_m):
     def run():
         for b in outputs:
             b.zero_()
-        launch(xs, idx, w, table, outputs, cluster_m=cluster_m, sm_count=10,
+        launch(xs, idx, w, table, outputs, cluster_m=cluster_m,
+               tile_m=tile_m, tile_n=tile_n, sm_count=10,
                epilogue_store="bulk_rows_reduce", scatter_table=addresses,
                multi_buffer_scatter=True, n_tile_major_output=True,
                wave_store_counter=counter, wave_ready_prefix=prefix)

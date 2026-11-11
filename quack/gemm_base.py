@@ -84,6 +84,7 @@ class GemmBase:
     bulk_row_store = False
     bulk_row_double_buffer = False
     bulk_row_swizzle = False
+    bulk_store_chunked = False
     # Elements between contiguous bulk-store rows; None keeps the dense tile pitch.
     bulk_store_smem_row_stride = None
     # Epilogue mixins that need a reduction over the full accumulator tile
@@ -329,8 +330,9 @@ class GemmBase:
         num_prev_subtiles = tile_scheduler.num_tiles_executed * epi_tile_num
         if const_expr(self.bulk_row_store):
             assert has_D and len(store_ctxs) == 1, "bulk_rows supports the primary D output only"
-            # A single full-tile buffer survives across all subtiles. Only
-            # wait at tile reuse, and only for the async reads of SMEM.
+            # Drain the previous tile's final use of the output buffer. The
+            # column-window path also drains at each reuse within this tile.
+            # Only async reads must finish before the next R2S writes.
             # All issuing lanes must wait on their own per-thread groups.
             if const_expr(not self.pingpong or self.bulk_row_double_buffer):
                 if is_tma_warp:
@@ -485,9 +487,18 @@ class GemmBase:
                 if const_expr(use_tma_epi):
                     epilogue_barrier.arrive_and_wait()
                 iket.range_pop()
+            elif const_expr(self.bulk_store_chunked):
+                if const_expr(epi_idx > 0 and epi_idx % self.epi_stage == 0):
+                    # Every issuing lane drains its reads before any epilogue
+                    # warp overwrites the previous column window in shared memory.
+                    if is_tma_warp:
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                    epilogue_barrier.arrive_and_wait()
             if const_expr(self.bulk_row_swizzle):
                 # Retain every TMA-layout subtile, ordered by logical (M, N).
                 epi_buffer = epi_coord[0] * epi_tile_shape[1] + epi_coord[1]
+            elif const_expr(self.bulk_store_chunked):
+                epi_buffer = (epi_coord[0], epi_coord[1] % self.bulk_store_subtiles_n)
             elif const_expr(self.bulk_row_store):
                 epi_buffer = epi_coord
             else:
@@ -520,6 +531,13 @@ class GemmBase:
                                 copy_out(src_idx=epi_buffer, dst_idx=epi_coord)
                     epi_store_pipeline.producer_commit()
                 iket.range_pop()
+            elif const_expr(self.bulk_store_chunked):
+                if const_expr((epi_idx + 1) % self.epi_stage == 0):
+                    cute.arch.fence_view_async_shared()
+                    epilogue_barrier.arrive_and_wait()
+                    if is_tma_warp:
+                        copy_D(chunk_idx=epi_idx // self.epi_stage)
+                        cute.arch.cp_async_bulk_commit_group()
             elif const_expr(not self.bulk_row_store):
                 epilogue_barrier.arrive_and_wait()
                 for i in cutlass.range_constexpr(len(store_ctxs)):
@@ -531,7 +549,7 @@ class GemmBase:
                             copy_out(src_idx=epi_buffer, dst_idx=epi_coord)
                 epilogue_barrier.arrive_and_wait()
 
-        if const_expr(self.bulk_row_store):
+        if const_expr(self.bulk_row_store and not self.bulk_store_chunked):
             iket.range_push("epi_store_issue")
             cute.arch.fence_view_async_shared()
             epilogue_barrier.arrive_and_wait()
@@ -797,8 +815,13 @@ class GemmBase:
         return epi_read_state, epi_producer_state
 
     @cute.jit
-    def epilog_bulk_store_rows(self, sD, gD, tile_coord, len_m, tidx, scatter_rows=None):
-        """Called by all 32 store-warp lanes after the full-tile R2S fence/barrier.
+    def epilog_bulk_store_rows(
+        self, sD, gD, tile_coord, len_m, tidx, scatter_rows=None,
+        col_offset: cutlass.Constexpr = 0,
+        smem_col_offset: cutlass.Constexpr = 0,
+        store_cols: cutlass.Constexpr = None,
+    ):
+        """Called by all 32 store-warp lanes after the output R2S fence/barrier.
 
         Linear bulk copies do not apply a tensor descriptor's swizzle or OOB
         handling. Each row in sD is contiguous, with an optional padded row pitch;
@@ -812,14 +835,17 @@ class GemmBase:
         pointers (already offset to this N tile for N-tile-major storage);
         gD supplies only the dtype and column extent.
         The host validates 16-byte alignment, including the final N tile width.
+        SM100 column windows supply separate global/shared column offsets and a
+        bounded copy width; scatter addresses still refer to the original N tile.
         """
         tile_m, tile_n = self.cta_tile_shape_mnk[:2]
         smem_row_stride = const_expr(
             tile_n if self.bulk_store_smem_row_stride is None else self.bulk_store_smem_row_stride
         )
         row_start = tile_coord[0] * tile_m
-        col_start = tile_coord[1] * tile_n
-        store_bytes = cutlass.min(tile_n, gD.shape[1] - col_start) * (self.d_dtype.width // 8)
+        col_start = tile_coord[1] * tile_n + col_offset
+        copy_cols = const_expr(tile_n if store_cols is None else store_cols)
+        store_bytes = cutlass.min(copy_cols, gD.shape[1] - col_start) * (self.d_dtype.width // 8)
         lane = tidx % cute.arch.WARP_SIZE
         # Diagnostic ablation: retain full MMA/R2S staging and only shorten store issuance.
         rows_to_store = const_expr(tile_m if self.bulk_store_rows is None else self.bulk_store_rows)
@@ -834,7 +860,7 @@ class GemmBase:
                     # Widen before multiplication for allocations exceeding 2 Gi elements.
                     dst_ptr = gD.iterator + (
                         Int64(tile_coord[1]) * gD.shape[0] + Int64(dst_row)
-                    ) * tile_n
+                    ) * tile_n + col_offset
                 elif const_expr(self.scatter_addresses):
                     dst_ptr = cute.make_ptr(
                         self.d_dtype,
@@ -844,6 +870,8 @@ class GemmBase:
                     )
                     if const_expr(not self.n_tile_major_output):
                         dst_ptr = dst_ptr + col_start
+                    else:
+                        dst_ptr = dst_ptr + col_offset
                 else:
                     dst_ptr = gD.iterator + cute.crd2idx((dst_row, col_start), gD.layout)
                 if const_expr(self.bulk_row_swizzle):
@@ -868,7 +896,7 @@ class GemmBase:
                             )
                 else:
                     copy_utils.cpasync_bulk_s2g(
-                        sD.iterator + row * smem_row_stride,
+                        sD.iterator + row * smem_row_stride + smem_col_offset,
                         dst_ptr,
                         store_bytes,
                         reduction_kind="add" if const_expr(self.bulk_row_reduce) else None,

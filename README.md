@@ -399,7 +399,7 @@ compilation and are restored afterwards; they do not insert device instrumentati
 Disabling the QuACK object cache is required so compilation actually runs the hooks.
 Layout byte counts exclude barriers, auxiliary outputs and allocation padding.
 
-SM100 bulk stores stage the entire CTA output tile so each row can be issued as one
+By default, SM100 bulk stores stage the entire CTA output tile so each row can be issued as one
 contiguous bulk copy or reduction. This consumes more shared memory than the TMA
 subtile ring. For the `(256,256)` and `(256,512)` BF16 configurations above, the
 observed A/B pipeline depths are respectively 5 versus 6, and 2 versus 4. Padding
@@ -431,6 +431,53 @@ respectively. The A/B stage counts should match their padding-disabled controls.
 `test_bulk_store_padded_rows` covers N tails, a partial M cluster, row scatter,
 reduction and repeated launches with guarded output storage. Throughput benefits
 must be measured on the GPU; the address mapping alone does not quantify them.
+
+An opt-in experiment, `--bulk-smem-cols 128`, retains only a 128-column shared-memory
+window and issues its row segments before reusing that buffer. The stage planner
+then budgets the smaller output allocation. For the BF16 configuration above this
+should restore A/B depths to 6 at tile N=256 and 4 at tile N=512, with about 34 KiB
+of padded output storage per CTA. The tradeoff is additional row-copy instructions
+and synchronization. Full-tile staging remains the default until GPU measurements
+establish which is faster. A limit of 0 explicitly selects that default; for other
+tile widths, the actual window is the GCD of the limit and tile N and must contain
+whole epilogue subtiles.
+
+The window path preserves the two separated N stripes used by two-CTA M=128 GEMMs,
+row/scatter destination offsets, and compact N-tile-major strides. Before shared
+memory reuse, all issuing lanes wait for source reads and synchronize with the
+epilogue warps. Ready publication still waits for **destination writes from all
+windows**, using the existing wave-completion protocol. The distinction between
+read completion and full completion is defined by
+[PTX bulk wait-group semantics](https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async-bulk-wait-group).
+
+Check the experimental path on B300 before timing it. The test-only environment
+setting is applied before any plans compile and requires the object cache disabled:
+
+```bash
+QUACK_TEST_BULK_SMEM_COLS=128 QUACK_CACHE_ENABLED=0 CUDA_VISIBLE_DEVICES=0 \
+python -m pytest -q \
+  'run/test_blackwell_gemm_communication.py::test_bulk_store_padded_rows[bulk_rows-512]' \
+  'run/test_blackwell_gemm_communication.py::test_wide_tile_scatter_waves[128]' \
+  'run/test_blackwell_gemm_communication.py::test_wide_tile_scatter_waves[256]' -x
+```
+
+The wide-tile tests check duplicate scatter reductions into independent compact
+buffers, concurrent consumers acquiring ready prefixes, and graph replays. To
+compare full-tile and window staging while keeping padding fixed:
+
+```bash
+for cols in 0 128; do
+  QUACK_CACHE_ENABLED=0 CUDA_VISIBLE_DEVICES=0 \
+  python run/blackwell_gemm_communication_bench.py \
+    --k 7168 --n 2048 --buffers 16 --tile-m 256 --tile-n 512 --cluster-m 2 \
+    --stores --variants "single table" "bulk rows" \
+    --bulk-smem-padding 16 --bulk-smem-cols "$cols" --print-kernel-config
+done
+```
+
+Inspect the compiled A/B stages and buffered-column counts, then compare each bulk
+timing against its TMA control. Repeat in reverse order to assess clock drift. The
+same window flag also applies to `--host-ready` for testing all store features.
 
 For hardware profiling, `--profile-variant` checks and warms one enabled variant,
 then performs one eager call in the `quack_profile` NVTX push/pop range. It checks the

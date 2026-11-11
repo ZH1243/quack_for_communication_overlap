@@ -55,6 +55,27 @@ def bulk_smem_padding(bytes_per_row):
 
 
 @contextmanager
+def bulk_smem_cols(max_cols):
+    """Opt-in column-window experiment, selected before compiling any plans."""
+    from quack.cache import CACHE_ENABLED
+    from quack.gemm_sm100 import GemmSm100
+
+    if CACHE_ENABLED:
+        raise ValueError(
+            "bulk SMEM window overrides require QUACK_CACHE_ENABLED=0 before Python starts"
+        )
+    if max_cols not in (0, 64, 128, 256):
+        raise ValueError("bulk SMEM column limit must be 0 (full tile), 64, 128, or 256")
+    previous = GemmSm100.bulk_store_smem_max_cols
+    GemmSm100.bulk_store_smem_max_cols = max_cols
+    try:
+        print(f"Bulk SMEM column limit: {max_cols or 'full tile'}", flush=True)
+        yield
+    finally:
+        GemmSm100.bulk_store_smem_max_cols = previous
+
+
+@contextmanager
 def kernel_config_trace():
     """Print specialization/layout metadata during compilation; no device tracing."""
     from quack.cache import CACHE_ENABLED
@@ -87,6 +108,10 @@ def kernel_config_trace():
         if self.bulk_row_store:
             print(f"  bulk row padding={self.bulk_store_smem_padding_bytes_used} bytes, "
                   f"SMEM row stride={self.bulk_store_smem_row_stride} elements", flush=True)
+            print(f"  bulk buffered columns={self.bulk_store_smem_cols}, "
+                  f"windows/tile={self.cta_tile_shape_mnk[1] // self.bulk_store_smem_cols}, "
+                  f"stripes/window={self.bulk_store_stripes if self.bulk_store_chunked else 1}",
+                  flush=True)
         return result
 
     def traced_partition(self, tiled_copy_t2r, d_layout, dtype, tTR_rD, sD, tidx):
