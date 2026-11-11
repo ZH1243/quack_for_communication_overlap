@@ -1014,13 +1014,20 @@ class TileStore(EpiOp):
             # M=64 with 2-CTA MMA puts two epilogue warps along N. Reusing
             # the full-width copy leaves their N offsets unhalved: partition_D
             # on the smaller postact tile can then alias another row/stage.
-            # Each gated register consumes source values (2*v, 2*v+1).
-            # Select the even value and map (m, n) -> (m, n//2), including
-            # the N component of the thread mapping, not just value extents.
-            # These are compile-time layout operations; no shuffle is needed.
             assert isinstance(copy_atom_r2s.op, cute.nvgpu.CopyUniversalOp)
             tv = tiled_copy_r2s.layout_src_tv_tiled
             tile_m, tile_n = (cute.size(t) for t in tiled_copy_r2s.tiler_mn)
+            # TV maps to coordinates INSIDE the copy's tiler. TMEM can use
+            # permuted tilers, e.g. (2,32):(32,1) for both M and N. Apply
+            # those permutations before interpreting the result as m + M*n;
+            # discarding them aliases N warps and turns row 32 into row 1.
+            tile_to_mn = cute.composition(
+                cute.make_layout((tile_m, tile_n)), tiled_copy_r2s.tiler_mn
+            )
+            tv = cute.composition(tile_to_mn, tv)
+            # Each gated register consumes source values (2*v, 2*v+1).
+            # Select the even value and map (m, n) -> (m, n//2), including
+            # the thread offsets. All of this is compile-time layout algebra.
             threads, values = cute.size(tv, mode=[0]), cute.size(tv, mode=[1])
             assert tile_n % 2 == 0 and values % 2 == 0
             even_values = cute.make_layout((threads, values // 2), stride=(1, 2 * threads))

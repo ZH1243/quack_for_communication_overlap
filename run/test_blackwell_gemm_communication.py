@@ -10,12 +10,14 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32
 from cutlass.cute.runtime import from_dlpack
+from cutlass.utils import LayoutEnum
 from cuda.bindings import driver as cuda
 
 from quack.cute_dsl_utils import get_max_active_clusters
 from quack.gemm import build_scatter_row_addresses, gemm
 from quack.gemm_config import GemmConfig, cta_tile_shape_m
 from quack.gemm_interface import gemm_act
+from quack.epilogue.ops import TileStore
 
 from blackwell_gemm_tables import make_table
 from wave_ready import build_wave_ready_prefix
@@ -135,6 +137,64 @@ def test_swiglu_and_down(cluster_m):
     ref = torch.cat([up[offsets[0][e]:offsets[0][e + 1]].float() @ wd[e].float().T
                      for e in range(4)])
     check(out, ref)
+
+
+class _GatedStoreCoordinateProbe:
+    """Exercise the production store mapping with the permuted tiler from B300."""
+
+    def __init__(self, tile_n):
+        self.tile_n = tile_n
+        self.arch = 100
+        self.acc_dtype = cutlass.Float32
+        self._tile_store_dtype_postact = cutlass.BFloat16
+        self._tile_store_layout_postact = LayoutEnum.ROW_MAJOR
+        self.store = TileStore("postact", gated=True)
+
+    def epi_smem_warp_shape_mnk(self):
+        return (2, 2, 1)
+
+    @cute.jit
+    def __call__(self, coordinates: cute.Tensor, stream: cuda.CUstream):
+        self.kernel(coordinates).launch(grid=(1, 1, 1), block=(128, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(self, coordinates: cute.Tensor):
+        tid = cute.arch.thread_idx()[0]
+        n = self.tile_n
+        atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16)
+        # Captured native SM100 R2S layout: TV indices are in the permuted
+        # tiler's domain, so its raw offsets are NOT logical matrix offsets.
+        tiler = (
+            cute.make_layout((2, 32), stride=(32, 1)),
+            cute.make_layout((2, n // 2), stride=(n // 2, 1)),
+        )
+        tv = cute.make_layout(((32, 2, 2), (n // 2, 1)), stride=((2, 1, 64), (128, 0)))
+        full_copy = cute.make_tiled_copy(atom, tv, tiler)
+        half_copy = self.store._make_tiled_copy_r2s(self, None, full_copy, full_copy)
+        full = full_copy.get_slice(tid).partition_D(cute.make_identity_tensor((64, n)))
+        half = half_copy.get_slice(tid).partition_D(cute.make_identity_tensor((64, n // 2)))
+        for i in cutlass.range_constexpr(n // 4):
+            src, dst = full[2 * i], half[i]
+            coordinates[tid, i, 0] = src[0]
+            coordinates[tid, i, 1] = src[1]
+            coordinates[tid, i, 2] = dst[0]
+            coordinates[tid, i, 3] = dst[1]
+
+
+@pytest.mark.parametrize("tile_n", [32, 64, 128])
+def test_swiglu_two_cta_copy_coordinates(tile_n):
+    """Check every lane/value's destination, including N-warp separation."""
+    coordinates = torch.full((128, tile_n // 4, 4), -1, device="cuda", dtype=torch.int32)
+    arg = from_dlpack(coordinates)
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    kernel = cute.compile(_GatedStoreCoordinateProbe(tile_n), arg, stream)
+    kernel(arg, stream)
+    tid = torch.arange(128, device="cuda", dtype=torch.int32)[:, None]
+    value = torch.arange(tile_n // 4, device="cuda", dtype=torch.int32)[None, :]
+    row = (tid % 64).expand(128, tile_n // 4)
+    col = (tid // 64) * (tile_n // 2) + 2 * value
+    reference = torch.stack((row, col, row, col // 2), dim=-1)
+    torch.testing.assert_close(coordinates, reference, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("table_gather", [False, True])
