@@ -207,6 +207,8 @@ class GemmSm100(GemmTmaBase):
     bulk_store_smem_padding_bytes = 16
     # Experimental column-window limit. Zero retains full-tile output staging.
     bulk_store_smem_max_cols = 0
+    # Split that allocation into independently reusable windows (opt-in).
+    bulk_store_buffer_count = 1
 
     EpilogueArguments = GemmTmaBase.EpilogueArguments
     EpilogueParams = GemmTmaBase.EpilogueParams
@@ -584,6 +586,7 @@ class GemmSm100(GemmTmaBase):
         )
         self.bulk_store_smem_cols = self.cta_tile_shape_mnk[1]
         if self.bulk_row_store:
+            assert self.bulk_store_buffer_count in (1, 2)
             self.bulk_store_stripes = (
                 2 if self.cta_tile_shape_mnk[0] == 64 and self.use_2cta_instrs else 1
             )
@@ -592,17 +595,29 @@ class GemmSm100(GemmTmaBase):
                 self.mma_inst_shape_mnk[1] if self.bulk_store_stripes == 2
                 else self.cta_tile_shape_mnk[1]
             )
+            self.bulk_store_window_cols = (
+                self.bulk_store_smem_cols // self.bulk_store_buffer_count
+            )
             if self.bulk_store_smem_max_cols > 0:
-                self.bulk_store_smem_cols = math.gcd(
-                    self.bulk_store_group_n, self.bulk_store_smem_max_cols
+                self.bulk_store_window_cols = min(
+                    math.gcd(
+                        self.bulk_store_group_n,
+                        self.bulk_store_smem_max_cols // self.bulk_store_buffer_count,
+                    ),
+                    self.cta_tile_shape_mnk[1] // self.bulk_store_buffer_count,
                 )
-            self.bulk_store_chunked = self.bulk_store_smem_cols < self.cta_tile_shape_mnk[1]
+                self.bulk_store_smem_cols = (
+                    self.bulk_store_window_cols * self.bulk_store_buffer_count
+                )
+            self.bulk_store_chunked = self.bulk_store_window_cols < self.cta_tile_shape_mnk[1]
             epi_n = cute.size(self.epi_tile[1])
-            assert self.bulk_store_smem_cols % epi_n == 0, (
-                "bulk SMEM window must contain whole epilogue subtiles"
+            assert self.bulk_store_window_cols % epi_n == 0, (
+                "each bulk SMEM buffer must contain whole epilogue subtiles; "
+                "increase the column limit or use one buffer"
             )
             self.bulk_store_subtiles_n = self.bulk_store_smem_cols // epi_n
             if self.bulk_store_chunked:
+                assert self.bulk_store_group_n % self.bulk_store_window_cols == 0
                 assert self.epi_m_major, "bulk column windows require M-major epilogue traversal"
                 assert cute.cosize(self.epi_tile[1]) == (
                     (self.bulk_store_stripes - 1)
@@ -682,8 +697,8 @@ class GemmSm100(GemmTmaBase):
                 assert self.d_dtype in (cutlass.Float16, cutlass.BFloat16, cutlass.Float32)
                 tile_m, tile_n = self.cta_tile_shape_mnk[:2]
                 epi_m, epi_n = (cute.size(t) for t in self.epi_tile)
-                # Bulk copies need contiguous row segments; retain a full tile
-                # by default, or one column window when explicitly requested.
+                # Bulk copies need contiguous row segments. Ring buffers sit
+                # side by side in each row and share its one padding region.
                 assert tile_m % epi_m == 0 and tile_n % epi_n == 0
                 # Keep the tiler's strides: with 2-CTA M=64, one subtile
                 # covers two separated N ranges (e.g. 0:32 and 64:96).
@@ -703,7 +718,7 @@ class GemmSm100(GemmTmaBase):
                         cute.coalesce(
                             cute.make_layout(
                                 (epi_n // stripe_n, stripe_n),
-                                stride=(1, self.bulk_store_smem_cols // stripe_n),
+                                stride=(1, self.bulk_store_window_cols // stripe_n),
                             )
                         ),
                     )
@@ -2303,10 +2318,13 @@ class GemmSm100(GemmTmaBase):
         chunk_idx: cutlass.Constexpr = 0,
     ):
         if const_expr(self.bulk_store_chunked):
-            stripe_cols = const_expr(self.bulk_store_smem_cols // self.bulk_store_stripes)
-            windows_per_group = const_expr(self.bulk_store_group_n // self.bulk_store_smem_cols)
+            stripe_cols = const_expr(self.bulk_store_window_cols // self.bulk_store_stripes)
+            windows_per_group = const_expr(self.bulk_store_group_n // self.bulk_store_window_cols)
             group_start = const_expr((chunk_idx // windows_per_group) * self.bulk_store_group_n)
             window_start = const_expr((chunk_idx % windows_per_group) * stripe_cols)
+            buffer_start = const_expr(
+                (chunk_idx % self.bulk_store_buffer_count) * self.bulk_store_window_cols
+            )
             for stripe in cutlass.range_constexpr(self.bulk_store_stripes):
                 self.epilog_bulk_store_rows(
                     sD, gD, tile_coord, len_m, tidx, scatter_rows,
@@ -2314,7 +2332,7 @@ class GemmSm100(GemmTmaBase):
                         group_start + stripe * (self.bulk_store_group_n // self.bulk_store_stripes)
                         + window_start
                     ),
-                    smem_col_offset=stripe * stripe_cols,
+                    smem_col_offset=buffer_start + stripe * stripe_cols,
                     store_cols=stripe_cols,
                 )
         else:

@@ -480,6 +480,44 @@ Inspect the compiled A/B stages and buffered-column counts, then compare each bu
 timing against its TMA control. Repeat in reverse order to assess clock drift. The
 same window flag also applies to `--host-ready` for testing all store features.
 
+`--bulk-smem-buffers 2` splits the column budget into two reusable buffers instead
+of the default one. With `--bulk-smem-cols 128`, tile N=512 and the configuration
+above, this means two 64-column windows sharing the same padded row pitch. Both
+modes allocate 34,800 bytes for D and retain four A/B stages. Each buffer must
+contain whole epilogue subtiles. For other tile widths the per-buffer width is the
+GCD of the instruction group width and the per-buffer column limit.
+
+The two-buffer path uses `cp.async.bulk.wait_group.read 1` before overwriting the
+older buffer, so reads from the newer buffer may remain outstanding. Every store
+lane commits a group even for a fully predicated window to preserve buffer/group
+age. A wait for all reads still protects reuse across persistent tiles, and full
+write completion still precedes wave-ready publication. More windows also mean
+more row-copy instructions; this is an opt-in performance experiment, not a
+measured speedup. It does not change the TMA epilogue or the default bulk path.
+
+First check partial output windows, buffer reuse and concurrent ready consumers:
+
+```bash
+QUACK_TEST_BULK_SMEM_COLS=128 QUACK_TEST_BULK_SMEM_BUFFERS=2 \
+QUACK_CACHE_ENABLED=0 CUDA_VISIBLE_DEVICES=0 python -m pytest -q \
+  'run/test_blackwell_gemm_communication.py::test_bulk_store_padded_rows[bulk_rows-512]' \
+  'run/test_blackwell_gemm_communication.py::test_wide_tile_scatter_waves[128]' \
+  'run/test_blackwell_gemm_communication.py::test_wide_tile_scatter_waves[256]' -x
+```
+
+Then compare one and two buffers with the same total output-storage budget:
+
+```bash
+for count in 1 2; do
+  QUACK_CACHE_ENABLED=0 CUDA_VISIBLE_DEVICES=0 \
+  python run/blackwell_gemm_communication_bench.py \
+    --k 7168 --n 2048 --buffers 16 --tile-m 256 --tile-n 512 --cluster-m 2 \
+    --stores --variants "single table" "bulk rows" \
+    --bulk-smem-padding 16 --bulk-smem-cols 128 --bulk-smem-buffers "$count" \
+    --print-kernel-config
+done
+```
+
 For a native compiler crash during TMEM partitioning, set
 `QUACK_PRINT_KERNEL_CONFIG=1` and disable pytest output capture (`-s`). The trace
 prints and flushes the MMA instruction shape, full accumulator layout, selected

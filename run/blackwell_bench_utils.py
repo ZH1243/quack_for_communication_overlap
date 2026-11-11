@@ -76,6 +76,25 @@ def bulk_smem_cols(max_cols):
 
 
 @contextmanager
+def bulk_smem_buffers(count):
+    """Split the column budget into one or two reusable output buffers."""
+    from quack.cache import CACHE_ENABLED
+    from quack.gemm_sm100 import GemmSm100
+
+    if CACHE_ENABLED:
+        raise ValueError("bulk SMEM buffer overrides require QUACK_CACHE_ENABLED=0")
+    if count not in (1, 2):
+        raise ValueError("bulk SMEM buffer count must be 1 or 2")
+    previous = GemmSm100.bulk_store_buffer_count
+    GemmSm100.bulk_store_buffer_count = count
+    try:
+        print(f"Bulk SMEM buffers: {count} within the total column budget", flush=True)
+        yield
+    finally:
+        GemmSm100.bulk_store_buffer_count = previous
+
+
+@contextmanager
 def kernel_config_trace():
     """Print specialization/layout metadata during compilation; no device tracing."""
     from quack.cache import CACHE_ENABLED
@@ -114,7 +133,9 @@ def kernel_config_trace():
             print(f"  bulk row padding={self.bulk_store_smem_padding_bytes_used} bytes, "
                   f"SMEM row stride={self.bulk_store_smem_row_stride} elements", flush=True)
             print(f"  bulk buffered columns={self.bulk_store_smem_cols}, "
-                  f"windows/tile={self.cta_tile_shape_mnk[1] // self.bulk_store_smem_cols}, "
+                  f"buffers={self.bulk_store_buffer_count}, "
+                  f"columns/window={self.bulk_store_window_cols}, "
+                  f"windows/tile={self.cta_tile_shape_mnk[1] // self.bulk_store_window_cols}, "
                   f"stripes/window={self.bulk_store_stripes if self.bulk_store_chunked else 1}",
                   flush=True)
         return result

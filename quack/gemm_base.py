@@ -491,11 +491,17 @@ class GemmBase:
                     epilogue_barrier.arrive_and_wait()
                 iket.range_pop()
             elif const_expr(self.bulk_store_chunked):
-                if const_expr(epi_idx > 0 and epi_idx % self.epi_stage == 0):
-                    # Every issuing lane drains its reads before any epilogue
-                    # warp overwrites the previous column window in shared memory.
+                if const_expr(
+                    epi_idx >= self.epi_stage
+                    and epi_idx % (self.epi_stage // self.bulk_store_buffer_count) == 0
+                ):
+                    # Only the group owning the buffer about to be reused must
+                    # finish reading. Newer groups can keep draining other buffers.
+                    # Every issuing lane waits on its own per-thread groups.
                     if is_tma_warp:
-                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                        cute.arch.cp_async_bulk_wait_group(
+                            self.bulk_store_buffer_count - 1, read=True
+                        )
                     epilogue_barrier.arrive_and_wait()
             if const_expr(self.bulk_row_swizzle):
                 # Retain every TMA-layout subtile, ordered by logical (M, N).
@@ -535,11 +541,15 @@ class GemmBase:
                     epi_store_pipeline.producer_commit()
                 iket.range_pop()
             elif const_expr(self.bulk_store_chunked):
-                if const_expr((epi_idx + 1) % self.epi_stage == 0):
+                if const_expr(
+                    (epi_idx + 1) % (self.epi_stage // self.bulk_store_buffer_count) == 0
+                ):
                     cute.arch.fence_view_async_shared()
                     epilogue_barrier.arrive_and_wait()
                     if is_tma_warp:
-                        copy_D(chunk_idx=epi_idx // self.epi_stage)
+                        copy_D(chunk_idx=epi_idx // (self.epi_stage // self.bulk_store_buffer_count))
+                        # Commit even for an entirely predicated window: group
+                        # age must continue to match the ring-buffer index.
                         cute.arch.cp_async_bulk_commit_group()
             elif const_expr(not self.bulk_row_store):
                 epilogue_barrier.arrive_and_wait()

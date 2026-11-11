@@ -28,12 +28,17 @@ from wave_ready import build_wave_ready_prefix
 def blackwell_compile_settings():
     """Apply process-local layout experiments and tracing before plans compile."""
     cols = os.environ.get("QUACK_TEST_BULK_SMEM_COLS")
+    buffers = os.environ.get("QUACK_TEST_BULK_SMEM_BUFFERS")
     trace = os.environ.get("QUACK_PRINT_KERNEL_CONFIG") == "1"
     with ExitStack() as contexts:
         if cols is not None:
             from blackwell_bench_utils import bulk_smem_cols
 
             contexts.enter_context(bulk_smem_cols(int(cols)))
+        if buffers is not None:
+            from blackwell_bench_utils import bulk_smem_buffers
+
+            contexts.enter_context(bulk_smem_buffers(int(buffers)))
         if trace:
             from blackwell_bench_utils import kernel_config_trace
 
@@ -285,7 +290,7 @@ def test_scatter(store, dtype, cluster_m, n):
 @pytest.mark.parametrize("tile_n", [128, 256, 512])
 @pytest.mark.parametrize("store", ["bulk_rows", "bulk_rows_reduce"])
 def test_bulk_store_padded_rows(tile_n, store):
-    """Exercise padded SMEM row pitches, N tails, row scatter and a partial cluster."""
+    """Exercise row pitches, N tails, scatter and buffer reuse across persistent tiles."""
     m, k, n = 259, 64, tile_n + 16
     dtype, device = torch.bfloat16, "cuda"
     a = torch.zeros(m, k, device=device, dtype=dtype)
@@ -311,7 +316,8 @@ def test_bulk_store_padded_rows(tile_n, store):
         out.zero_()
         gemm(a, w, out, None, None, tile_M=256, tile_N=tile_n, cluster_M=2, cluster_N=1,
              max_swizzle_size=1, is_dynamic_persistent=False, A_idx=idx,
-             gather_work_table=table, epilogue_store=store, scatter_table=mapping)
+             gather_work_table=table, epilogue_store=store, scatter_table=mapping,
+             sm_count=4)
         check(out, expected, reduce=reduce)
         assert (storage[0] == -123).all().item()
         assert (storage[-1] == -123).all().item()
