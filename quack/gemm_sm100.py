@@ -202,6 +202,9 @@ class GemmSm100(GemmTmaBase):
     """
 
     arch = 100
+    # Keep each row 16-byte aligned while spreading R2S row starts across banks.
+    # The stage planner uses this only when it fits without losing an A/B stage.
+    bulk_store_smem_padding_bytes = 16
 
     EpilogueArguments = GemmTmaBase.EpilogueArguments
     EpilogueParams = GemmTmaBase.EpilogueParams
@@ -571,6 +574,7 @@ class GemmSm100(GemmTmaBase):
             self.ab_stage,
             self.epi_stage,
             self.epi_c_stage,
+            self.bulk_store_smem_padding_bytes_used,
         ) = self._compute_stages(
             self.tiled_mma,
             self.mma_tiler,
@@ -590,6 +594,7 @@ class GemmSm100(GemmTmaBase):
             self.occupancy,
             self.epi_smem_warp_shape_mnk(),
             full_tile_store=self.bulk_row_store,
+            bulk_smem_padding_bytes=self.bulk_store_smem_padding_bytes,
             fixed_user_smem_bytes=(
                 math.ceil(self.cta_tile_shape_mnk[0] * 8 / 1024) * 1024
                 if self.multi_buffer_gather else 0
@@ -641,7 +646,12 @@ class GemmSm100(GemmTmaBase):
                 # Keep the tiler's strides: with 2-CTA M=64, one subtile
                 # covers two separated N ranges (e.g. 0:32 and 64:96).
                 # Using only epi_n would swap the middle column ranges.
-                d_tile = cute.make_layout((tile_m, tile_n), stride=(tile_n, 1))
+                self.bulk_store_smem_row_stride = (
+                    tile_n + self.bulk_store_smem_padding_bytes_used * 8 // self.d_dtype.width
+                )
+                d_tile = cute.make_layout(
+                    (tile_m, tile_n), stride=(self.bulk_store_smem_row_stride, 1)
+                )
                 self.epi_smem_layout_staged = cute.group_modes(
                     cute.flat_divide(d_tile, self.epi_tile), 2, 4
                 )
@@ -2987,8 +2997,9 @@ class GemmSm100(GemmTmaBase):
         occupancy: int,
         warp_shape_mnk: Tuple[int, int, int] | None = None,
         full_tile_store: bool = False,
+        bulk_smem_padding_bytes: int = 0,
         fixed_user_smem_bytes: int = 0,
-    ) -> Tuple[int, int, int]:
+    ) -> Tuple[int, int, int, int, int]:
         """Computes the number of stages for A/B/C operands based on heuristics.
 
         :param tiled_mma: The tiled MMA object defining the core computation.
@@ -3010,9 +3021,8 @@ class GemmSm100(GemmTmaBase):
         :param occupancy: Target number of CTAs per SM (occupancy).
         :type occupancy: int
 
-        :return: A tuple containing the computed number of stages for:
-                 (ACC stages, A/B operand stages, C stages)
-        :rtype: tuple[int, int, int]
+        :return: ACC, A/B, D and C stage counts, and the selected bulk-row padding in bytes.
+        :rtype: tuple[int, int, int, int, int]
         """
         blockscaled = sf_dtype is not None
         # Default ACC stages
@@ -3108,11 +3118,18 @@ class GemmSm100(GemmTmaBase):
         # Refine epilogue stages:
         # Calculate remaining smem after allocating for A/B stages and reserved bytes
         # Add remaining unused smem to epilogue
+        padding_used = 0
         if const_expr(full_tile_store):
             assert ab_stage >= 2, "bulk_rows leaves insufficient SMEM for two A/B stages"
+            assert bulk_smem_padding_bytes >= 0 and bulk_smem_padding_bytes % 16 == 0
+            # A/B allocations are 1024-byte aligned after sD. Budget the rounded
+            # padded extent, including the otherwise unused final row's padding.
+            padding_bytes = cute.round_up(cta_tile_shape_mnk[0] * bulk_smem_padding_bytes, 1024)
+            if padding_bytes <= remaining_bytes - ab_bytes_per_stage * ab_stage:
+                padding_used = bulk_smem_padding_bytes
         if epi_bytes_per_stage > 0 and not full_tile_store:
             epi_stage += (remaining_bytes - ab_bytes_per_stage * ab_stage) // epi_bytes_per_stage
-        return num_acc_stage, ab_stage, epi_stage, epi_c_stage
+        return num_acc_stage, ab_stage, epi_stage, epi_c_stage, padding_used
 
     @staticmethod
     def _compute_num_tmem_alloc_cols(

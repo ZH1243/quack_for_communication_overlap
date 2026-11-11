@@ -84,6 +84,8 @@ class GemmBase:
     bulk_row_store = False
     bulk_row_double_buffer = False
     bulk_row_swizzle = False
+    # Elements between contiguous bulk-store rows; None keeps the dense tile pitch.
+    bulk_store_smem_row_stride = None
     # Epilogue mixins that need a reduction over the full accumulator tile
     # BEFORE any subtile is stored (e.g. QK-norm's per-head sum of squares)
     # set this in epi_to_underlying_arguments. The epilogue then runs a
@@ -799,8 +801,9 @@ class GemmBase:
         """Called by all 32 store-warp lanes after the full-tile R2S fence/barrier.
 
         Linear bulk copies do not apply a tensor descriptor's swizzle or OOB
-        handling. By default rows in sD are contiguous; bulk_row_swizzle instead
-        resolves each 16-byte chunk through the swizzled subtile layout.
+        handling. Each row in sD is contiguous, with an optional padded row pitch;
+        bulk_row_swizzle instead resolves each 16-byte chunk through the swizzled
+        subtile layout.
         The caller supplies a batch-offset ordinary GMEM tensor, and each lane
         predicates its sequence-local row.
         With scatter_rows, gD is the global output base and each lane uses its
@@ -811,6 +814,9 @@ class GemmBase:
         The host validates 16-byte alignment, including the final N tile width.
         """
         tile_m, tile_n = self.cta_tile_shape_mnk[:2]
+        smem_row_stride = const_expr(
+            tile_n if self.bulk_store_smem_row_stride is None else self.bulk_store_smem_row_stride
+        )
         row_start = tile_coord[0] * tile_m
         col_start = tile_coord[1] * tile_n
         store_bytes = cutlass.min(tile_n, gD.shape[1] - col_start) * (self.d_dtype.width // 8)
@@ -862,7 +868,7 @@ class GemmBase:
                             )
                 else:
                     copy_utils.cpasync_bulk_s2g(
-                        sD.iterator + row * tile_n,
+                        sD.iterator + row * smem_row_stride,
                         dst_ptr,
                         store_bytes,
                         reduction_kind="add" if const_expr(self.bulk_row_reduce) else None,

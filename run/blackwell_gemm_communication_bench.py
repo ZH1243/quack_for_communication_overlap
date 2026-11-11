@@ -14,7 +14,8 @@ from quack.gemm_config import GemmConfig, cta_tile_shape_m
 from quack.gemm_interface import gemm_act
 
 from blackwell_bench_utils import (
-    Variant, kernel_config_trace, mapped_host_flag, measure, profile_variant, select_variants,
+    Variant, bulk_smem_padding, kernel_config_trace, mapped_host_flag, measure, profile_variant,
+    select_variants,
 )
 from blackwell_gemm_tables import make_table
 from wave_ready import build_wave_ready_prefix
@@ -56,6 +57,8 @@ def parse_args():
                            help="check/warm one enabled variant, then launch in NVTX quack_profile")
     parser.add_argument("--print-kernel-config", action="store_true",
                         help="print compiled stages/layouts; requires QUACK_CACHE_ENABLED=0")
+    parser.add_argument("--bulk-smem-padding", type=int, choices=(0, 16), default=None,
+                        help="bulk-row padding ablation in bytes; requires QUACK_CACHE_ENABLED=0")
     parser.add_argument("--rounds", type=int, default=9)
     parser.add_argument("--repetitions", type=int, default=16)
     parser.add_argument("--warmup", type=int, default=100, help="full graph replays")
@@ -76,6 +79,8 @@ def parse_args():
         parser.error("SwiGLU requires even N; gemm_act does not expose an SM-count limit")
     if args.stores and args.n % 8:
         parser.error("bulk stores require BF16 row widths divisible by 8")
+    if args.bulk_smem_padding is not None and not args.stores:
+        parser.error("--bulk-smem-padding requires --stores, --waves, or --host-ready")
     ntiles = math.ceil(args.n / args.tile_n)
     if ntiles % args.group_size:
         parser.error("N tile count must be divisible by group-size")
@@ -326,6 +331,8 @@ def benchmark(args, resources):
 def main():
     args = parse_args()
     with ExitStack() as resources:
+        if args.bulk_smem_padding is not None:
+            resources.enter_context(bulk_smem_padding(args.bulk_smem_padding))
         if args.print_kernel_config:
             resources.enter_context(kernel_config_trace())
         benchmark(args, resources)

@@ -399,6 +399,39 @@ compilation and are restored afterwards; they do not insert device instrumentati
 Disabling the QuACK object cache is required so compilation actually runs the hooks.
 Layout byte counts exclude barriers, auxiliary outputs and allocation padding.
 
+SM100 bulk stores stage the entire CTA output tile so each row can be issued as one
+contiguous bulk copy or reduction. This consumes more shared memory than the TMA
+subtile ring. For the `(256,256)` and `(256,512)` BF16 configurations above, the
+observed A/B pipeline depths are respectively 5 versus 6, and 2 versus 4. Padding
+does not recover these lost stages.
+
+The bulk layout also requests 16 bytes of padding between shared-memory rows. This
+spreads row starts across banks for the row-per-lane register-to-shared mapping while
+preserving contiguous, 16-byte-aligned bulk-copy sources. Padding is applied only if
+the aligned allocation fits without reducing A/B stage count; the trace reports the
+selected padding and physical row stride. It does not change output tensor strides.
+
+To measure this layout change separately, compare padding disabled and enabled with
+the same TMA control. Both runs check numerical outputs, and require a cold QuACK
+object cache because the override is local to this benchmark process:
+
+```bash
+for padding in 0 16; do
+  QUACK_CACHE_ENABLED=0 CUDA_VISIBLE_DEVICES=0 \
+  python run/blackwell_gemm_communication_bench.py \
+    --k 7168 --n 2048 --buffers 16 --tile-m 256 --tile-n 512 --cluster-m 2 \
+    --stores --variants "single table" "bulk rows" \
+    --bulk-smem-padding "$padding" --print-kernel-config
+done
+```
+
+Repeat with `--tile-n 256`, and reverse the padding order to check for run-to-run
+drift. With padding selected, these BF16 row strides are 520 and 264 elements,
+respectively. The A/B stage counts should match their padding-disabled controls.
+`test_bulk_store_padded_rows` covers N tails, a partial M cluster, row scatter,
+reduction and repeated launches with guarded output storage. Throughput benefits
+must be measured on the GPU; the address mapping alone does not quantify them.
+
 For hardware profiling, `--profile-variant` checks and warms one enabled variant,
 then performs one eager call in the `quack_profile` NVTX push/pop range. It checks the
 output again after the profiled call. For example, on the B300 node with Nsight Compute:

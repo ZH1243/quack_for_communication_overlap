@@ -37,6 +37,24 @@ def select_variants(variants, names):
 
 
 @contextmanager
+def bulk_smem_padding(bytes_per_row):
+    """Process-local padding ablation; set before compiling any GEMM plans."""
+    from quack.cache import CACHE_ENABLED
+    from quack.gemm_sm100 import GemmSm100
+
+    if CACHE_ENABLED:
+        raise ValueError("--bulk-smem-padding requires QUACK_CACHE_ENABLED=0 before Python starts")
+    previous = GemmSm100.bulk_store_smem_padding_bytes
+    GemmSm100.bulk_store_smem_padding_bytes = bytes_per_row
+    try:
+        print(f"Bulk SMEM padding requested: {bytes_per_row} bytes/row; "
+              "applied only if A/B stage count is preserved", flush=True)
+        yield
+    finally:
+        GemmSm100.bulk_store_smem_padding_bytes = previous
+
+
+@contextmanager
 def kernel_config_trace():
     """Print specialization/layout metadata during compilation; no device tracing."""
     from quack.cache import CACHE_ENABLED
@@ -66,6 +84,9 @@ def kernel_config_trace():
               "excludes other storage, metadata and alignment padding", flush=True)
         print(f"  epilogue tile={self.epi_tile}", flush=True)
         print(f"  D shared layout={self.epi_smem_layout_staged}", flush=True)
+        if self.bulk_row_store:
+            print(f"  bulk row padding={self.bulk_store_smem_padding_bytes_used} bytes, "
+                  f"SMEM row stride={self.bulk_store_smem_row_stride} elements", flush=True)
         return result
 
     def traced_partition(self, tiled_copy_t2r, d_layout, dtype, tTR_rD, sD, tidx):

@@ -263,6 +263,41 @@ def test_scatter(store, dtype, cluster_m, n):
     check(out, expected, reduce=reduce)
 
 
+@pytest.mark.parametrize("tile_n", [128, 256, 512])
+@pytest.mark.parametrize("store", ["bulk_rows", "bulk_rows_reduce"])
+def test_bulk_store_padded_rows(tile_n, store):
+    """Exercise padded SMEM row pitches, N tails, row scatter and a partial cluster."""
+    m, k, n = 259, 64, tile_n + 16
+    dtype, device = torch.bfloat16, "cuda"
+    a = torch.zeros(m, k, device=device, dtype=dtype)
+    a[:, 0] = (torch.arange(m, device=device) % 11) / 8
+    a[:, 1] = 1
+    w = torch.zeros(1, n, k, device=device, dtype=dtype)
+    columns = torch.arange(n, device=device)
+    w[0, :, 0] = (columns % 13) / 8
+    w[0, :, 1] = (columns % 17 - 8) / 16
+    idx = torch.randperm(m, device=device, dtype=torch.int32)
+    rows, _ = make_table([[m]], n=n, tile_m=256, tile_n=tile_n, cluster_m=2)
+    table = torch.tensor(rows, device=device, dtype=torch.int32)
+    mapping = torch.randperm(m, device=device, dtype=torch.int32)
+    reduce = store == "bulk_rows_reduce"
+    if reduce:
+        mapping = mapping // 2
+    storage = torch.full((m + 2, n), -123, device=device, dtype=dtype)
+    out = storage[1:-1]
+    reference = a[idx.long()].float() @ w[0].float().T
+    expected = torch.zeros(m, n, device=device, dtype=torch.float32)
+    expected.index_add_(0, mapping.long(), reference.to(dtype).float())
+    for _ in range(2):
+        out.zero_()
+        gemm(a, w, out, None, None, tile_M=256, tile_N=tile_n, cluster_M=2, cluster_N=1,
+             max_swizzle_size=1, is_dynamic_persistent=False, A_idx=idx,
+             gather_work_table=table, epilogue_store=store, scatter_table=mapping)
+        check(out, expected, reduce=reduce)
+        assert (storage[0] == -123).all().item()
+        assert (storage[-1] == -123).all().item()
+
+
 @cute.kernel
 def _observe_ready_kernel(buffers: tuple, snapshots: tuple, ready: cute.Tensor):
     """Acquire each ready group, then snapshot its columns while GEMM continues."""
