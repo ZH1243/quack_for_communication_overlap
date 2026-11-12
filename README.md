@@ -733,9 +733,68 @@ alive until completion, and reset additive outputs and the host flag each iterat
 The GEMM wrapper resets its GPU wave counter. Publication of streamed table rows requires
 the corresponding input data to be visible first, including the proxy's existing RDMA
 visibility handling. SM90 bulk-store diagnostic options (partial-row stores, double
-buffering, and swizzled bulk stores) remain SM90-only. The C++ proxy and its Hopper-named
-launch scripts have not been changed; their geometry/configuration migration and the
-two-node integration test remain separate validation steps.
+buffering, and swizzled bulk stores) remain SM90-only.
+
+### Embedded RDMA proxy integration and cached store configuration
+
+`RDMA_CPU_Proxy/scripts/rdma_proxy_worker.py` uses the shared
+`run/hopper_pregather_gemm.py` helpers for down projection on both architectures.
+Their historical filename does not select SM90: `args.device_capacity=9|10` selects
+the descriptor geometry and activation configuration. SM100 uses no pingpong,
+static persistence and no TMA gather. `prepare_grouped_inputs` sizes tables using
+`cta_tile_shape_m(tile_m, cluster_m, device_capacity) * cluster_m`, and uses the same
+actual device and `sm_count` capacity query as the low-level cooperative GEMM.
+Hopper's original per-CTA tile-M semantics and pingpong wave requirement remain.
+
+Production callers can now specialize bulk stores without changing kernel classes:
+
+```python
+from quack.gemm import gemm
+from quack.gemm_config import BlackwellBulkStoreConfig
+
+# Candidate measured at BF16 tile=(256,512), cluster_M=2; validate other shapes.
+bulk = BlackwellBulkStoreConfig(padding_bytes=16, max_cols=128,
+                               buffer_count=1, num_warps=4)
+# Add bulk_store_config=bulk to an SM100 bulk_rows/bulk_rows_reduce gemm call.
+```
+
+The immutable configuration participates in both the in-memory plan key and the
+persistent compiled-object key. Different settings can coexist in one process;
+keep the normal QuACK cache enabled. Omitting the configuration retains existing
+library defaults (full-tile staging, one issuing warp). Padding still applies only
+when it preserves A/B pipeline depth. The kernel rejects windows that cannot hold
+whole epilogue subtiles; a small window is not suitable for every tile shape.
+The benchmark-only context managers described above still require
+`QUACK_CACHE_ENABLED=0`; the production API does not use them.
+
+The pregather helper exposes `--bulk-smem-padding`, `--bulk-smem-cols`,
+`--bulk-smem-buffers`, and `--bulk-store-warps`. They are optional SM100 bulk-store
+settings, forwarded as this configuration. The proxy exposes the same options
+with a `--down-` prefix. First run the focused numerical tests with the cache enabled:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m pytest -q run/test_proxy_gemm_integration.py -x
+CUDA_VISIBLE_DEVICES=0 python -m pytest -q run/test_blackwell_gemm_communication.py -x
+```
+
+Repeat the focused proxy-helper command in a new Python process to exercise warm
+persistent-object-cache loading as well as the first process's configuration changes.
+
+The proxy-helper test composes streamed multi-buffer gather/SwiGLU with the shared
+down runner, duplicate scatter reduction into compact N-tile-major allocations,
+mapped-host publication and a concurrent GPU consumer that acquire-loads readiness.
+It repeats three iterations with poisoned input/table/output state, covers the
+128x128/cluster-M=1 proxy down tile plus two-CTA cases, and compares default stores
+with the explicit 128-column/four-warp candidate. A separate numerical test changes
+settings within one process to check plan and compiled-cache isolation.
+
+On the Mac only source/static checks and CPU metadata regressions can run. These
+new GPU tests and the full two-node embedded-library pipeline have **not** been
+validated here. The earlier 13-variant standalone benchmark is not a substitute.
+Follow `RDMA_CPU_Proxy/README.md` for staged native build, actual-shape performance
+comparisons, repeated numerical two-node runs, and network settings supplied by
+the operator. Retain separate measurements for the proxy's 128x128 tiles and the
+previously measured 256x512 tile; no throughput guarantee transfers between them.
 
 ## Bitmask token exchange on Hopper
 

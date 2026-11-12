@@ -12,7 +12,7 @@ from cutlass.cute.runtime import make_ptr
 
 from quack.cache import jit_cache
 from quack.split_k_reduce import split_k_reduce
-from quack.gemm_config import SplitKMode, cta_tile_shape_m
+from quack.gemm_config import BlackwellBulkStoreConfig, SplitKMode, cta_tile_shape_m
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters, torch2cute_dtype_map
 from quack.gemm_default_epi import (
@@ -105,6 +105,7 @@ def _compile_gemm(
     bulk_row_double_buffer=False,
     bulk_row_swizzle=False,
     bulk_store_rows=None,
+    bulk_store_config=None,
 ):
     sm_to_cls = {
         8: GemmDefaultSm80,
@@ -273,6 +274,7 @@ def _compile_gemm(
         bulk_row_double_buffer=bulk_row_double_buffer,
         bulk_row_swizzle=bulk_row_swizzle,
         bulk_store_rows=bulk_store_rows,
+        bulk_store_config=bulk_store_config,
         n_tile_major_output=n_tile_major_output,
     )
 
@@ -666,6 +668,9 @@ def gemm(
     bulk_row_swizzle: bool = False,
     # Diagnostic: only store the first rows of each CTA tile; other D rows are untouched.
     bulk_store_rows: Optional[int] = None,
+    # SM100 per-instance bulk epilogue settings. Included in plan and compiled
+    # object cache keys; None retains library defaults. No process-global mutation.
+    bulk_store_config: Optional[BlackwellBulkStoreConfig] = None,
     # Cap persistent CTAs in whole clusters; does not reserve or pin physical SMs.
     sm_count: Optional[int] = None,
 ) -> _GemmPlan:
@@ -784,6 +789,7 @@ def gemm(
         bulk_row_double_buffer,
         bulk_row_swizzle,
         bulk_store_rows,
+        bulk_store_config,
         A_idx is not None,
         batch_idx_permute is not None,
         tile_count_semaphore is not None,
@@ -870,6 +876,7 @@ def gemm(
             bulk_row_double_buffer=bulk_row_double_buffer,
             bulk_row_swizzle=bulk_row_swizzle,
             bulk_store_rows=bulk_store_rows,
+            bulk_store_config=bulk_store_config,
             scatter_table=scatter_table,
             multi_buffer_scatter=multi_buffer_scatter,
             n_tile_major_output=n_tile_major_output,
@@ -1090,6 +1097,7 @@ def _build_gemm_plan(
     bulk_row_double_buffer=False,
     bulk_row_swizzle=False,
     bulk_store_rows=None,
+    bulk_store_config=None,
     sm_count=None,
 ) -> _GemmPlan:
     if wave_ready_host_address is not None:
@@ -1337,6 +1345,11 @@ def _build_gemm_plan(
         assert B.stride(-2) == 1, "varlen_k requires B to be n-major"
 
     device_capacity = get_device_capacity(A.device)
+    if bulk_store_config is not None:
+        if not isinstance(bulk_store_config, BlackwellBulkStoreConfig):
+            raise TypeError("bulk_store_config must be a BlackwellBulkStoreConfig")
+        if device_capacity[0] not in (10, 11) or epilogue_store == "tma":
+            raise ValueError("bulk_store_config requires SM100/SM110 bulk-row stores")
     if device_capacity[0] != 9 and (
         bulk_store_rows is not None or bulk_row_swizzle or bulk_row_double_buffer
     ):
@@ -1535,7 +1548,10 @@ def _build_gemm_plan(
     tile_shape_mnk = (tile_M, tile_N) if tile_K is None else (tile_M, tile_N, tile_K)
     cluster_size = cluster_M * cluster_N * cluster_K
     max_active_clusters = (
-        get_max_active_clusters(cluster_size, device_capacity=device_capacity, sm_count=sm_count)
+        get_max_active_clusters(
+            cluster_size, device_capacity=device_capacity,
+            device_id=A.device.index or 0, sm_count=sm_count,
+        )
         if persistent else 0
     )
     if wave_ready_prefix is not None:
@@ -1602,6 +1618,7 @@ def _build_gemm_plan(
         bulk_row_double_buffer=bulk_row_double_buffer,
         bulk_row_swizzle=bulk_row_swizzle,
         bulk_store_rows=bulk_store_rows,
+        bulk_store_config=bulk_store_config,
     )
 
     scheduler_uses_semaphore = is_dynamic_persistent and device_capacity[0] <= 9

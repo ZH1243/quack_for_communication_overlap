@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark a QuACK Hopper grouped GEMM after materializing gathered tokens.
+"""Benchmark a QuACK Hopper/Blackwell grouped GEMM after materializing gathered tokens.
 
 This is the no-gather-fusion counterpart of ``hopper_gather_gemm.py``. It first
 creates the same MoE inputs on CUDA:
@@ -27,7 +27,7 @@ Add ``--gather-table-expert-waves`` instead to fill logical persistent work
 waves with one expert, borrowing from its later N groups when necessary.
 Only exhausted experts may share a wave with the next expert. Wave boundaries
 are not GPU-wide synchronization points unless --gather-table-wave-barrier is enabled.
-This opt-in requires --pingpong and bulk_rows/bulk_rows_reduce. Each CTA drains
+This opt-in requires bulk_rows/bulk_rows_reduce and --pingpong on Hopper. Each CTA drains
 its tile stores completely before reporting completion; the next wave waits
 for every preceding-wave CTA before entering its epilogue. The kernel uses a
 cooperative launch (an oversized grid is rejected by CUDA). The per-call counter
@@ -156,9 +156,9 @@ from dataclasses import dataclass
 
 import torch
 
-from quack.cute_dsl_utils import get_max_active_clusters
+from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
 from quack.gemm import build_scatter_row_addresses, gemm as quack_gemm
-from quack.gemm_config import GemmConfig
+from quack.gemm_config import BlackwellBulkStoreConfig, GemmConfig, cta_tile_shape_m
 from quack.gemm_interface import act_to_pytorch_fn_map, gated_to_pytorch_fn_map, gemm_act
 
 
@@ -255,6 +255,14 @@ def add_kernel_arguments(parser: argparse.ArgumentParser, *, prefix: str = "") -
     )
     add_argument("--max-swizzle-size", type=int, default=8)
     add_argument("--pingpong", action="store_true")
+    add_argument("--bulk-smem-padding", type=int, default=None,
+                 help="SM100 bulk-store padding in bytes per row (multiple of 16)")
+    add_argument("--bulk-smem-cols", type=int, default=None,
+                 help="SM100 total buffered output columns; 0 keeps full-tile staging")
+    add_argument("--bulk-smem-buffers", type=int, default=None,
+                 help="SM100 reusable output buffers (1 or 2)")
+    add_argument("--bulk-store-warps", type=int, default=None,
+                 help="SM100 existing epilogue warps issuing row copies (1, 2, or 4)")
     add_argument(
         "--bulk-store-rows",
         type=int,
@@ -304,7 +312,7 @@ def add_kernel_arguments(parser: argparse.ArgumentParser, *, prefix: str = "") -
         "--gather-table-wave-barrier",
         action="store_true",
         help="Order bulk output stores across expert waves (requires "
-        "--gather-table-expert-waves, --pingpong, and a bulk-row epilogue; "
+        "--gather-table-expert-waves, a bulk-row epilogue, and --pingpong on SM90; "
         "uses a cooperative CUDA launch)",
     )
     add_argument(
@@ -376,7 +384,7 @@ def add_kernel_arguments(parser: argparse.ArgumentParser, *, prefix: str = "") -
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark QuACK's SM90 grouped GEMM after pre-gathering routed tokens."
+        description="Benchmark QuACK's SM90/SM100 GEMM after pre-gathering routed tokens."
     )
     parser.add_argument("--tokens", "-T", type=int, default=4096, help="Number of X rows (T)")
     parser.add_argument("--hidden", "-K", type=int, default=4096, help="Input dimension (K)")
@@ -455,7 +463,33 @@ def scatter_output_sizes(args: argparse.Namespace) -> tuple[list[int], list[int]
     return used, capacity
 
 
+def device_capacity_for_args(args: argparse.Namespace, device=None) -> int:
+    """Allow CPU-side configuration validation with an explicit architecture."""
+    capacity = getattr(args, "device_capacity", None)
+    if capacity is None:
+        capacity = get_device_capacity(device)[0] if torch.cuda.is_available() else 9
+    if capacity not in (9, 10):
+        raise ValueError("pregather helpers support Hopper (9) and Blackwell (10)")
+    return capacity
+
+
+def bulk_store_config_for_args(args: argparse.Namespace) -> BlackwellBulkStoreConfig | None:
+    fields = dict(padding_bytes="bulk_smem_padding", max_cols="bulk_smem_cols",
+                  buffer_count="bulk_smem_buffers", num_warps="bulk_store_warps")
+    values = {field: getattr(args, name, None) for field, name in fields.items()}
+    explicit = {field: value for field, value in values.items() if value is not None}
+    return BlackwellBulkStoreConfig(**explicit) if explicit else None
+
+
 def validate_args(args: argparse.Namespace, *, prepacked: bool = False) -> None:
+    capacity = device_capacity_for_args(args)
+    if capacity == 10 and args.pingpong:
+        raise ValueError("Blackwell requires pingpong=False")
+    bulk_config = bulk_store_config_for_args(args)
+    if bulk_config is not None and (
+        capacity != 10 or args.epilogue_store not in ("bulk_rows", "bulk_rows_reduce")
+    ):
+        raise ValueError("bulk SMEM/warp settings require Blackwell bulk-row stores")
     sm_count = getattr(args, "sm_count", None)
     if sm_count is not None:
         if args.cluster_m <= 0 or sm_count <= 0 or sm_count % args.cluster_m:
@@ -544,12 +578,12 @@ def validate_args(args: argparse.Namespace, *, prepacked: bool = False) -> None:
         )
     if args.gather_table_wave_barrier and (
         not args.gather_table_expert_waves
-        or not args.pingpong
+        or (capacity == 9 and not args.pingpong)
         or args.epilogue_store not in ("bulk_rows", "bulk_rows_reduce")
     ):
         raise ValueError(
             "--gather-table-wave-barrier requires --gather-table-expert-waves, "
-            "--pingpong, and --epilogue-store bulk_rows or bulk_rows_reduce"
+            "--epilogue-store bulk_rows or bulk_rows_reduce, and --pingpong on SM90"
         )
     if args.gather_table_expert_waves and not args.gather_table:
         raise ValueError("--gather-table-expert-waves requires --gather-table")
@@ -654,6 +688,10 @@ def prepare_grouped_inputs(
     ):
         raise ValueError("grouped operands do not match the configured GEMM dimensions")
     device, dtype = A.device, A.dtype
+    capacity = device_capacity_for_args(args, device)
+    if get_device_capacity(device)[0] != capacity:
+        raise ValueError("configured device_capacity does not match the input GPU")
+    cta_m = cta_tile_shape_m(args.tile_m, args.cluster_m, capacity)
     gemm_output_dim = W_up.shape[-1]
     cu_seqlens_m = torch.tensor([0, *counts], dtype=torch.int32, device=device).cumsum(
         0, dtype=torch.int32
@@ -664,12 +702,15 @@ def prepare_grouped_inputs(
         clusters_n = math.ceil(gemm_output_dim / args.tile_n)
         x = min(args.max_swizzle_size, clusters_n)
         num_work = (
-            sum(math.ceil(count / (args.tile_m * args.cluster_m)) for count in counts)
+            sum(math.ceil(count / (cta_m * args.cluster_m)) for count in counts)
             * clusters_n
         )
         # Match GatherTableTileScheduler.get_grid_shape and GEMM's capacity query.
         wave_work_ids = min(
-            get_max_active_clusters(args.cluster_m, sm_count=getattr(args, "sm_count", None)),
+            get_max_active_clusters(
+                args.cluster_m, device_capacity=get_device_capacity(device),
+                device_id=device.index or 0, sm_count=getattr(args, "sm_count", None),
+            ),
             num_work,
         )
         if wave_work_ids <= 0 or wave_work_ids % x:
@@ -699,6 +740,7 @@ def prepare_grouped_inputs(
             device=torch.device("cpu") if getattr(args, "gather_table_publish_ready", False) else device,
             n_group_major=args.gather_table_n_group_major,
             wave_work_ids=wave_work_ids,
+            device_capacity=capacity,
         )
         if getattr(args, "gather_table_publish_ready", False):
             if __package__:
@@ -809,6 +851,8 @@ def prepare_grouped_inputs(
 
 
 def make_launch(args: argparse.Namespace, inputs: PregatherInputs):
+    capacity = device_capacity_for_args(args, inputs.A.device)
+    bulk_store_config = bulk_store_config_for_args(args)
     # QuACK's plain low-level API expects B as [E, N, K]. This is a zero-copy
     # view of each user-facing [E, input, output] weight tensor. The activation
     # API below uses the torch-convention W_up view directly.
@@ -849,7 +893,7 @@ def make_launch(args: argparse.Namespace, inputs: PregatherInputs):
             cluster_n=1,
             cluster_k=1,
             max_swizzle_size=args.max_swizzle_size,
-            device_capacity=9,
+            device_capacity=capacity,
             use_tma_gather=False,
         )
 
@@ -895,6 +939,7 @@ def make_launch(args: argparse.Namespace, inputs: PregatherInputs):
                 bulk_row_double_buffer=args.bulk_row_double_buffer,
                 bulk_row_swizzle=args.bulk_row_swizzle,
                 bulk_store_rows=args.bulk_store_rows,
+                bulk_store_config=bulk_store_config,
                 scatter_table=(
                     inputs.scatter_row_addresses
                     if args.multi_buffer_scatter
@@ -931,6 +976,7 @@ def make_launch(args: argparse.Namespace, inputs: PregatherInputs):
                 bulk_row_double_buffer=args.bulk_row_double_buffer,
                 bulk_row_swizzle=args.bulk_row_swizzle,
                 bulk_store_rows=args.bulk_store_rows,
+                bulk_store_config=bulk_store_config,
             )
 
     return launch
@@ -1195,18 +1241,19 @@ def gib(nbytes: int) -> float:
 @torch.inference_mode()
 def main() -> None:
     args = parse_args()
-    validate_args(args)
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
 
     torch.cuda.set_device(args.device)
     device = torch.device("cuda", args.device)
     capability = torch.cuda.get_device_capability(device)
-    if capability[0] != 9:
+    if capability[0] not in (9, 10):
         raise RuntimeError(
-            "This runner targets Hopper (SM90), but "
+            "This runner targets Hopper (SM90) and Blackwell (SM100), but "
             f"device {args.device} has capability {capability}"
         )
+    args.device_capacity = capability[0]
+    validate_args(args)
 
     torch.manual_seed(args.seed)
     inputs = prepare_inputs(args, device)

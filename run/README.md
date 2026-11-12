@@ -1,7 +1,7 @@
 # Gather GEMM runners
 
 This directory contains standalone benchmark runners for QuACK's grouped GEMM.
-The Hopper runners target SM90; `blackwell_gather_gemm.py` targets B200/B300
+Most Hopper runners target SM90; `blackwell_gather_gemm.py` targets B200/B300
 (SM10x). The indexed-gather runners use uniform Mixture-of-Experts (MoE) routing;
 the Hopper table-scheduled runner also supports uneven expert lengths.
 
@@ -77,6 +77,21 @@ this tensor through the ordinary TMA A-load path.
 The reported time **does not include** the pre-gather operation. Consequently,
 this runner measures the GEMM after pre-gathering, not the full pre-gather plus
 GEMM pipeline. Keep this distinction in mind when comparing the two scripts.
+
+This runner and its `prepare_grouped_inputs` / `make_launch` helpers also support
+SM100/B300, including the RDMA proxy down projection. Device capability selects
+the per-CTA row geometry; Blackwell requires `pingpong=False`. Wave barriers use
+the same device-specific resident cluster count and optional `--sm-count` as the
+kernel. On Blackwell, the optional `--bulk-smem-padding 16 --bulk-smem-cols 128
+--bulk-smem-buffers 1 --bulk-store-warps 4` selects a cached, per-call specialization.
+These values are candidates to benchmark, not new defaults. Do not use the
+process-global benchmark override contexts in embedded workers.
+
+Run `python -m pytest -q run/test_proxy_gemm_integration.py -x` on B300 to check
+the actual shared-helper up/down composition with numerical references, repeated
+iterations, compact scatter reductions, mapped-host readiness and a concurrent
+GPU consumer. See the repository README for configuration/cache details and the
+RDMA_CPU_Proxy README for the two-node launch protocol.
 
 ### `hopper_gather_table_gemm.py`
 
@@ -231,7 +246,8 @@ not alter the ready-row prefix.
 
 ## Requirements
 
-- Hopper scripts: an NVIDIA GPU with compute capability 9.x (for example, H100)
+- Hopper scripts: an NVIDIA GPU with compute capability 9.x (for example, H100);
+  `hopper_pregather_gemm.py` and its shared helpers also accept 10.x (B200/B300)
 - `blackwell_gather_gemm.py`: an NVIDIA B200/B300 GPU with compute capability 10.x
 - A working CUDA-enabled PyTorch installation
 - QuACK installed from this repository
@@ -283,8 +299,8 @@ python run/hopper_pregather_gemm.py --gather-table --gather-table-expert-waves \
     --tile-m 128 --tile-n 128 --cluster-m 2 --max-swizzle-size 1
 ```
 
-This requires expert-wave scheduling, pingpong, and `bulk_rows` or
-`bulk_rows_reduce`. Each store-warp lane waits for its tile's global writes to
+This requires expert-wave scheduling, `bulk_rows` or `bulk_rows_reduce`, and
+pingpong on Hopper (disable pingpong on Blackwell). Each store-warp lane waits for its tile's global writes to
 complete. After a warp synchronization, one lane increments a GPU-scope release
 counter once per CTA tile, even for an entirely predicated tile. Before the next
 wave enters its epilogue, it acquire-waits for all preceding-wave CTA tiles.
@@ -305,7 +321,7 @@ The low-level `quack.gemm.gemm` API enables this behavior with
 `torch.int32` tensor of shape `[1]`. The API resets it on every launch and leaves
 the completed CTA-tile count there afterward. Do not share the workspace between
 concurrent invocations. This initial implementation accepts only static,
-single-buffer, non-streaming four-column gather tables with pingpong bulk stores.
+single-buffer, non-streaming four-column gather tables with bulk stores (pingpong on SM90).
 At this level the barrier works for any table order, not only expert-wave order.
 
 Hopper numerical regression checks (including partial waves and graph replay):

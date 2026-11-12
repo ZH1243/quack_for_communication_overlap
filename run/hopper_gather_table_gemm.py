@@ -361,6 +361,7 @@ def build_work_table(
     device: torch.device,
     n_group_major: bool = False,
     wave_work_ids: int | None = None,
+    device_capacity: int = 9,
 ) -> tuple[torch.Tensor, tuple[tuple[int, ...], ...], int]:
     """Encode serpentine order, optionally keeping each wave on one expert.
 
@@ -379,7 +380,9 @@ def build_work_table(
             "wave_work_ids must be positive and divisible by effective_swizzle_size, "
             f"got wave_work_ids={wave_work_ids}, effective_swizzle_size={x}"
         )
-    cluster_rows = tile_m * cluster_m
+    from quack.gemm_config import cta_tile_shape_m
+
+    cluster_rows = cta_tile_shape_m(tile_m, cluster_m, device_capacity) * cluster_m
     rows: list[tuple[int, int, int, int]] = []
 
     for expert, count in enumerate(counts):

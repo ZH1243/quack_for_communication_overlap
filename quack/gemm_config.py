@@ -34,6 +34,32 @@ class SplitKMode(IntEnum):
 
 
 @dataclass(frozen=True)
+class BlackwellBulkStoreConfig:
+    """Per-launch SM100 bulk epilogue specialization, included in compile/cache keys.
+
+    Defaults preserve full-tile staging and one issuing warp. The measured
+    (256, 512) BF16 candidate is ``max_cols=128, num_warps=4``; benchmark other
+    shapes before selecting it. ``max_cols`` is the total buffered column
+    budget, shared by ``buffer_count`` independently reusable windows.
+    """
+
+    padding_bytes: int = 16
+    max_cols: int = 0
+    buffer_count: int = 1
+    num_warps: int = 1
+
+    def __post_init__(self):
+        if self.padding_bytes < 0 or self.padding_bytes % 16:
+            raise ValueError("bulk SMEM padding must be a nonnegative multiple of 16 bytes")
+        if self.max_cols not in (0, 64, 128, 256, 512):
+            raise ValueError("bulk SMEM columns must be 0 (full tile), 64, 128, 256, or 512")
+        if self.buffer_count not in (1, 2):
+            raise ValueError("bulk SMEM buffer count must be 1 or 2")
+        if self.num_warps not in (1, 2, 4):
+            raise ValueError("bulk store warp count must be 1, 2, or 4")
+
+
+@dataclass(frozen=True)
 class GemmConfig:
     tile_m: int = 128
     tile_n: int = 192

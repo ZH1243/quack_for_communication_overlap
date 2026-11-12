@@ -42,7 +42,7 @@ from quack.tile_scheduler import (
 )
 from quack.varlen_utils import VarlenArguments, VarlenManager
 from quack.gemm_base import GemmTmaBase, NamedBarrierGemm
-from quack.gemm_config import SplitKMode
+from quack.gemm_config import BlackwellBulkStoreConfig, SplitKMode
 from quack import layout_utils
 from quack import pipeline_checks
 import quack.copy_utils as copy_utils
@@ -237,6 +237,7 @@ class GemmSm100(GemmTmaBase):
         gather_table_num_buffers: int = 1,
         epilogue_store: str = "tma",
         n_tile_major_output: bool = False,
+        bulk_store_config: Optional[BlackwellBulkStoreConfig] = None,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -290,6 +291,15 @@ class GemmSm100(GemmTmaBase):
         assert epilogue_store in ("tma", "bulk_rows", "bulk_rows_reduce")
         self.bulk_row_store = epilogue_store != "tma"
         self.bulk_row_reduce = epilogue_store == "bulk_rows_reduce"
+        if bulk_store_config is not None:
+            if not self.bulk_row_store:
+                raise ValueError("bulk_store_config requires bulk-row stores")
+            # Instance-local values: independent plans may coexist with a warm
+            # object cache, without mutating benchmark class defaults.
+            self.bulk_store_smem_padding_bytes = bulk_store_config.padding_bytes
+            self.bulk_store_smem_max_cols = bulk_store_config.max_cols
+            self.bulk_store_buffer_count = bulk_store_config.buffer_count
+            self.bulk_store_num_warps = bulk_store_config.num_warps
         self.bulk_store_rows = None
         self.n_tile_major_output = n_tile_major_output
         self.pingpong = False  # Native TMEM accumulator pipeline, not SM90 warpgroup pingpong.
