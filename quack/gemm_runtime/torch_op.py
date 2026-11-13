@@ -120,6 +120,7 @@ def _gemm_epi(digest: str, ins: list[torch.Tensor], outs: list[torch.Tensor], me
         store_d=m["store_d"],
         config=cfg,
         tuned=m["tuned"],
+        sm_count=m.get("sm_count"),
         cu_seqlens_m=named.get("cu_seqlens_m"),
         A_idx=named.get("A_idx"),
         SFA=_sf_decode(named.get("SFA"), m.get("bs_format_a")),
@@ -211,6 +212,7 @@ def compile_call(
     transform_sf=None,
     transform_operands=None,
     add_to_output=False,
+    sm_count=None,
 ):
     """torch.compile-path body of ``EpiMod.__call__``: record one functional
     ``quack::gemm_epi_f`` call (allocation inside the op, so the graph gets a
@@ -268,6 +270,7 @@ def compile_call(
             sink_names=sink_names,
             store_d=bool(store_d),
             tuned=bool(tuned),
+            sm_count=sm_count,
             config=None if cfg is None else cfg.__dict__,
             rounding_mode=int(rounding_mode),
             bs_format_a=bs_format_a,

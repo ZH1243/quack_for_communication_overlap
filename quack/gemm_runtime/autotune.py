@@ -175,9 +175,12 @@ def _prune_for_mod(mod, transform_a, configs, named_args, **kwargs):
     varlen_or_gather = varlen_m or A_idx is not None
     blockscaled = kwargs.get("SFA") is not None
     has_concat = bool(kwargs.get("concat_layout"))
+    sm_count = kwargs.get("sm_count")
     for conf in configs:
         c = conf.kwargs["config"]
         if c.device_capacity != cap:
+            continue
+        if sm_count is not None and sm_count % (c.cluster_m * c.cluster_n):
             continue
         if not config_supports(c, gather_A=A_idx is not None, varlen_m=varlen_m):
             continue
@@ -230,6 +233,7 @@ def _make_tuned_fn(mod, epi_names, transform_a=None, ta_names=()):
         cu_seqlens_m=None,
         A_idx=None,
         dynamic_scheduler=False,
+        sm_count=None,
         SFA=None,
         SFB=None,
         bs_format_a=None,
@@ -297,6 +301,7 @@ def _make_tuned_fn(mod, epi_names, transform_a=None, ta_names=()):
                 cluster_N=c.cluster_n,
                 pingpong=c.pingpong,
                 is_dynamic_persistent=dyn,
+                sm_count=sm_count,
                 max_swizzle_size=c.max_swizzle_size,
                 tile_count_semaphore=sem,
                 cu_seqlens_m=cu_seqlens_m,
@@ -337,6 +342,7 @@ def _make_tuned_fn(mod, epi_names, transform_a=None, ta_names=()):
     ]
     params.append(inspect.Parameter("b_kn", kw, default=False))
     params.append(inspect.Parameter("dynamic_scheduler", kw, default=False))
+    params.append(inspect.Parameter("sm_count", kw, default=None))
     params.append(inspect.Parameter("concat_layout", kw, default=None))
     params.append(inspect.Parameter("transform_digest", kw, default=None))
     params.append(inspect.Parameter("transform_sf", kw, default=None))
@@ -366,6 +372,7 @@ def _get_tuner(mod, epi_names, has_c, device, transform_a=None, ta_names=()):
                 "mod_digest",
                 "b_kn",
                 "dynamic_scheduler",
+                "sm_count",
                 "concat_layout",
                 "bs_format_a",
                 "bs_format_b",
@@ -391,6 +398,7 @@ def tuned_mod_gemm(
     cu_seqlens_m=None,
     A_idx=None,
     dynamic_scheduler=False,
+    sm_count=None,
     SFA=None,
     SFB=None,
     bs_format_a=None,
@@ -409,6 +417,8 @@ def tuned_mod_gemm(
     mod.gemm's own plan cache). Reduce-sink buffers in ``epi_args`` must be
     allocated at the sweep's worst case — see ``sink_arg_shapes``. Returns
     TunedModGemm(plan, config, sinks) with the winning config's sink views."""
+    if sm_count is not None and sm_count <= 0:
+        raise ValueError("sm_count must be positive and divisible by the cluster size")
     if transform_a is not None:
         from quack.operand_transform.host import as_transform_mod
 
@@ -427,6 +437,7 @@ def tuned_mod_gemm(
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
         dynamic_scheduler=dynamic_scheduler,
+        sm_count=sm_count,
         SFA=SFA,
         SFB=SFB,
         bs_format_a=bs_format_a,

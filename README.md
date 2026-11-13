@@ -483,10 +483,32 @@ counts `2 * total_routes * N * K`, including the full preactivation N for SwiGLU
 
 Ready checks here measure the already-ready path, and completion tests have no
 concurrent consumer. Producer arrival delays, CPU polling, and RDMA/NVLink overlap
-require the two-node proxy benchmark. `--swiglu` does not accept `--sm-count` because
-the activation API does not expose that limit. Use `--baseline-only` to measure the
+require the two-node proxy benchmark. This benchmark's `--swiglu` variants still
+reject `--sm-count`; their runner does not forward the activation API's cap.
+Use `--baseline-only` to measure the
 existing indexed-gather path separately; compare identical configurations, data, and
 node conditions across revisions to check for regressions in ordinary GEMM.
+
+### Persistent CTA budget for fused activation
+
+`quack.gemm_interface.gemm_act(..., sm_count=128)` (also `gemm_gated`) accepts
+an optional persistent CTA budget. It supports Hopper and Blackwell, including
+the streamed multi-buffer gather-table SwiGLU used by RDMA_CPU_Proxy. The proxy
+exposes this as `--up-sm-count`, independently of `--down-sm-count`.
+
+The budget must be a positive multiple of the selected cluster size
+(`cluster_m * cluster_n`). Hardware capacity and available work may reduce the
+actual grid further. It limits parallelism without reserving physical SMs;
+Blackwell two-CTA MMA still accounts for both CTAs. `None` preserves the existing
+capacity policy. `EpiMod.gemm` rejects a cap with `persistent=False`.
+Host plan/call caches distinguish budgets; the compiled kernel can be reused
+because the cluster count is supplied through runtime scheduler arguments.
+
+Run the numerical cap/cache checks on each Hopper and Blackwell machine:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 timeout 1800 python -m pytest -q tests/test_gemm_sm_count.py -x
+```
 
 **Blackwell bulk-row output slowdown and mitigations.** The communication output
 path initially incurred a large throughput drop on B300. For BF16 R=32768 routes

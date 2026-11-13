@@ -828,6 +828,7 @@ def _gemm_act_call(
     alpha: float | Tensor = 1.0,
     tuned: bool,
     config: Optional[GemmConfig] = None,
+    sm_count: Optional[int] = None,
 ) -> None:
     from quack.epilogue.library import linear_act_mod
 
@@ -874,6 +875,7 @@ def _gemm_act_call(
             cluster_N=config.cluster_n,
             pingpong=config.pingpong,
             persistent=True,
+            sm_count=sm_count,
             is_dynamic_persistent=False,
             max_swizzle_size=config.max_swizzle_size,
             A_idx=A_idx,
@@ -892,6 +894,7 @@ def _gemm_act_call(
         store_d=store_d,
         config=config,
         tuned=tuned,
+        sm_count=sm_count,
         dynamic_scheduler=dynamic_scheduler,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
@@ -2177,12 +2180,17 @@ def gemm_act(
     concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
     split_k: Optional[int] = 1,
     split_k_mode: int = SplitKMode.SERIAL,
+    sm_count: Optional[int] = None,
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM with activation (or gated activation) and optional output tensors.
 
     ``alpha`` scales the accumulator before the activation
     (``postact = act(alpha * A @ B + C + bias)``). It is applied in fp32 and
     may be a float or a 1-element CUDA tensor; 1.0 keeps the alpha-free epilogue.
+
+    ``sm_count`` optionally caps persistent CTAs in whole clusters, bounded
+    by this device's cluster capacity. It does not reserve or pin physical SMs.
+    ``None`` preserves the hardware-derived default.
 
     On SM90/SM100, ``gather_work_table`` selects the table-scheduled gather-A path.
     Pass tensor sequences for ``A`` and ``A_idx`` together with
@@ -2281,6 +2289,7 @@ def gemm_act(
             bs_format_b=bs_format_b,
             alpha=alpha if isinstance(alpha, float) else 1.0,
             alpha_tensor=alpha if not isinstance(alpha, float) else None,
+            sm_count=sm_count,
             **kwargs,
         )
         return preact_out, postact_out
@@ -2306,6 +2315,7 @@ def gemm_act(
         alpha=alpha,
         tuned=tuned,
         config=config,
+        sm_count=sm_count,
     )
     return preact_out, postact_out
 
@@ -2317,7 +2327,7 @@ gemm_gated = gemm_act
     "quack::gemm_act_out",
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str? activation=None, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True, Tensor? SFA=None, Tensor? SFB=None, str? bs_format_a=None, str? bs_format_b=None, float alpha=1.0, Tensor? alpha_tensor=None) -> ()",
+    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str? activation=None, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True, Tensor? SFA=None, Tensor? SFB=None, str? bs_format_a=None, str? bs_format_b=None, float alpha=1.0, Tensor? alpha_tensor=None, int? sm_count=None) -> ()",
 )
 def gemm_act_out(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -2337,6 +2347,7 @@ def gemm_act_out(
     bs_format_b: Optional[str] = None,
     alpha: float = 1.0,
     alpha_tensor: Optional[Tensor] = None,
+    sm_count: Optional[int] = None,
 ) -> None:
     """GEMM with activation and pre-allocated output tensors."""
     _gemm_act_call(
@@ -2356,6 +2367,7 @@ def gemm_act_out(
         dynamic_scheduler=dynamic_scheduler,
         alpha=_merge_tensor(alpha, alpha_tensor),
         tuned=tuned,
+        sm_count=sm_count,
     )
 
 
@@ -2901,7 +2913,7 @@ def gemm_symmetric(
     "quack::gemm_gated_out",
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str activation='swiglu', Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True, str? concat_layout=None, Tensor? SFA=None, Tensor? SFB=None, str? bs_format_a=None, str? bs_format_b=None, float alpha=1.0, Tensor? alpha_tensor=None) -> ()",
+    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str activation='swiglu', Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True, str? concat_layout=None, Tensor? SFA=None, Tensor? SFB=None, str? bs_format_a=None, str? bs_format_b=None, float alpha=1.0, Tensor? alpha_tensor=None, int? sm_count=None) -> ()",
 )
 def gemm_gated_out(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -2922,6 +2934,7 @@ def gemm_gated_out(
     bs_format_b: Optional[str] = None,
     alpha: float = 1.0,
     alpha_tensor: Optional[Tensor] = None,
+    sm_count: Optional[int] = None,
 ) -> None:
     """GEMM with gated activation and pre-allocated output tensors."""
     _gemm_act_call(
@@ -2942,6 +2955,7 @@ def gemm_gated_out(
         dynamic_scheduler=dynamic_scheduler,
         alpha=_merge_tensor(alpha, alpha_tensor),
         tuned=tuned,
+        sm_count=sm_count,
     )
 
 

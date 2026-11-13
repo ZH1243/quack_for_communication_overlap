@@ -376,9 +376,12 @@ def build_gemm_epi_plan(
     # operand_transform.host.w4_operand_views (blob view + optional strip);
     # the ctor a_dtype comes from the format's mma_dtype.
     transform_a=None,
+    sm_count=None,
 ) -> GemmEpiPlan:
     """Derive majors/dtypes/epi keys from tensor metadata and compile (or hit
     the jit cache). Variant wrappers call this after their validation asserts."""
+    if sm_count is not None and not persistent:
+        raise ValueError("sm_count requires persistent=True")
     transform_ref, owned_fmt, transform_dims = None, None, None
     if transform_a is not None:
         from quack.operand_transform.host import as_transform_mod
@@ -404,6 +407,18 @@ def build_gemm_epi_plan(
                 "transform_a_operand(mod, A, values, tile_M)"
             )
             A = A.blob
+    # Residency is a runtime scheduler argument. Query the operand's device,
+    # and validate the cap before compiling a kernel on a cold plan cache.
+    max_active_clusters = (
+        get_max_active_clusters(
+            cluster_M * cluster_N,
+            device_capacity=device_capacity,
+            device_id=A.device.index or 0,
+            sm_count=sm_count,
+        )
+        if persistent
+        else 0
+    )
     batched = A.ndim == 3 or varlen_m
     a_major = _get_major(A, "m", "k")
     b_major = _get_major(B, "n", "k")
@@ -486,7 +501,6 @@ def build_gemm_epi_plan(
         transform_dims=transform_dims,
     )
 
-    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
     # Must mirror make_fake_scheduler_args above: only the SM90 dynamic
     # scheduler consumes the semaphore, so it's the only non-static case.
     scheduler_uses_semaphore = is_dynamic_persistent and device_capacity[0] == 9

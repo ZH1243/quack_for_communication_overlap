@@ -554,13 +554,17 @@ class EpiMod:
         self._minted[key] = cls
         return cls
 
-    def gemm_tuned(self, A, B, D, C=None, *, epi_args: dict, b_kn: bool = False):
+    def gemm_tuned(
+        self, A, B, D, C=None, *, epi_args: dict, b_kn: bool = False, sm_count=None
+    ):
         """Autotuned gemm(): config-space sweep via quack.gemm_runtime.autotune (lazy
         import — this module sits below gemm_config in the import graph).
         Returns TunedModGemm(plan, config, sinks); see tuned_mod_gemm."""
         from quack.gemm_runtime.autotune import tuned_mod_gemm
 
-        return tuned_mod_gemm(self, A, B, D, C, epi_args=epi_args, b_kn=b_kn)
+        return tuned_mod_gemm(
+            self, A, B, D, C, epi_args=epi_args, b_kn=b_kn, sm_count=sm_count
+        )
 
     def gemm(
         self,
@@ -577,6 +581,7 @@ class EpiMod:
         tile_K: Optional[int] = None,
         pingpong: bool = False,
         persistent: bool = True,
+        sm_count: Optional[int] = None,  # persistent CTA budget, in whole clusters
         is_dynamic_persistent: bool = False,
         max_swizzle_size: int = 8,
         tile_count_semaphore=None,
@@ -621,6 +626,8 @@ class EpiMod:
         #                        split-k self-resets); None = fresh per call
         _launch=True,  # False: resolve/compile only (EpiMod.plan) — no kernel launch
     ) -> GemmEpiPlan:
+        if sm_count is not None and not persistent:
+            raise ValueError("sm_count requires persistent=True")
         gather_table = gather_work_table is not None
         varlen_m = cu_seqlens_m is not None or gather_table
         gather_A = A_idx is not None
@@ -725,6 +732,7 @@ class EpiMod:
             cluster_N,
             pingpong,
             persistent,
+            sm_count,
             is_dynamic_persistent,
             max_swizzle_size,
             A.device,
@@ -1228,6 +1236,7 @@ class EpiMod:
             tile_K=tile_K,
             pingpong=pingpong,
             persistent=persistent,
+            sm_count=sm_count,
             is_dynamic_persistent=is_dynamic_persistent,
             max_swizzle_size=max_swizzle_size,
             varlen_m=varlen_m,
@@ -1402,6 +1411,7 @@ class EpiMod:
             cluster_N=config.cluster_n,
             pingpong=config.pingpong,
             persistent=True,
+            sm_count=ctx.get("sm_count"),
             is_dynamic_persistent=dyn,
             max_swizzle_size=config.max_swizzle_size,
             tile_count_semaphore=semaphore,
@@ -1436,6 +1446,7 @@ class EpiMod:
         config=None,  # explicit GemmConfig pins; None + tuned=True autotunes
         tuned=True,
         dynamic_scheduler=False,
+        sm_count=None,
         cu_seqlens_m=None,
         A_idx=None,
         SFA=None,
@@ -1535,6 +1546,7 @@ class EpiMod:
                 store_d=store_d,
                 config=config,
                 tuned=tuned,
+                sm_count=sm_count,
                 cu_seqlens_m=cu_seqlens_m,
                 A_idx=A_idx,
                 SFA=SFA,
@@ -1579,6 +1591,7 @@ class EpiMod:
                 None if config is None else id(config),
                 tuned,
                 dynamic_scheduler,
+                sm_count,
                 tensor_key(cu_seqlens_m),
                 tensor_key(A_idx),
                 tensor_key(SFA),
@@ -1683,6 +1696,7 @@ class EpiMod:
                 cu_seqlens_m=cu_seqlens_m,
                 A_idx=A_idx,
                 dynamic_scheduler=dynamic_scheduler,
+                sm_count=sm_count,
                 SFA=SFA,
                 SFB=SFB,
                 bs_format_a=bs_format_a,
@@ -1714,6 +1728,7 @@ class EpiMod:
                 bs_format_b=bs_format_b,
                 rounding_mode=rounding_mode,
                 epi_key_overrides=epi_key_overrides,
+                sm_count=sm_count,
                 concat_layout=concat_layout,
                 transform_a=transform_a,
                 transform_sf=transform_sf,
@@ -1770,6 +1785,7 @@ class EpiMod:
         #               autotuning here (autotune via an eager call, or pass
         #               the tuned config) — plan() never launches.
         dynamic_scheduler=False,
+        sm_count=None,
         cu_seqlens_m=None,
         A_idx=None,
         SFA=None,
@@ -1834,6 +1850,7 @@ class EpiMod:
             bs_format_b=bs_format_b,
             rounding_mode=rounding_mode,
             epi_key_overrides=epi_key_overrides,
+            sm_count=sm_count,
             transform_a=transform_a,
             transform_sf=transform_sf,
             add_to_output=add_to_output,
@@ -2009,6 +2026,7 @@ class StaticEpi:
         epi_args,
         config=None,
         dynamic_scheduler=False,
+        sm_count=None,
         b_kn=False,
         varlen_m=False,
         gather_A=False,
@@ -2032,6 +2050,7 @@ class StaticEpi:
             cluster_N=cfg.cluster_n,
             pingpong=cfg.pingpong,
             persistent=True,
+            sm_count=sm_count,
             is_dynamic_persistent=dyn,
             max_swizzle_size=cfg.max_swizzle_size,
             varlen_m=varlen_m,
