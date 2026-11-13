@@ -93,6 +93,34 @@ iterations, compact scatter reductions, mapped-host readiness and a concurrent
 GPU consumer. See the repository README for configuration/cache details and the
 RDMA_CPU_Proxy README for the two-node launch protocol.
 
+`prepare_grouped_inputs(..., route_weights=weights)` accepts an optional contiguous
+FP32 `[routes]` tensor for the non-streaming four-column down gather table. Its
+entries follow logical routed input rows, before scatter; `make_launch` retains
+the tensor and passes it to the fused epilogue. Each FP32 down accumulator is
+multiplied by its row weight before output conversion and `bulk_rows_reduce`.
+Weights are applied once; ready-gated consumers continue adding partial results.
+Omitting the tensor retains the existing unweighted specialization. Keep the
+tensor alive and update packed values when the upstream row order changes.
+
+The proxy integration test includes distinct weights, all-zero completion and
+all-one equivalence to the unweighted reference with repeated launches and
+per-call bulk store settings. On each Hopper and Blackwell machine also run the
+RDMA worker composition suite, which exercises streamed multi-source SwiGLU,
+changed arrival order, GPU mapping and CPU-style metadata publication, an empty
+source, compact scatter reduction, and concurrent combine:
+
+```bash
+cd "$PROXY_ROOT"
+QUACK_ROOT="$QUACK_ROOT" CUDA_VISIBLE_DEVICES=0 timeout 3600 python -m unittest discover \
+  -s tests -p test_worker_composition.py -v
+```
+
+That suite's independent full-composition reference starts from original source
+token/expert/weight assignments and both GEMM matrices, not from packed mapping.
+`test_cpu_scatter_cuda` in the native proxy separately checks the actual CPU
+publisher and metadata copy ordering. Two-node execution remains necessary to
+validate GPUDirect visibility and communication/combine overlap.
+
 ### `hopper_gather_table_gemm.py`
 
 Benchmarks the new Hopper table-scheduled gather-A path. It passes no

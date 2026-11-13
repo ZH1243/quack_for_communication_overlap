@@ -195,6 +195,8 @@ class PregatherInputs:
     wave_store_workspace: torch.Tensor | None = None
     # GPU int32[1] view of workspace[1], reset per invocation. Acquire-load to poll.
     ready_groups: torch.Tensor | None = None
+    # Packed logical routed rows; retain through all launches and completion.
+    route_weights: torch.Tensor | None = None
 
     def output_buffers(self) -> tuple[torch.Tensor, ...]:
         return self.up_output if isinstance(self.up_output, tuple) else (self.up_output,)
@@ -678,6 +680,7 @@ def prepare_grouped_inputs(
     *,
     output_buffers: tuple[torch.Tensor, ...] | None = None,
     scatter_mapping: torch.Tensor | None = None,
+    route_weights: torch.Tensor | None = None,
 ) -> PregatherInputs:
     """Prepare output and scheduling metadata around an existing expert-major input."""
     if len(counts) != args.experts or sum(counts) != A.shape[0] or any(c < 0 for c in counts):
@@ -687,6 +690,12 @@ def prepare_grouped_inputs(
         args.output_dim * (2 if args.activation in GATED_ACTIVATIONS else 1),
     ):
         raise ValueError("grouped operands do not match the configured GEMM dimensions")
+    if route_weights is not None:
+        if args.activation is not None or args.down_projection or not args.gather_table:
+            raise ValueError("route_weights requires a plain gather-table GEMM")
+        if (route_weights.shape != (args.routes,) or route_weights.dtype != torch.float32
+                or route_weights.device != A.device or not route_weights.is_contiguous()):
+            raise ValueError("route_weights must be contiguous FP32[routes] on the input device")
     device, dtype = A.device, A.dtype
     capacity = device_capacity_for_args(args, device)
     if get_device_capacity(device)[0] != capacity:
@@ -847,6 +856,7 @@ def prepare_grouped_inputs(
         wave_ready_prefix=wave_ready_prefix,
         wave_store_workspace=wave_store_workspace,
         ready_groups=wave_store_workspace[1:] if wave_store_workspace is not None else None,
+        route_weights=route_weights,
     )
 
 
@@ -948,6 +958,7 @@ def make_launch(args: argparse.Namespace, inputs: PregatherInputs):
                 multi_buffer_scatter=args.multi_buffer_scatter,
                 n_tile_major_output=args.n_tile_major_output,
                 sm_count=getattr(args, "sm_count", None),
+                route_weights=inputs.route_weights,
             )
 
         if args.down_projection:
@@ -1099,7 +1110,12 @@ def check_scatter_reduction(
     for expert, (start, end) in enumerate(zip(offsets, offsets[1:])):
         a, w = inputs.A[start:end], inputs.W_up[expert]
         values = a.float() @ w.float()
-        baseline = (a @ w).to(output.dtype).float()
+        baseline = (a @ w).float()
+        if inputs.route_weights is not None:
+            scale = inputs.route_weights[start:end, None]
+            values = values * scale
+            baseline = baseline * scale
+        baseline = baseline.to(output.dtype).float()
         destinations = indices[start:end]
         reference.index_add_(0, destinations, values)
         magnitude.index_add_(0, destinations, baseline.abs())
@@ -1173,6 +1189,11 @@ def check_correctness(
             up_baseline = gated_to_pytorch_fn_map[activation](gate, up)
         elif activation is not None:
             up_baseline = act_to_pytorch_fn_map[activation](up_baseline)
+
+        if inputs.route_weights is not None:
+            scale = inputs.route_weights[start:end, None]
+            up_reference = up_reference * scale
+            up_baseline = (up_baseline.float() * scale).to(up_baseline.dtype)
 
         up_actual = (
             up_output[start:end]

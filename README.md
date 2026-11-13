@@ -244,7 +244,114 @@ This validates basic Blackwell GEMM. The communication extensions below have a n
 Blackwell implementation, but still require compilation, numerical validation, and
 performance measurement on B300. The earlier basic-GEMM result does not validate them.
 
-### Blackwell communication GEMM validation
+## Blackwell node development environment (CUDA 13)
+
+Use this alternative on Linux Blackwell nodes with an existing CUDA 13.0 toolkit.
+Create a new environment so the CUDA 12.9 setup above remains available. For a
+multi-node run, perform the setup on each node. These commands select Python 3.12,
+PyTorch 2.13.0+cu130, CUDA Python bindings 13.0.3, and CUTLASS DSL 4.7.0 with its
+`cu13` extra.
+
+Initialize Conda and create the environment:
+
+```bash
+source ~/miniconda3/etc/profile.d/conda.sh
+conda create --name zh_quack_blackwell312_cu130 python=3.12 pip -y
+conda activate zh_quack_blackwell312_cu130
+python -m pip install --upgrade pip
+```
+
+Select the installed toolkit, adjusting its path if necessary. Setting `CUDA_HOME`
+does not install a toolkit; `bin/nvcc` must already exist at the selected path.
+Keep QuACK's compiled-object cache inside the new environment:
+
+```bash
+export CUDA_HOME=/usr/local/cuda-13.0
+export PATH="$CONDA_PREFIX/bin:$CUDA_HOME/bin:$PATH"
+export QUACK_CACHE_DIR="$CONDA_PREFIX/var/cache/quack"
+"$CUDA_HOME/bin/nvcc" --version  # Expected: release 13.0.
+nvidia-smi
+```
+
+Install the CUDA 13.0 PyTorch build first, then matching CUDA Python bindings and
+this repository checkout. Use `pip` for the CUDA 13 extra, following the
+installation-order guidance at the top of this README:
+
+```bash
+python -m pip install 'torch==2.13.0+cu130' \
+  --index-url https://download.pytorch.org/whl/cu130
+python -m pip install 'cuda-python==13.0.3' 'cuda-bindings==13.0.3'
+cd /path/to/quack_for_communication_overlap
+python -m pip install -e '.[dev,cu13]' \
+  --extra-index-url https://download.pytorch.org/whl/cu130
+python -m pip check
+```
+
+Verify the package versions, editable checkout, and GPU visibility:
+
+```bash
+python - <<'PY'
+from importlib.metadata import version
+
+import torch
+import quack
+
+assert torch.version.cuda == "13.0", torch.version.cuda
+assert version("nvidia-cutlass-dsl") == "4.7.0"
+assert version("nvidia-cutlass-dsl-libs-cu13") == "4.7.0"
+assert torch.cuda.is_available(), "CUDA is unavailable"
+print("PyTorch:", torch.__version__)
+print("PyTorch CUDA:", torch.version.cuda)
+print("CUDA Python / bindings:", version("cuda-python"), version("cuda-bindings"))
+print("CUTLASS DSL / cu13:", version("nvidia-cutlass-dsl"),
+      version("nvidia-cutlass-dsl-libs-cu13"))
+print("QuACK:", quack.__file__)
+print("Visible GPUs:", torch.cuda.device_count())
+print("GPU:", torch.cuda.get_device_name(0))
+print("Compute capability:", torch.cuda.get_device_capability(0))
+PY
+```
+
+Confirm that `quack.__file__` points into this checkout. With the new environment
+active, run the 512-by-512 numerical GEMM check from the previous section; it
+compares the result against an FP32 reference. Then exercise the communication
+composition with:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 timeout 1800 python -m pytest -q \
+  run/test_proxy_gemm_integration.py -x
+```
+
+This test checks up/down composition, scatter reduction, compact output,
+readiness publication, repeated iterations, and concurrent GPU consumption.
+Native two-node RDMA execution still needs its separate integration checks.
+
+For embedded `librdma_cpu_proxy.so` execution, build the native proxy in a fresh
+`build-blackwell-cu130` directory using
+`-DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc"`,
+`-DCUDAToolkit_ROOT="$CUDA_HOME"`, and `-DCMAKE_CUDA_RUNTIME_LIBRARY=Shared`.
+Export `RDMA_PROXY_BUILD_DIR` to that directory when launching the proxy scripts.
+The library should depend on `libcudart.so.13`, and the worker's embedded-runtime
+preflight must see exactly one loaded runtime. See RDMA_CPU_Proxy's README,
+“CUDA 13 alternative”, for the full build, preflight, and two-node commands.
+
+In a later terminal, activate `zh_quack_blackwell312_cu130` and repeat the
+`CUDA_HOME`, `PATH`, and `QUACK_CACHE_DIR` exports above, plus
+`RDMA_PROXY_BUILD_DIR` when using the proxy. These shell exports are not saved by
+creating the Conda environment.
+
+This CUDA 13 recipe has been checked against package requirements but has not
+been validated on B300 here. CUTLASS DSL 4.7.0's
+[`cu13` compiler bundle corresponds to CUDA 13.3](https://docs.nvidia.com/cutlass/4.7.0/media/docs/pythonDSL/quick_start.html),
+while PyTorch and the native toolkit selected above use CUDA 13.0. The DSL wheel
+supplies its GEMM compiler. Matching runtime major versions addresses the CUDA
+12/13 conflict, but does not establish driver compatibility with every compiler
+feature. CUDA 13.x
+[minor-version compatibility has feature and PTX limitations](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html);
+retain `nvidia-smi` output and require the numerical checks to pass before the
+full proxy run.
+
+## Blackwell communication GEMM validation
 
 The native SM100 kernel now accepts single-buffer/indexed and multi-buffer gather tables,
 streamed table readiness, fused table-gather SwiGLU, bulk-row copy/reduction, row scatter,

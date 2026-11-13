@@ -35,7 +35,8 @@ def blackwell_device():
 
 @pytest.mark.parametrize("tile_m,tile_n,down_cluster_m", [(128, 128, 1), (128, 128, 2), (256, 512, 2)])
 @pytest.mark.parametrize("tuned_bulk", [False, True])
-def test_proxy_up_down_composition(tile_m, tile_n, down_cluster_m, tuned_bulk):
+@pytest.mark.parametrize("route_weight_policy", [None, "distinct", "zeros", "ones"])
+def test_proxy_up_down_composition(tile_m, tile_n, down_cluster_m, tuned_bulk, route_weight_policy):
     """Ragged multi-buffer SwiGLU -> compact scatter-add -> concurrent acquire."""
     xs, idx, wu, table, pre, packed, _ = inputs(
         3, n=512, tile_m=tile_m, tile_n=128, cluster_m=2,
@@ -78,9 +79,16 @@ def test_proxy_up_down_composition(tile_m, tile_n, down_cluster_m, tuned_bulk):
                     for count in used)
     mapping = torch.tensor([[i % 3, (i // 3) % used[i % 3]] for i in range(rows)],
                            device="cuda", dtype=torch.int32)
+    route_weights = None
+    if route_weight_policy is not None:
+        route_weights = (torch.zeros(rows, device="cuda", dtype=torch.float32)
+                         if route_weight_policy == "zeros" else
+                         torch.ones(rows, device="cuda", dtype=torch.float32)
+                         if route_weight_policy == "ones" else
+                         0.03125 + torch.arange(rows, device="cuda", dtype=torch.float32).remainder(17) / 16)
     down = pregather.prepare_grouped_inputs(
         args, up[:rows], wd, [len(p) for p in packed],
-        output_buffers=outputs, scatter_mapping=mapping,
+        output_buffers=outputs, scatter_mapping=mapping, route_weights=route_weights,
     )
     cluster_rows = cta_tile_shape_m(tile_m, down_cluster_m, 10) * down_cluster_m
     assert all(end - start <= cluster_rows
@@ -109,6 +117,9 @@ def test_proxy_up_down_composition(tile_m, tile_n, down_cluster_m, tuned_bulk):
             offsets.append(offsets[-1] + len(p))
         ref_down = torch.cat([up[offsets[e]:offsets[e + 1]].float() @ wd[e].float()
                               for e in range(len(packed))])
+        if route_weights is not None:
+            # Scaling precedes contribution conversion and additive reduction.
+            ref_down *= route_weights[:, None]
         expected = [torch.zeros(count, out_n, device="cuda") for count in used]
         for b in range(3):
             mask = mapping[:, 0] == b

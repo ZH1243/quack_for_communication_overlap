@@ -106,6 +106,7 @@ def _compile_gemm(
     bulk_row_swizzle=False,
     bulk_store_rows=None,
     bulk_store_config=None,
+    has_route_weights=False,
 ):
     sm_to_cls = {
         8: GemmDefaultSm80,
@@ -159,6 +160,10 @@ def _compile_gemm(
         mColVec = None
 
     epi_args = GemmCls.EpilogueArguments(
+        mRouteWeights=(
+            fake_tensor(Float32, (m,), leading_dim=0, divisibility=1)
+            if has_route_weights else None
+        ),
         mScatter=(
             fake_tensor(Int64, (m, 2), leading_dim=1, divisibility=1)
             if has_scatter and scatter_addresses and n_tile_major_output
@@ -673,6 +678,12 @@ def gemm(
     bulk_store_config: Optional[BlackwellBulkStoreConfig] = None,
     # Cap persistent CTAs in whole clusters; does not reserve or pin physical SMs.
     sm_count: Optional[int] = None,
+    # Optional contiguous CUDA FP32[R] scales in logical routed-row order.
+    # Applies to the FP32 accumulator before output conversion/scatter reduction.
+    # Initial scope: static single-buffer four-column gather tables. Values must
+    # be finite and nonnegative (caller validates contents outside timed launches).
+    # Zero weights still perform stores and participate in completion accounting.
+    route_weights: Optional[Tensor] = None,
 ) -> _GemmPlan:
     if sm_count is not None and not persistent:
         raise ValueError("sm_count requires persistent=True")
@@ -748,6 +759,12 @@ def gemm(
             raise ValueError("tensor sequences require multi_buffer_gather=True")
         A_buffers, A_idx_buffers = (A,), (A_idx,) if A_idx is not None else ()
 
+    # tensor_key excludes device, so enforce this on warm plan-cache hits too.
+    if route_weights is not None and (
+        not isinstance(route_weights, Tensor) or route_weights.device != A.device
+    ):
+        raise ValueError("route_weights must be a tensor on the GEMM input device")
+
     alpha_mode = scalar_mode(alpha)
     beta_mode = scalar_mode(beta)
     sr_seed_mode = (
@@ -775,6 +792,7 @@ def gemm(
         tensor_key(cu_seqlens_m),
         tensor_key(cu_seqlens_k),
         tensor_key(scatter_table),
+        tensor_key(route_weights),
         multi_buffer_scatter,
         n_tile_major_output,
         tensor_key(gather_work_table),
@@ -878,6 +896,7 @@ def gemm(
             bulk_store_rows=bulk_store_rows,
             bulk_store_config=bulk_store_config,
             scatter_table=scatter_table,
+            route_weights=route_weights,
             multi_buffer_scatter=multi_buffer_scatter,
             n_tile_major_output=n_tile_major_output,
             sm_count=sm_count,
@@ -899,6 +918,7 @@ def gemm(
         cu_seqlens_k=cu_seqlens_k,
         A_idx=A_idx,
         scatter_table=scatter_table,
+        route_weights=route_weights,
         gather_work_table=gather_work_table,
         gather_work_table_ready=gather_work_table_ready,
         wave_store_counter=wave_store_counter,
@@ -933,6 +953,7 @@ def run_gemm_plan(
     cu_seqlens_k: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,
     scatter_table: Optional[Tensor] = None,
+    route_weights: Optional[Tensor] = None,
     gather_work_table: Optional[Tensor] = None,
     gather_work_table_ready: Optional[Tensor] = None,
     # Opt-in wave store barrier: private int32[1] workspace, reset on every launch.
@@ -991,6 +1012,7 @@ def run_gemm_plan(
     if epi_args is None:
         epi_args = GemmDefaultEpiMixin.EpilogueArguments(
             mScatter=scatter_table,
+            mRouteWeights=route_weights,
             alpha=scalar_arg(alpha, plan.alpha_mode),
             beta=scalar_arg(beta, plan.beta_mode),
             mRowVecBroadcast=rowvec_bias,
@@ -1099,7 +1121,24 @@ def _build_gemm_plan(
     bulk_store_rows=None,
     bulk_store_config=None,
     sm_count=None,
+    route_weights=None,
 ) -> _GemmPlan:
+    if route_weights is not None:
+        if (
+            gather_work_table is None or gather_work_table.ndim != 2
+            or gather_work_table.shape[1] != 4 or multi_buffer_gather_args is not None
+            or gather_work_table_ready is not None
+        ):
+            raise ValueError(
+                "route_weights requires a non-streaming single-buffer four-column gather table"
+            )
+        if (
+            A_idx is None or route_weights.ndim != 1
+            or route_weights.shape != A_idx.shape or route_weights.dtype != torch.float32
+            or not route_weights.is_cuda or route_weights.device != A.device
+            or not route_weights.is_contiguous()
+        ):
+            raise ValueError("route_weights must be contiguous CUDA FP32[R] aligned with A_idx")
     if wave_ready_host_address is not None:
         if wave_ready_prefix is None:
             raise ValueError("host readiness publication requires wave_ready_prefix")
@@ -1619,6 +1658,7 @@ def _build_gemm_plan(
         bulk_row_swizzle=bulk_row_swizzle,
         bulk_store_rows=bulk_store_rows,
         bulk_store_config=bulk_store_config,
+        has_route_weights=route_weights is not None,
     )
 
     scheduler_uses_semaphore = is_dynamic_persistent and device_capacity[0] <= 9
@@ -1638,6 +1678,7 @@ def _build_gemm_plan(
         and SFD is None
         and SFDCol is None
         and scatter_table is None
+        and route_weights is None
     ):
         epi_static = GemmDefaultEpiMixin.EpilogueArguments(
             alpha=None,

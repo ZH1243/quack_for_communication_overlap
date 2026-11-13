@@ -7,7 +7,7 @@ from cutlass import Int32, Float32, const_expr
 
 from quack.cute_dsl_utils import mlir_namedtuple
 from quack.epilogue.mixin import ComposableEpiMixin
-from quack.epilogue.ops import Scalar, RowVecLoad, ColVecLoad
+from quack.epilogue.ops import EpiOp, Scalar, RowVecLoad, ColVecLoad
 from quack.epilogue.quantize_out import BlockScaleFactorStore
 from quack.gemm_sm80 import GemmSm80
 from quack.gemm_sm90 import GemmSm90
@@ -67,6 +67,49 @@ def apply_linear_epilogue(
             tRS_rD[i] += tDrColVec[i]
 
 
+class RouteWeightLoad(EpiOp):
+    """Read a packed routed-row scale without changing epilogue traversal/smem.
+
+    Gather-table M coordinates are absolute routed-row starts, not tile IDs or
+    source-token IDs. The scheduler has already applied the Blackwell two-CTA
+    offset. Repeated N groups intentionally read the same immutable row weights.
+    Unlike ColVecLoad, this op needs neither cu_seqlens_m nor a staging barrier.
+    """
+
+    def param_fields(self):
+        return [(self.name, Optional[cute.Tensor], None)]
+
+    def to_params(self, gemm, args):
+        return {self.name: getattr(args, self.name)}
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        assert gemm.gather_table, "route weights require gather-table scheduling"
+        row_start, row_end = ctx.tile_coord_mnkl[0], ctx.tile_coord_mnkl[2]
+        row_layout = cute.make_layout((ctx.tile_M, ctx.tile_N), stride=(1, 0))
+        gWeights = cute.make_tensor(param.iterator + row_start, row_layout)
+        # Use a scalar row-coordinate iterator with the same broadcast layout.
+        # filter_zeros below leaves one load for each distinct per-thread row.
+        cRows = cute.make_tensor(0, row_layout)
+        tDgW = ctx.partition_for_epilogue_fn(gWeights)
+        tDcW = ctx.partition_for_epilogue_fn(cRows)
+        if const_expr(ctx.tiled_copy_t2r is not None):
+            tDgW = ctx.tiled_copy_r2s.retile(tDgW)
+            tDcW = ctx.tiled_copy_r2s.retile(tDcW)
+        tDrW = cute.make_rmem_tensor(tDgW.layout, Float32)
+        gW = cute.filter_zeros(tDgW)
+        cW = cute.filter_zeros(tDcW)
+        rW = cute.filter_zeros(tDrW)
+        for i in cutlass.range(cute.size(rW), unroll_full=True):
+            rW[i] = Float32(0.0)
+            if row_start + cW[i] < row_end and row_start + cW[i] < cute.size(param):
+                rW[i] = gW[i]
+        return tDrW
+
+    def begin_loop(self, gemm, state, epi_coord):
+        return cute.group_modes(state, 3, cute.rank(state))[None, None, None, epi_coord]
+
+
 class GemmDefaultEpiMixin(ComposableEpiMixin):
     _epi_ops = (
         Scalar("alpha"),
@@ -74,6 +117,7 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
         Scalar("sr_seed", dtype=Int32),
         RowVecLoad("mRowVecBroadcast"),
         ColVecLoad("mColVecBroadcast"),
+        RouteWeightLoad("mRouteWeights"),
         # D quantize codecs (at most one active): the driver's store loop runs
         # the active codec on the final D fragment right before DStore's
         # convert (see gemm_base.epilogue / ComposableEpiMixin._epi_store_quant).
@@ -113,6 +157,7 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
         sfd_norm_const: Optional[Float32 | cute.Tensor] = None
         mSFDCol: Optional[cute.Tensor] = None
         mScatter: Optional[cute.Tensor] = None
+        mRouteWeights: Optional[cute.Tensor] = None
 
     # EpilogueParams auto-generated from _epi_ops
 
@@ -152,6 +197,12 @@ class GemmDefaultEpiMixin(ComposableEpiMixin):
             epi_loop_tensors.get("mRowVecBroadcast"),
             epi_loop_tensors.get("mColVecBroadcast"),
         )
+        if const_expr("mRouteWeights" in epi_loop_tensors):
+            # The accumulator is still FP32 here. DStore converts only after
+            # epi_visit_subtile returns; bulk_rows_reduce then adds that value.
+            tDrW = epi_loop_tensors["mRouteWeights"]
+            for i in cutlass.range(cute.size(tRS_rD), unroll_full=True):
+                tRS_rD[i] = tRS_rD[i] * tDrW[i]
         return ()
 
 
