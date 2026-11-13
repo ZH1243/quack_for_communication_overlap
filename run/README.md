@@ -121,6 +121,85 @@ token/expert/weight assignments and both GEMM matrices, not from packed mapping.
 publisher and metadata copy ordering. Two-node execution remains necessary to
 validate GPUDirect visibility and communication/combine overlap.
 
+### Weighted epilogue overhead on Blackwell
+
+Add `--weighted-contributions` to `blackwell_gemm_communication_bench.py` to
+compare fused FP32 route scaling against the matching unweighted paths. It
+implies `--stores`; `--waves` and `--host-ready` enable additional weighted
+completion/publication pairs. Existing variants and defaults are unchanged.
+
+| Weighted variant | Unweighted control |
+| --- | --- |
+| `weighted scatter add` | `scatter add` |
+| `weighted compact scatter` | `compact scatter add` |
+| `weighted wave barrier` | `wave barrier` |
+| `weighted GPU ready` | `GPU ready prefix` |
+| `weighted host ready` | `host ready prefix` |
+
+The `vs control` column is the added route-scaling latency:
+`100 * (weighted_us / unweighted_us - 1)`. Both variants use identical input
+data, expert matrices, gather table, destination mapping, geometry, bulk store
+settings, and completion protocol. Outputs and ready counters are independent.
+The reference multiplies the FP32 GEMM result before BF16 conversion, then sums
+the converted contributions. Numerical and completion checks run before timing
+and after graph replay.
+
+The benchmark's existing synthetic routing pairs rows into duplicate output
+destinations. A private seed (`5678`) generates fixed positive FP32 route weights,
+normalized over each destination's complete route group before output-buffer
+partitioning. This is synthetic two-contribution data, not the proxy's top-k
+router. The same packed vector is reused by every weighted variant and iteration.
+Generation, normalization, route packing, output zeroing, and mapped-host flag
+resets are excluded from timing. Wave variants include their mandatory GPU
+counter reset in both calls. Graphs interleave launches and rotate variant order;
+check the reported baseline drift and repeat on an idle GPU.
+
+First exercise partial M/N tiles and a singleton destination on the remote GPU:
+
+```bash
+QUACK_CACHE_ENABLED=0 CUDA_VISIBLE_DEVICES=0 \
+python run/blackwell_gemm_communication_bench.py \
+  --k 64 --n 520 --buffers 3 --experts 2 \
+  --routes-per-buffer 129 --tokens-per-buffer 257 \
+  --tile-m 256 --tile-n 512 --cluster-m 2 \
+  --host-ready --weighted-contributions \
+  --bulk-smem-padding 16 --bulk-smem-cols 128 \
+  --bulk-smem-buffers 1 --bulk-store-warps 4 \
+  --warmup 1 --rounds 1 --repetitions 1
+```
+
+Then run the full comparison with the requested workload:
+
+```bash
+QUACK_CACHE_ENABLED=0 CUDA_VISIBLE_DEVICES=0 \
+python run/blackwell_gemm_communication_bench.py \
+  --k 1024 --n 7168 --buffers 16 \
+  --tile-m 256 --tile-n 512 --cluster-m 2 \
+  --packed-baseline --host-ready --weighted-contributions \
+  --bulk-smem-padding 16 --bulk-smem-cols 128 \
+  --bulk-smem-buffers 1 --bulk-store-warps 4
+```
+
+For a focused comparison of just the two host-ready paths, append
+`--variants "host ready prefix" "weighted host ready"` to that command.
+To isolate scaling without completion/publication, instead append
+`--variants "compact scatter add" "weighted compact scatter"`.
+For the proxy's model-shaped down projection, change `--k 1024` to `--k 2048`;
+keep all other settings identical within the comparison. An optional
+`--sm-count 128` caps both paths equally.
+
+`QUACK_CACHE_ENABLED=0` is still required by this standalone benchmark's existing
+bulk override context managers. Route weighting itself supports normal caching;
+the production per-call bulk configuration is unchanged. These measurements
+exclude weight preparation, communication, and concurrent combine. They measure
+the GEMM path, not full proxy overhead.
+
+CPU reference/argument regression checks (PyTorch required; no CUDA/CuTe):
+
+```bash
+python -m unittest discover -s tests -p test_blackwell_weighted_bench.py -v
+```
+
 ### `hopper_gather_table_gemm.py`
 
 Benchmarks the new Hopper table-scheduled gather-A path. It passes no

@@ -8,20 +8,8 @@ from contextlib import ExitStack
 import torch
 import torch.nn.functional as F
 
-from quack.cute_dsl_utils import get_max_active_clusters
-from quack.gemm import build_scatter_row_addresses, gemm
-from quack.gemm_config import GemmConfig, cta_tile_shape_m
-from quack.gemm_interface import gemm_act
 
-from blackwell_bench_utils import (
-    Variant, bulk_smem_buffers, bulk_smem_cols, bulk_smem_padding, bulk_store_warps,
-    kernel_config_trace, mapped_host_flag, measure, profile_variant, select_variants,
-)
-from blackwell_gemm_tables import make_table
-from wave_ready import build_wave_ready_prefix
-
-
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--k", type=int, default=4096)
     parser.add_argument("--n", type=int, default=1024,
@@ -47,6 +35,9 @@ def parse_args():
                         help="completion barrier and GPU ready prefix; implies --stores")
     parser.add_argument("--host-ready", action="store_true",
                         help="mapped-host ready-prefix publication; implies --waves")
+    parser.add_argument("--weighted-contributions", action="store_true",
+                        help="compare fused FP32 route scaling against matching unweighted "
+                             "scatter/reduction and enabled completion paths; implies --stores")
     parser.add_argument("--swiglu", action="store_true",
                         help="compare indexed/table fused SwiGLU with store_preact=False")
     parser.add_argument("--baseline-only", action="store_true")
@@ -68,9 +59,9 @@ def parse_args():
     parser.add_argument("--rounds", type=int, default=9)
     parser.add_argument("--repetitions", type=int, default=16)
     parser.add_argument("--warmup", type=int, default=100, help="full graph replays")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     args.waves = args.waves or args.host_ready
-    args.stores = args.stores or args.waves
+    args.stores = args.stores or args.waves or args.weighted_contributions
     if min(args.k, args.n, args.buffers, args.experts, args.routes_per_buffer,
            args.tokens_per_buffer, args.tile_m, args.tile_n, args.group_size,
            args.rounds, args.repetitions) <= 0 or args.warmup < 0:
@@ -99,7 +90,38 @@ def parse_args():
     return args
 
 
+def make_route_weights(mapping, *, seed=5678):
+    """Fixed positive FP32 scales normalized over each synthetic destination's routes.
+
+    The benchmark pairs routes into duplicate destinations, rather than using a
+    real top-k router. Normalize complete destination groups before splitting
+    them into output buffers. A private RNG preserves the existing workload.
+    """
+    generator = torch.Generator(device=mapping.device).manual_seed(seed)
+    weights = torch.rand(mapping.numel(), dtype=torch.float32, device=mapping.device,
+                         generator=generator).add_(0.01)
+    totals = torch.zeros_like(weights).scatter_add_(0, mapping.long(), weights)
+    return (weights / totals[mapping.long()]).contiguous()
+
+
+def scatter_reference(reference, mapping, dtype, route_weights=None):
+    """Round each scaled FP32 contribution before the scatter-add reference."""
+    accumulator = reference if route_weights is None else reference * route_weights[:, None]
+    return torch.zeros_like(reference).index_add_(0, mapping.long(), accumulator.to(dtype).float())
+
+
 def benchmark(args, resources):
+    # Delay CUDA/DSL imports so CLI and reference arithmetic can be tested on CPU.
+    from quack.cute_dsl_utils import get_max_active_clusters
+    from quack.gemm import build_scatter_row_addresses, gemm
+    from quack.gemm_config import GemmConfig, cta_tile_shape_m
+    from quack.gemm_interface import gemm_act
+    from blackwell_bench_utils import (
+        Variant, mapped_host_flag, measure, profile_variant, select_variants,
+    )
+    from blackwell_gemm_tables import make_table
+    from wave_ready import build_wave_ready_prefix
+
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         raise RuntimeError("run this benchmark on a B200/B300 node")
     torch.manual_seed(1234)
@@ -224,11 +246,21 @@ def benchmark(args, resources):
         # Pair routes into even destination rows across the full allocation so
         # duplicate reduction exercises every destination buffer at normal sizes.
         mapping = (permutation // 2) * 2
-        reduced = torch.zeros_like(reference).index_add_(
-            0, mapping.long(), reference.to(dtype).float()
-        )
+        reduced = scatter_reference(reference, mapping, dtype)
         add("scatter add", joined_x, joined_idx, table=single_table,
             store="bulk_rows_reduce", scatter=mapping, expected=reduced, control="reduce unique")
+        route_weights = None
+        weighted_reduced = None
+        if args.weighted_contributions:
+            route_weights = make_route_weights(mapping)
+            weighted_reduced = scatter_reference(reference, mapping, dtype, route_weights)
+            add("weighted scatter add", joined_x, joined_idx, table=single_table,
+                store="bulk_rows_reduce", scatter=mapping, expected=weighted_reduced,
+                route_weights=route_weights, control="scatter add")
+            print("Routing weights: fixed FP32 positive random values (seed=5678), normalized "
+                  "over all routes sharing each synthetic destination. Weight generation and "
+                  "packing excluded; scaling occurs before BF16 conversion. Read each weighted "
+                  "row's 'vs control' for its added GEMM-path cost.", flush=True)
         # Keep global destination row order identical across single/multi-buffer
         # scatter. Destinations are equal-sized views of one allocation, avoiding
         # an allocation-placement change when measuring address representation.
@@ -236,7 +268,7 @@ def benchmark(args, resources):
         dest_mapping = torch.stack((mapping // rows_per_dest, mapping % rows_per_dest), dim=1)
         ntiles = math.ceil(args.n / args.tile_n)
 
-        def add_destinations(name, *, compact=False, control, **kwargs):
+        def add_destinations(name, *, compact=False, control, expected=reduced, **kwargs):
             width = ntiles * args.tile_n if compact else args.n
             storage = torch.zeros(r, width, device=device, dtype=dtype)
             buffers = tuple(storage.split(rows_per_dest))
@@ -255,11 +287,14 @@ def benchmark(args, resources):
                 ])
 
             add(name, joined_x, joined_idx, table=single_table, out=buffers,
-                store="bulk_rows_reduce", scatter=addresses, expected=reduced, logical=logical,
+                store="bulk_rows_reduce", scatter=addresses, expected=expected, logical=logical,
                 multi_buffer_scatter=True, n_tile_major_output=compact, control=control, **kwargs)
 
         add_destinations("multi-dest scatter add", control="scatter add")
         add_destinations("compact scatter add", compact=True, control="multi-dest scatter add")
+        if args.weighted_contributions:
+            add_destinations("weighted compact scatter", compact=True, control="compact scatter add",
+                             expected=weighted_reduced, route_weights=route_weights)
 
     if args.waves:
         num_work = len(single_rows) * args.group_size
@@ -271,7 +306,7 @@ def benchmark(args, resources):
         print(f"Wave geometry: {active} resident clusters, {len(prefix)} waves, "
               f"{num_groups} column groups", flush=True)
 
-        def add_wave(name, *, publish=False, host=False, control):
+        def add_wave(name, *, publish=False, host=False, control, weighted=False):
             counter = torch.zeros(2 if publish else 1, device=device, dtype=torch.int32)
             kwargs = dict(wave_store_counter=counter)
             reset = lambda: None
@@ -288,12 +323,20 @@ def benchmark(args, resources):
                     assert word.value == num_groups
 
             add_destinations(name, compact=True, control=control, prepare_extra=reset,
-                             check_extra=check_state, **kwargs)
+                             check_extra=check_state,
+                             expected=weighted_reduced if weighted else reduced,
+                             route_weights=route_weights if weighted else None, **kwargs)
 
         add_wave("wave barrier", control="compact scatter add")
         add_wave("GPU ready prefix", publish=True, control="wave barrier")
+        if args.weighted_contributions:
+            add_wave("weighted wave barrier", control="wave barrier", weighted=True)
+            add_wave("weighted GPU ready", publish=True, control="GPU ready prefix", weighted=True)
         if args.host_ready:
             add_wave("host ready prefix", publish=True, host=True, control="GPU ready prefix")
+            if args.weighted_contributions:
+                add_wave("weighted host ready", publish=True, host=True,
+                         control="host ready prefix", weighted=True)
         print("Wave timing includes the wrapper's GPU counter reset and cooperative launch; "
               "output and mapped-host flag resets are outside the interval.", flush=True)
 
@@ -342,6 +385,10 @@ def benchmark(args, resources):
 
 def main():
     args = parse_args()
+    from blackwell_bench_utils import (
+        bulk_smem_buffers, bulk_smem_cols, bulk_smem_padding, bulk_store_warps,
+        kernel_config_trace,
+    )
     with ExitStack() as resources:
         if args.bulk_smem_padding is not None:
             resources.enter_context(bulk_smem_padding(args.bulk_smem_padding))
