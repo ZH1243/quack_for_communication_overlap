@@ -174,6 +174,7 @@ class GemmSm90(GemmTmaBase):
         bulk_row_swizzle: bool = False,
         bulk_store_rows: Optional[int] = None,
         gather_single_source_fast_path: bool = False,
+        gather_hoist_addresses: bool = False,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -256,6 +257,11 @@ class GemmSm90(GemmTmaBase):
         ):
             raise ValueError("gather_single_source_fast_path requires SM90 multi-buffer gather")
         self.gather_single_source_fast_path = gather_single_source_fast_path
+        if gather_hoist_addresses and (
+            self.arch != 90 or not gather_table or not self.multi_buffer_gather
+        ):
+            raise ValueError("gather_hoist_addresses requires SM90 multi-buffer gather")
+        self.gather_hoist_addresses = gather_hoist_addresses
         self.concat_layout = concat_layout or ()
         if gather_A:
             assert cluster_shape_mnk[1] == 1, "Cluster shape N must be 1 for gather A "
@@ -1991,6 +1997,7 @@ class GemmSm90(GemmTmaBase):
                 limit_k=len_k,
                 address_barrier=self.gather_address_barrier,
                 single_source_fast_path=self.gather_single_source_fast_path,
+                hoist_addresses=self.gather_hoist_addresses,
             )
         elif const_expr(self.gather_table):
             copy_A = copy_utils.gather_m_get_copy_fn(

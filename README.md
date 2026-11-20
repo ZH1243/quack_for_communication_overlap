@@ -178,6 +178,24 @@ interleaved timings on H200 determine the result. See the
 [runner documentation](run/README.md#hopper_gemm_communication_benchpy) for coverage
 counts and supported combinations.
 
+To evaluate address hoisting independently of the single-source optimization,
+use the following matched H200 comparison after the numerical checks in the
+[runner documentation](run/README.md#hopper_gemm_communication_benchpy):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python run/hopper_gemm_communication_bench.py \
+  --k 7168 --n 2048 --buffers 16 \
+  --tile-m 128 --tile-n 128 --cluster-m 2 --hoist-gather-addresses \
+  --variants "single table reordered" "multi table reordered" "multi hoisted addresses"
+```
+
+Only `multi hoisted addresses` enables `gather_hoist_addresses=True`, with
+`multi table reordered` as its control. It precomputes lane row bases outside the
+K loop and a common K offset before per-row copy predicates, retaining mixed-source
+and partial-tile handling. This opt-in experiment keeps readiness disabled in
+the compared pair and makes no speedup claim; validate correctness and measure
+the generated kernel on H200.
+
 ## Blackwell node development environment (CUDA 12.9)
 
 The following setup was validated on a Linux x86_64 node with eight NVIDIA B300 GPUs

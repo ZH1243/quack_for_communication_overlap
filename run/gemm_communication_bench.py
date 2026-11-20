@@ -48,6 +48,9 @@ def parse_args(argv=None, *, device_capacity=10):
     parser.add_argument("--single-source-fast-path", action="store_true",
                         help="experimental Hopper multi-buffer gather optimization; "
                              "implies --reordered-tables")
+    parser.add_argument("--hoist-gather-addresses", action="store_true",
+                        help="experimental Hopper gather address hoisting; "
+                             "implies --reordered-tables")
     parser.add_argument("--stores", action="store_true",
                         help="bulk copy, row scatter, reduction, multi-buffer and compact output")
     parser.add_argument("--readiness", action="store_true",
@@ -84,7 +87,11 @@ def parse_args(argv=None, *, device_capacity=10):
     args = parser.parse_args(argv)
     if args.single_source_fast_path and not hopper:
         parser.error("--single-source-fast-path requires Hopper (SM90)")
-    args.reordered_tables = args.reordered_tables or args.single_source_fast_path
+    if args.hoist_gather_addresses and not hopper:
+        parser.error("--hoist-gather-addresses requires Hopper (SM90)")
+    args.reordered_tables = (
+        args.reordered_tables or args.single_source_fast_path or args.hoist_gather_addresses
+    )
     args.waves = args.waves or args.host_ready
     args.stores = args.stores or args.waves or args.weighted_contributions
     if min(args.k, args.n, args.buffers, args.experts, args.routes_per_buffer,
@@ -351,6 +358,15 @@ def benchmark(args, resources):
               "and launch settings; only the single-source specialization is enabled. "
               "Readiness checks are disabled for this pair; SwiGLU variants are unchanged.",
               flush=True)
+
+    if args.hoist_gather_addresses:
+        add("multi hoisted addresses", xs, indices, table=ordered_multi_table,
+            control="multi table reordered", gather_hoist_addresses=True)
+        print("Experimental address hoist: identical multi-buffer inputs, table, expert/M/N "
+              "order and launch settings; only gather address hoisting is enabled. "
+              "This variant retains the original source selection for mixed/partial CTAs; "
+              "single-source optimization and readiness checks are disabled. "
+              "SwiGLU variants are unchanged.", flush=True)
 
     if args.inline_indices:
         _, inline_rows = make_inline_comparison_rows(

@@ -1552,6 +1552,7 @@ def multi_buffer_gather_m_get_copy_fn(
     limit_k: Int32,
     address_barrier: cutlass.pipeline.NamedBarrier,
     single_source_fast_path: cutlass.Constexpr[bool] = False,
+    hoist_addresses: cutlass.Constexpr[bool] = False,
 ) -> Callable:
     """Gather one packed A tile from independent X/A_idx buffers.
 
@@ -1560,6 +1561,8 @@ def multi_buffer_gather_m_get_copy_fn(
     valid destination row. The buffer tuple length is compile-time static.
     The optional fast path resolves a sole contributing source once per warp,
     then reads indices directly without the shared row-pointer exchange.
+    Address hoisting is independent: cache lane-adjusted row bases and predicate
+    the copies directly, keeping the common K offset outside row conditionals.
     """
     num_buffers = const_expr(len(mAs))
     assert len(gAIdxs) == num_buffers and len(route_ranges) == 2 * num_buffers
@@ -1667,19 +1670,30 @@ def multi_buffer_gather_m_get_copy_fn(
         # can overwrite sRowPtrs. The fast path never accesses this scratch.
         address_barrier.arrive_and_wait()
 
-    # The X buffers have identical dtype/layout/stride (validated by gemm()),
-    # so a selected row address can be viewed through the first buffer's static
-    # layout.
+    # Keep validity from the original row base: adding a lane offset would make
+    # an invalid zero pointer nonzero. K is contiguous (validated by gemm()).
+    element_bytes = const_expr(mAs[0].element_type.width // 8)
+    vector_alignment = const_expr(
+        min(mAs[0].iterator.alignment, elems_per_load * element_bytes)
+    )
     selected_mAs_k = []
-    for m in cutlass.range_constexpr(rows_per_thread):
-        row_ptr = cute.make_ptr(
-            mAs[0].element_type,
-            row_ptrs[m],
-            mAs[0].iterator.memspace,
-            assumed_align=mAs[0].iterator.alignment,
-        )
-        selected_mA = cute.make_tensor(row_ptr, mAs[0].layout)
-        selected_mAs_k.append(cute.logical_divide(selected_mA, (None, tile_K)))
+    if const_expr(hoist_addresses):
+        assert cols_per_thread == 1
+        lane_byte_offset = Int64(tAcA[0, 0, 0][1]) * element_bytes
+        for m in cutlass.range_constexpr(rows_per_thread):
+            row_ptrs[m] = row_ptrs[m] + lane_byte_offset
+    else:
+        # The X buffers share dtype/layout/stride, so selected row addresses can
+        # be viewed through the first buffer's static layout.
+        for m in cutlass.range_constexpr(rows_per_thread):
+            row_ptr = cute.make_ptr(
+                mAs[0].element_type,
+                row_ptrs[m],
+                mAs[0].iterator.memspace,
+                assumed_align=mAs[0].iterator.alignment,
+            )
+            selected_mA = cute.make_tensor(row_ptr, mAs[0].layout)
+            selected_mAs_k.append(cute.logical_divide(selected_mA, (None, tile_K)))
 
     def copy_fn(src_idx, dst_idx, pred: cutlass.Constexpr[bool] = False):
         tApA_k = None
@@ -1688,21 +1702,48 @@ def multi_buffer_gather_m_get_copy_fn(
             limit_k_cur = limit_k - src_idx * tile_K
             for k in cutlass.range(cols_per_thread, unroll_full=True):
                 tApA_k[k] = t0AcA[0, 0, k][1] < limit_k_cur
-        for m in cutlass.range_constexpr(rows_per_thread):
-            if row_valid[m]:
-                mA_cur = selected_mAs_k[m][None, (None, src_idx)]
-                mA_row = cute.tiled_divide(
-                    cute.append_ones(mA_cur[0, None], up_to_rank=2),
-                    (elems_per_load, 1),
-                )[None, None, 0]
-                assert cute.size(tAcA.shape, mode=[2]) == 1
-                ki = tAcA[0, 0, 0][1] // elems_per_load
+        if const_expr(hoist_addresses):
+            # Do not put the uniform K offset inside a row-dependent branch:
+            # The profiled SM90 16-buffer specialization repeats VOTEU/USHF and
+            # lane-address arithmetic before each cp.async in the hot K loop.
+            k_byte_offset = Int64(src_idx) * (tile_K * element_bytes)
+            copy_pred = cute.make_rmem_tensor(cols_per_thread, Boolean)
+            for m in cutlass.range_constexpr(rows_per_thread):
+                row_ptr = cute.make_ptr(
+                    mAs[0].element_type,
+                    row_ptrs[m] + k_byte_offset,
+                    mAs[0].iterator.memspace,
+                    assumed_align=vector_alignment,
+                )
+                # One contiguous vector, matching the original ((V, 1),) view.
+                mA_vec = cute.make_tensor(row_ptr, cute.make_layout(((elems_per_load, 1),)))
+                copy_pred[0] = row_valid[m]
+                if const_expr(pred):
+                    copy_pred[0] = row_valid[m] & tApA_k[0]
+                # Tensor construction only forms an address. Invalid rows and
+                # K-tail vectors must be masked at the actual memory operation.
                 cute.copy(
                     thr_copy_A,
-                    mA_row[None, ki],
+                    mA_vec,
                     tAsA[(None, m), dst_idx],
-                    pred=tApA_k,
+                    pred=copy_pred,
                 )
+        else:
+            for m in cutlass.range_constexpr(rows_per_thread):
+                if row_valid[m]:
+                    mA_cur = selected_mAs_k[m][None, (None, src_idx)]
+                    mA_row = cute.tiled_divide(
+                        cute.append_ones(mA_cur[0, None], up_to_rank=2),
+                        (elems_per_load, 1),
+                    )[None, None, 0]
+                    assert cute.size(tAcA.shape, mode=[2]) == 1
+                    ki = tAcA[0, 0, 0][1] // elems_per_load
+                    cute.copy(
+                        thr_copy_A,
+                        mA_row[None, ki],
+                        tAsA[(None, m), dst_idx],
+                        pred=tApA_k,
+                    )
 
     return copy_fn
 
