@@ -1,10 +1,8 @@
-"""Numerical tests for Hopper gather source selection, address hoisting and guards.
+"""Numerical tests for Hopper gather source selection and copy-path experiments.
 
 Run CPU fixture checks and optional Hopper kernel checks from the repository root:
     python -m unittest discover -s tests -p test_hopper_single_source_fast_path.py -v
 """
-
-from __future__ import annotations
 
 import math
 from types import SimpleNamespace
@@ -129,6 +127,61 @@ class SingleSourceFixtureTests(unittest.TestCase):
 )
 class SingleSourceKernelTests(unittest.TestCase):
     @torch.inference_mode()
+    def test_explicit_copy_skips_rows_and_zero_fills_k_tails(self):
+        """Observe skipped versus zero-filled shared vectors before any MMA masking."""
+        import cutlass
+        import cutlass.cute as cute
+        from cutlass import BFloat16, Int32
+        from cutlass.cute.runtime import from_dlpack
+        from cutlass.utils import SmemAllocator
+        from cuda.bindings import driver as cuda
+        from quack.copy_utils import _cpasync_gather_row
+
+        @cute.kernel
+        def probe(source: cute.Tensor, output: cute.Tensor):
+            tidx, _, _ = cute.arch.thread_idx()
+            storage = SmemAllocator().allocate_tensor(
+                BFloat16, cute.make_layout((32, 8, 2), stride=(8, 1, 256)), byte_alignment=128,
+            )
+            for col in cutlass.range_constexpr(8):
+                storage[tidx, col, 0] = BFloat16(-13)
+                storage[tidx, col, 1] = BFloat16(-13)
+            cute.arch.barrier()
+            cute.arch.fence_view_async_shared()
+            row_valid = tidx % 2 == 0
+            k_valid = tidx % 4 < 2
+            _cpasync_gather_row(
+                storage[tidx, None, 0].iterator, source[tidx, None].iterator, row_valid,
+            )
+            _cpasync_gather_row(
+                storage[tidx, None, 1].iterator, source[tidx, None].iterator, row_valid,
+                src_bytes=Int32(k_valid) * 16,
+            )
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.barrier()
+            for col in cutlass.range_constexpr(8):
+                output[0, tidx, col] = storage[tidx, col, 0]
+                output[1, tidx, col] = storage[tidx, col, 1]
+
+        @cute.jit
+        def launch(source: cute.Tensor, output: cute.Tensor, stream: cuda.CUstream):
+            probe(source, output).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+
+        source = torch.arange(1, 257).reshape(32, 8).to(device="cuda", dtype=torch.bfloat16)
+        output = torch.full((2, 32, 8), float("nan"), device="cuda", dtype=source.dtype)
+        src_arg, dst_arg = from_dlpack(source), from_dlpack(output)
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        compiled = cute.compile(launch, src_arg, dst_arg, stream)
+        compiled(src_arg, dst_arg, stream)
+        torch.cuda.synchronize()
+        expected = torch.full_like(output, -13)
+        expected[0, ::2] = source[::2]
+        expected[1, ::4] = source[::4]
+        expected[1, 2::4] = 0
+        torch.testing.assert_close(output, expected, atol=0, rtol=0)
+
+    @torch.inference_mode()
     def check_case(self, tile_m, cluster_m, pingpong, *, num_buffers=3):
         from quack.gemm import gemm
 
@@ -139,12 +192,13 @@ class SingleSourceKernelTests(unittest.TestCase):
         torch.backends.cuda.matmul.allow_tf32 = False
         case = make_case(tile_m, cluster_m, "cuda", num_buffers=num_buffers)
         table = torch.tensor(case.rows, device="cuda", dtype=torch.int32)
-        # (single-source fast path, hoisted addresses, guarded copies).
-        # Guarded copies require hoisting; test them with both source selectors.
+        # (single-source fast path, hoisted addresses, guarded copies, explicit copy).
+        # Explicit copies require both hoisting and guards; test both selectors.
         variants = (
-            (False, False, False), (True, False, False),
-            (False, True, False), (True, True, False),
-            (False, True, True), (True, True, True),
+            (False, False, False, False), (True, False, False, False),
+            (False, True, False, False), (True, True, False, False),
+            (False, True, True, False), (True, True, True, False),
+            (False, True, True, True), (True, True, True, True),
         )
         outputs = {
             flags: torch.full(
@@ -154,7 +208,7 @@ class SingleSourceKernelTests(unittest.TestCase):
         }
 
         def launch(flags):
-            fast, hoist, guard = flags
+            fast, hoist, guard, explicit = flags
             output = outputs[flags]
             output.fill_(float("nan"))
             gemm(
@@ -163,6 +217,7 @@ class SingleSourceKernelTests(unittest.TestCase):
                 gather_single_source_fast_path=fast,
                 gather_hoist_addresses=hoist,
                 gather_guarded_copies=guard,
+                gather_explicit_copy=explicit,
                 tile_M=tile_m, tile_N=128, tile_K=64,
                 cluster_M=cluster_m, cluster_N=1, max_swizzle_size=1,
                 persistent=True, is_dynamic_persistent=False, pingpong=pingpong,
@@ -181,7 +236,7 @@ class SingleSourceKernelTests(unittest.TestCase):
                 )
                 self.assertTrue(torch.isnan(output[case.routes:]).all().item())
                 torch.testing.assert_close(
-                    output[:case.routes], outputs[(False, False, False)][:case.routes],
+                    output[:case.routes], outputs[variants[0]][:case.routes],
                     atol=0, rtol=0,
                 )
 

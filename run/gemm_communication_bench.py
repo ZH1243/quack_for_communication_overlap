@@ -54,6 +54,9 @@ def parse_args(argv=None, *, device_capacity=10):
     parser.add_argument("--guard-gather-copies", action="store_true",
                         help="retain per-row guards with Hopper gather address hoisting; "
                              "implies --hoist-gather-addresses")
+    parser.add_argument("--explicit-gather-copy", action="store_true",
+                        help="experimental explicit guarded Hopper cp.async copies; "
+                             "implies --guard-gather-copies")
     parser.add_argument("--stores", action="store_true",
                         help="bulk copy, row scatter, reduction, multi-buffer and compact output")
     parser.add_argument("--readiness", action="store_true",
@@ -90,6 +93,9 @@ def parse_args(argv=None, *, device_capacity=10):
     args = parser.parse_args(argv)
     if args.single_source_fast_path and not hopper:
         parser.error("--single-source-fast-path requires Hopper (SM90)")
+    if args.explicit_gather_copy and not hopper:
+        parser.error("--explicit-gather-copy requires Hopper (SM90)")
+    args.guard_gather_copies = args.guard_gather_copies or args.explicit_gather_copy
     if args.guard_gather_copies and not hopper:
         parser.error("--guard-gather-copies requires Hopper (SM90)")
     args.hoist_gather_addresses = args.hoist_gather_addresses or args.guard_gather_copies
@@ -382,6 +388,17 @@ def benchmark(args, resources):
               "launch settings as multi hoisted addresses; retains the original per-row "
               "validity guard around each copy with hoisted addresses. "
               "Single-source optimization and readiness checks are disabled.", flush=True)
+
+    if args.explicit_gather_copy:
+        add("multi explicit copy", xs, indices, table=ordered_multi_table,
+            control="multi hoisted guarded", gather_hoist_addresses=True,
+            gather_guarded_copies=True, gather_explicit_copy=True)
+        print("Experimental explicit copy: identical inputs, table, expert/M/N order and "
+              "launch settings as multi hoisted guarded; explicit guarded cp.async aims "
+              "to share destination-stage address calculation. Source addressing and "
+              "mixed/partial-tile checks are retained; single-source optimization and "
+              "readiness checks are disabled. Inspect generated code and measure on H200.",
+              flush=True)
 
     if args.inline_indices:
         _, inline_rows = make_inline_comparison_rows(

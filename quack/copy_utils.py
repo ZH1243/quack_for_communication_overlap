@@ -1541,6 +1541,41 @@ def gather_m_get_copy_fn(
     return copy_fn
 
 
+@dsl_user_op
+def _cpasync_gather_row(
+    dst: cute.Pointer,
+    src: cute.Pointer,
+    row_valid: Boolean,
+    *,
+    src_bytes: Optional[Int32] = None,
+    loc=None,
+    ip=None,
+):
+    """Copy one 16-byte vector, skipping invalid rows and zero-filling K tails.
+
+    Put the row guard inside the effectful PTX operation so its address inputs
+    are formed outside row-dependent IR branches. The caller derives ``dst``
+    from the existing swizzled tensor view and retains pipeline commit/arrival.
+    ``src_bytes`` is omitted for full K tiles and is 0 or 16 for the final tile.
+    This matches the GLOBAL-cache CopyG2SOp used by the SM90 gather loader.
+    """
+    args = [
+        Int32(dst.toint(loc=loc, ip=ip)),
+        Int64(src.toint(loc=loc, ip=ip)),
+        row_valid,
+    ]
+    tail_operand = ""
+    if src_bytes is not None:
+        args.append(src_bytes)
+        tail_operand = ", {$r3}"
+    cute.arch.inline_ptx(
+        "@{$r2} cp.async.cg.shared.global [{$r0}], [{$r1}], 16" + tail_operand + ";",
+        read_only_args=args,
+        loc=loc,
+        ip=ip,
+    )
+
+
 @cute.jit
 def multi_buffer_gather_m_get_copy_fn(
     thr_copy_A: cute.ThrCopy,
@@ -1554,6 +1589,7 @@ def multi_buffer_gather_m_get_copy_fn(
     single_source_fast_path: cutlass.Constexpr[bool] = False,
     hoist_addresses: cutlass.Constexpr[bool] = False,
     guarded_copies: cutlass.Constexpr[bool] = False,
+    explicit_copy: cutlass.Constexpr[bool] = False,
 ) -> Callable:
     """Gather one packed A tile from independent X/A_idx buffers.
 
@@ -1565,10 +1601,13 @@ def multi_buffer_gather_m_get_copy_fn(
     Address hoisting is independent: cache lane-adjusted row bases and form the
     common K offset outside row conditionals. Its guarded-copy control restores
     the original row guard instead of passing row validity to the copy atom.
+    Explicit copies move that guard into PTX to expose shared destination-stage
+    address calculation outside row-dependent IR branches.
     """
     num_buffers = const_expr(len(mAs))
     assert len(gAIdxs) == num_buffers and len(route_ranges) == 2 * num_buffers
     assert not guarded_copies or hoist_addresses
+    assert not explicit_copy or guarded_copies
     tile_M, tile_K = cute.size(sA, mode=[0]), cute.size(sA, mode=[1])
     assert cute.size(sRowPtrs) == tile_M
     tAsA = partition_D_position_independent(thr_copy_A, sA)
@@ -1679,6 +1718,8 @@ def multi_buffer_gather_m_get_copy_fn(
     vector_alignment = const_expr(
         min(mAs[0].iterator.alignment, elems_per_load * element_bytes)
     )
+    if const_expr(explicit_copy):
+        assert elems_per_load * element_bytes == 16
     selected_mAs_k = []
     if const_expr(hoist_addresses):
         assert cols_per_thread == 1
@@ -1711,6 +1752,13 @@ def multi_buffer_gather_m_get_copy_fn(
             # lane-address arithmetic before each cp.async in the hot K loop.
             k_byte_offset = Int64(src_idx) * (tile_K * element_bytes)
             copy_pred = cute.make_rmem_tensor(cols_per_thread, Boolean)
+            tAsA_stage, src_bytes = None, None
+            if const_expr(explicit_copy):
+                # Slice the original position-independent swizzled layout once
+                # per K iteration. No hard-coded stage stride or row offsets.
+                tAsA_stage = tAsA[None, dst_idx]
+                if const_expr(pred):
+                    src_bytes = Int32(tApA_k[0]) * 16
             for m in cutlass.range_constexpr(rows_per_thread):
                 row_ptr = cute.make_ptr(
                     mAs[0].element_type,
@@ -1720,7 +1768,14 @@ def multi_buffer_gather_m_get_copy_fn(
                 )
                 # One contiguous vector, matching the original ((V, 1),) view.
                 mA_vec = cute.make_tensor(row_ptr, cute.make_layout(((elems_per_load, 1),)))
-                if const_expr(guarded_copies):
+                if const_expr(explicit_copy):
+                    _cpasync_gather_row(
+                        tAsA_stage[(None, m),].iterator,
+                        row_ptr,
+                        row_valid[m],
+                        src_bytes=src_bytes,
+                    )
+                elif const_expr(guarded_copies):
                     # Keep address formation outside the row guard. This
                     # control changes copy predication only at source level;
                     # inspect SASS for compiler sinking or other restructuring.

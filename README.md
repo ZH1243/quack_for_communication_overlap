@@ -203,8 +203,15 @@ The compared variants share inputs, table order and geometry; single-source
 specialization and readiness checks remain disabled. Mixed-source and partial
 tiles remain supported, with no speedup claim.
 
+`--explicit-gather-copy` adds an explicit guarded `cp.async` variant named
+`multi explicit copy`, controlled by `multi hoisted guarded`. It retains the
+same source-address formula and mixed/partial-tile checks while aiming to share
+destination-stage address calculation across row copies. It implies guards,
+hoisting and reordered tables. Generated SASS and performance still need to be
+checked on H200; neither one shared calculation nor a speedup is assumed.
+
 Run the numerical checks, then keep total routes and tokens at 32768 while
-comparing 8 and 16 buffers on H200:
+comparing all five variants with 8 and 16 buffers on H200:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m unittest discover \
@@ -215,9 +222,9 @@ for input_buffers in 8 16; do
     --k 7168 --n 2048 --experts 8 --buffers "$input_buffers" \
     --routes-per-buffer "$((32768 / input_buffers))" \
     --tokens-per-buffer "$((32768 / input_buffers))" \
-    --tile-m 128 --tile-n 128 --cluster-m 2 --guard-gather-copies \
+    --tile-m 128 --tile-n 128 --cluster-m 2 --explicit-gather-copy \
     --variants "single table reordered" "multi table reordered" \
-               "multi hoisted addresses" "multi hoisted guarded"
+               "multi hoisted addresses" "multi hoisted guarded" "multi explicit copy"
 done
 ```
 
