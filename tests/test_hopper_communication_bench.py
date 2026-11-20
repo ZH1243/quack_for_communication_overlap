@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import __future__
 from contextlib import ExitStack
+from itertools import product
 from pathlib import Path
 import sys
 from types import ModuleType
@@ -114,7 +115,7 @@ class HopperBenchmarkMetadataTests(unittest.TestCase):
                         torch.testing.assert_close(inline_output, reference)
 
     def test_table_cta_expansion_matches_grouped_matmul(self):
-        """Check full SM90 cluster spans, source transitions, empty experts and tails."""
+        """Match single/multi CTA work and values before and after table reordering."""
         make_table = load_cpu_tables().make_table
         counts = [[259, 0, 3], [0, 0, 0], [7, 0, 263]]
         sources = [
@@ -130,8 +131,11 @@ class HopperBenchmarkMetadataTests(unittest.TestCase):
         for b, cs in enumerate(counts):
             for count in cs:
                 offsets[b].append(offsets[b][-1] + count)
-        for cluster_m, n, group_size in ((1, 272, 1), (2, 400, 2)):
-            with self.subTest(cluster_m=cluster_m, n=n, group_size=group_size):
+        for capacity, cluster_m, group_size in product((9, 10), (1, 2), (1, 2)):
+            n = 272 if group_size == 1 else 400
+            # Expected native geometry, independent of the builder under test.
+            cta_rows = 64 if capacity == 10 and cluster_m == 2 else 128
+            with self.subTest(capacity=capacity, cluster_m=cluster_m, group_size=group_size):
                 weights = torch.arange(3 * n * 8).reshape(3, n, 8).float() % 19 / 32
                 packed_parts, reference_parts = [], []
                 for expert in range(3):
@@ -143,48 +147,71 @@ class HopperBenchmarkMetadataTests(unittest.TestCase):
                 packed = torch.cat(packed_parts)
                 reference = torch.cat(reference_parts)
                 expert_counts = [sum(cs[e] for cs in counts) for e in range(3)]
+
+                def execute(output, row, multi):
+                    expert = row[0]
+                    if multi:
+                        n_base, ranges = row[1], list(zip(row[2::2], row[3::2]))
+                        start = sum(lo for lo, _ in ranges)
+                        a = torch.cat([
+                            source[index[lo:hi].long()]
+                            for source, index, (lo, hi) in zip(sources, indices, ranges)
+                        ])
+                    else:
+                        _, start, end, n_base = row
+                        a = packed[start:end]
+                    work = []
+                    for n_offset in range(group_size):
+                        col = (n_base + n_offset) * 128
+                        col_end = min(col + 128, n)
+                        for cta in range(cluster_m):
+                            lo = min(cta * cta_rows, len(a))
+                            hi = min((cta + 1) * cta_rows, len(a))
+                            work.append((expert, start + lo, start + hi, col, col_end))
+                            if lo < hi:
+                                output[start + lo:start + hi, col:col_end] = (
+                                    a[lo:hi] @ weights[expert, col:col_end].T
+                                )
+                    return work
+
+                original_rows, reordered_rows = {}, {}
                 for multi in (False, True):
                     with self.subTest(multi=multi):
                         rows, _ = make_table(
-                            counts if multi else [expert_counts], device_capacity=9,
+                            counts if multi else [expert_counts], device_capacity=capacity,
                             tile_m=128, cluster_m=cluster_m, tile_n=128,
                             n=n, group_size=group_size,
                         )
+                        original_rows[multi] = rows
+                        reordered_rows[multi] = shared_bench.reorder_gather_rows(
+                            rows, multi_buffer=multi,
+                        )
                         output = torch.full_like(reference, float("nan"))
-
-                        def execute(row):
-                            expert = row[0]
-                            if multi:
-                                n_base, ranges = row[1], list(zip(row[2::2], row[3::2]))
-                                start = sum(lo for lo, _ in ranges)
-                                a = torch.cat([
-                                    source[index[lo:hi].long()]
-                                    for source, index, (lo, hi) in zip(sources, indices, ranges)
-                                ])
-                            else:
-                                _, start, end, n_base = row
-                                a = packed[start:end]
-                            for n_offset in range(group_size):
-                                col = (n_base + n_offset) * 128
-                                col_end = min(col + 128, n)
-                                for cta in range(cluster_m):
-                                    lo, hi = cta * 128, min((cta + 1) * 128, len(a))
-                                    if lo < hi:
-                                        output[start + lo:start + hi, col:col_end] = (
-                                            a[lo:hi] @ weights[expert, col:col_end].T
-                                        )
-
-                        # The first full cluster must compute 128 rows per CTA.
-                        # Using SM100's half-M geometry would leave NaNs here.
-                        execute(rows[0])
-                        span = 128 * cluster_m
+                        # A full SM90 cluster computes 128 rows per CTA.
+                        # Applying SM100's half-M geometry leaves NaNs here.
+                        execute(output, rows[0], multi)
+                        span = cta_rows * cluster_m
                         columns = 128 * group_size
                         torch.testing.assert_close(
                             output[:span, :columns], reference[:span, :columns],
                         )
                         for row in rows[1:]:
-                            execute(row)
+                            execute(output, row, multi)
                         torch.testing.assert_close(output, reference)
+
+                outputs = [torch.full_like(reference, float("nan")) for _ in range(2)]
+                work = [[], []]
+                self.assertEqual(len(reordered_rows[False]), len(reordered_rows[True]))
+                for single, multi in zip(reordered_rows[False], reordered_rows[True]):
+                    work[0].extend(execute(outputs[0], single, False))
+                    work[1].extend(execute(outputs[1], multi, True))
+                    # Source boundaries and empty buffers must not change the
+                    # traversal. Check partial writes to expose unmatched order.
+                    torch.testing.assert_close(outputs[0], outputs[1], equal_nan=True)
+                self.assertEqual(work[0], work[1])
+                for multi in (False, True):
+                    self.assertNotEqual(reordered_rows[multi], original_rows[multi])
+                    torch.testing.assert_close(outputs[multi], reference)
 
     def test_weighted_reference_and_hopper_launch_options(self):
         args = bench.parse_args([
@@ -218,6 +245,7 @@ class HopperBenchmarkGpuTests(unittest.TestCase):
             "--routes-per-buffer", "129", "--tokens-per-buffer", "67",
             "--tile-m", "128", "--tile-n", "128", "--cluster-m", "2",
             "--sm-count", "4", "--packed-baseline", "--inline-indices", "--readiness",
+            "--reordered-tables",
             "--warmup", "1", "--rounds", "1", "--repetitions", "1", *features,
         ])
         with ExitStack() as resources:

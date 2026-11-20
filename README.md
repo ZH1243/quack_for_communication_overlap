@@ -437,7 +437,8 @@ Additional feature comparisons are opt-in:
 | --- | --- |
 | `--packed-baseline` | Non-gather grouped GEMM on prepacked inputs, with the same expert shapes and weights; packing is outside timing. |
 | `--inline-indices` | Adds `single table reordered` to measure traversal order, then compares embedded indices against that four-column control in the same order. |
-| `--readiness` | Single/multi-buffer gather with ready-counter acquire checks versus the same path without checks. All rows are already available. |
+| `--reordered-tables` | Adds single/multi-buffer expert/M/N traversal comparisons; multi-buffer uses the reordered single-buffer control. |
+| `--readiness` | Single/multi-buffer gather with ready-counter acquire checks versus the same path without checks, including enabled reordered tables. All rows are already available. |
 | `--stores` | TMA output versus bulk rows, row permutation, reduction with unique destinations, duplicate-destination reduction, multi-buffer addresses, and compact N-tile-major layout. |
 | `--waves` | Compact scatter-add with a completion barrier, then GPU ready-prefix publication; implies `--stores`. |
 | `--host-ready` | Adds mapped-host ready-prefix publication to GPU publication; implies `--waves`. |

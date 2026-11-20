@@ -22,7 +22,8 @@ are views of the same physical allocation to control data-placement effects.
 | --- | --- |
 | `--packed-baseline` | Prepacked grouped GEMM versus indexed gather; packing excluded. |
 | `--inline-indices` | Four-column table traversal order, then embedded indices versus separate indices at the same order. |
-| `--readiness` | Already-ready single/multi-table acquire checks versus unchecked paths. |
+| `--reordered-tables` | Single/multi-buffer tables in the same expert/M/N order, alongside the original N-group-first paths. |
+| `--readiness` | Already-ready single/multi-table acquire checks versus unchecked paths, including any enabled reordered tables. |
 | `--stores` | TMA output, bulk rows, row scatter, unique/duplicate reductions, multiple destinations and compact N-tile-major output. |
 | `--waves` | Completion barrier and GPU ready-prefix publication; implies stores. |
 | `--host-ready` | Mapped-host publication versus GPU publication; implies waves. |
@@ -37,7 +38,7 @@ CUDA_VISIBLE_DEVICES=0 python run/hopper_gemm_communication_bench.py \
   --k 64 --n 272 --buffers 3 --experts 2 \
   --routes-per-buffer 129 --tokens-per-buffer 257 \
   --tile-m 128 --tile-n 128 --cluster-m 2 --sm-count 8 \
-  --packed-baseline --inline-indices --readiness --host-ready \
+  --packed-baseline --inline-indices --reordered-tables --readiness --host-ready \
   --weighted-contributions --swiglu --warmup 1 --rounds 1 --repetitions 1
 ```
 
@@ -78,6 +79,37 @@ To measure only index embedding, select
 `--variants "single table reordered" "inline-index table"`; the first selected
 variant becomes the overall baseline. This control is also enabled by
 `--inline-indices` in the Blackwell runner.
+
+To isolate multi-buffer handling and readiness at a fixed expert/M/N order,
+enable `--reordered-tables --readiness`:
+
+| Variant | Control | `vs control` measures |
+| --- | --- | --- |
+| `multi table reordered` | `single table reordered` | Multi-buffer handling at the same logical work order. |
+| `single reordered ready` | `single table reordered` | Single-buffer ready acquire checks at that fixed order. |
+| `multi reordered ready` | `multi table reordered` | Multi-buffer ready acquire checks at that fixed order. |
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python run/hopper_gemm_communication_bench.py \
+  --k 7168 --n 2048 --buffers 16 \
+  --tile-m 128 --tile-n 128 --cluster-m 2 --reordered-tables --readiness \
+  --variants "single table reordered" "multi table reordered" \
+             "single reordered ready" "multi reordered ready"
+```
+
+Omit `--variants` to include the indexed baseline and original N-group-first
+single/multi tables and their ready checks. Comparing the `multi table` and
+`multi table reordered` latencies then shows the multi-buffer ordering effect;
+the reordered row's `vs control` remains the comparison with reordered **single**.
+`--inline-indices --readiness` also enables `single reordered ready` without
+requiring the multi-buffer order comparison. Both architecture entry points
+support these options.
+
+The multi-buffer sort uses the packed output M range (sums of source ranges),
+so it matches single-buffer work even when tiles cross source boundaries.
+Ready counters contain the full table length for both orders; these are acquire
+costs with no producer delay. This experiment does not change the streaming or
+completion variants, whose N-group-first order supports early column publication.
 
 Measure down-like stores, completion and weighting:
 

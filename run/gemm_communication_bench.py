@@ -43,6 +43,8 @@ def parse_args(argv=None, *, device_capacity=10):
                         help="also compare a non-gather grouped GEMM; packing is excluded")
     parser.add_argument("--inline-indices", action="store_true",
                         help="compare table order, then embedded indices against the same order")
+    parser.add_argument("--reordered-tables", action="store_true",
+                        help="compare single/multi-buffer tables in matched expert/M/N order")
     parser.add_argument("--stores", action="store_true",
                         help="bulk copy, row scatter, reduction, multi-buffer and compact output")
     parser.add_argument("--readiness", action="store_true",
@@ -85,7 +87,9 @@ def parse_args(argv=None, *, device_capacity=10):
         parser.error("dimensions/counts must be positive and warmup nonnegative")
     if args.buffers < 2 and not args.baseline_only:
         parser.error("the multi-buffer comparison requires at least two buffers")
-    if args.baseline_only and (args.stores or args.readiness or args.swiglu or args.inline_indices):
+    if args.baseline_only and (
+        args.stores or args.readiness or args.swiglu or args.inline_indices or args.reordered_tables
+    ):
         parser.error("--baseline-only cannot be combined with feature comparisons")
     if args.sm_count is not None and (args.sm_count <= 0 or args.sm_count % args.cluster_m):
         parser.error("sm-count must be positive and divisible by cluster-m")
@@ -148,6 +152,18 @@ def scatter_reference(reference, mapping, dtype, route_weights=None):
     return torch.zeros_like(reference).index_add_(0, mapping.long(), accumulator.to(dtype).float())
 
 
+def reorder_gather_rows(rows, *, multi_buffer=False):
+    """Order descriptors by expert, packed output M range, then N group.
+
+    Multi-buffer output offsets are sums of the per-source offsets, as in the
+    kernel scheduler. Sorting by those sums matches the single-buffer traversal,
+    including tiles spanning source boundaries and sources with empty ranges.
+    """
+    if multi_buffer:
+        return sorted(rows, key=lambda row: (row[0], sum(row[2::2]), sum(row[3::2]), row[1]))
+    return sorted(rows)
+
+
 def make_inline_comparison_rows(single_rows, tokens, *, cluster_rows):
     """Build separate-index and inline tables with identical expert/M/N traversal.
 
@@ -155,7 +171,7 @@ def make_inline_comparison_rows(single_rows, tokens, *, cluster_rows):
     Keep an ordinary four-column control in that order to separate traversal
     effects from the cost of embedding indices. Preparation is outside timing.
     """
-    ordered_rows = sorted(single_rows)
+    ordered_rows = reorder_gather_rows(single_rows)
     inline_rows = [
         [e, ng, start, end, *tokens[start:end], *([-1] * (cluster_rows - (end - start)))]
         for e, start, end, ng in ordered_rows
@@ -278,15 +294,25 @@ def benchmark(args, resources):
         add("single table", joined_x, joined_idx, table=single_table, control="indexed baseline")
         add("multi table", xs, indices, table=multi_table, control="single table")
 
-    if args.inline_indices:
-        cluster_rows = cta_m * args.cluster_m
-        tokens = joined_idx.cpu().tolist()
-        ordered_rows, inline_rows = make_inline_comparison_rows(
-            single_rows, tokens, cluster_rows=cluster_rows,
-        )
+    ordered_table, ordered_multi_table = None, None
+    if args.inline_indices or args.reordered_tables:
+        ordered_rows = reorder_gather_rows(single_rows)
         ordered_table = torch.tensor(ordered_rows, device=device, dtype=torch.int32)
         add("single table reordered", joined_x, joined_idx, table=ordered_table,
             control="single table")
+
+    if args.reordered_tables:
+        ordered_multi_rows = reorder_gather_rows(multi_rows, multi_buffer=True)
+        ordered_multi_table = torch.tensor(ordered_multi_rows, device=device, dtype=torch.int32)
+        add("multi table reordered", xs, indices, table=ordered_multi_table,
+            control="single table reordered")
+        print("Reordered controls: single/multi tables traverse expert/M/N; "
+              "multi table reordered compares against single table reordered.", flush=True)
+
+    if args.inline_indices:
+        _, inline_rows = make_inline_comparison_rows(
+            ordered_rows, joined_idx.cpu().tolist(), cluster_rows=cta_m * args.cluster_m,
+        )
         inline_table = torch.tensor(inline_rows, device=device, dtype=torch.int32)
         unused_idx = torch.full_like(joined_idx, -1)
         add("inline-index table", joined_x, unused_idx, table=inline_table,
@@ -301,6 +327,12 @@ def benchmark(args, resources):
             gather_work_table_ready=single_ready, control="single table")
         add("multi table ready", xs, indices, table=multi_table,
             gather_work_table_ready=multi_ready, control="multi table")
+        if ordered_table is not None:
+            add("single reordered ready", joined_x, joined_idx, table=ordered_table,
+                gather_work_table_ready=single_ready, control="single table reordered")
+        if ordered_multi_table is not None:
+            add("multi reordered ready", xs, indices, table=ordered_multi_table,
+                gather_work_table_ready=multi_ready, control="multi table reordered")
         print("Ready-check timing: all rows are available; producer delay is excluded.", flush=True)
 
     if args.stores:
