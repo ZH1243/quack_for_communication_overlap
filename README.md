@@ -436,7 +436,7 @@ Additional feature comparisons are opt-in:
 | Flag | Comparison |
 | --- | --- |
 | `--packed-baseline` | Non-gather grouped GEMM on prepacked inputs, with the same expert shapes and weights; packing is outside timing. |
-| `--inline-indices` | Token indices embedded in descriptors versus the four-column table with separate indices. |
+| `--inline-indices` | Adds `single table reordered` to measure traversal order, then compares embedded indices against that four-column control in the same order. |
 | `--readiness` | Single/multi-buffer gather with ready-counter acquire checks versus the same path without checks. All rows are already available. |
 | `--stores` | TMA output versus bulk rows, row permutation, reduction with unique destinations, duplicate-destination reduction, multi-buffer addresses, and compact N-tile-major layout. |
 | `--waves` | Compact scatter-add with a completion barrier, then GPU ready-prefix publication; implies `--stores`. |

@@ -17,6 +17,7 @@ from unittest.mock import patch
 import torch
 
 from run import hopper_gemm_communication_bench as bench
+from run import gemm_communication_bench as shared_bench
 
 
 def load_cpu_tables():
@@ -39,6 +40,79 @@ def load_cpu_tables():
 
 
 class HopperBenchmarkMetadataTests(unittest.TestCase):
+    def test_inline_indices_match_reordered_control_work_and_values(self):
+        """Inline embedding must keep the control's exact expert/M/N traversal."""
+        tables = load_cpu_tables()
+        counts, tile_m, tile_n, n, k = [271, 0, 131], 128, 128, 400, 8
+        source = torch.arange(31 * k).reshape(31, k).float() % 23 / 16
+        tokens = ((torch.arange(sum(counts)) * 7 + 3) % 31).tolist()
+        weights = torch.arange(3 * n * k).reshape(3, n, k).float() % 19 / 32
+        parts, start = [], 0
+        for expert, count in enumerate(counts):
+            parts.append(source[tokens[start:start + count]] @ weights[expert].T)
+            start += count
+        reference = torch.cat(parts)
+        for capacity in (9, 10):
+            for cluster_m in (1, 2):
+                for group_size in (1, 2):
+                    with self.subTest(capacity=capacity, cluster_m=cluster_m,
+                                      group_size=group_size):
+                        cta_rows = tables.cta_tile_shape_m(tile_m, cluster_m, capacity)
+                        rows, _ = tables.make_table(
+                            [counts], device_capacity=capacity, tile_m=tile_m,
+                            cluster_m=cluster_m, tile_n=tile_n, n=n, group_size=group_size,
+                        )
+                        ordered, inline = shared_bench.make_inline_comparison_rows(
+                            rows, tokens, cluster_rows=cta_rows * cluster_m,
+                        )
+
+                        def execute(output, row, embedded=False):
+                            if embedded:
+                                expert, n_base, begin, end = row[:4]
+                                indices = row[4:4 + end - begin]
+                                self.assertEqual(row[4 + end - begin:],
+                                                 [-1] * (cta_rows * cluster_m - end + begin))
+                            else:
+                                expert, begin, end, n_base = row
+                                indices = tokens[begin:end]
+                            gathered = source[indices]
+                            work = []
+                            for n_offset in range(group_size):
+                                col = (n_base + n_offset) * tile_n
+                                col_end = min(col + tile_n, n)
+                                for cta in range(cluster_m):
+                                    lo = min(cta * cta_rows, len(gathered))
+                                    hi = min((cta + 1) * cta_rows, len(gathered))
+                                    work.append((expert, begin + lo, begin + hi, col, col_end))
+                                    if lo < hi:
+                                        output[begin + lo:begin + hi, col:col_end] = (
+                                            gathered[lo:hi] @ weights[expert, col:col_end].T
+                                        )
+                            return work
+
+                        default_output = torch.full_like(reference, float("nan"))
+                        default_work = []
+                        for row in rows:
+                            default_work.extend(execute(default_output, row))
+                        torch.testing.assert_close(default_output, reference)
+                        control_output = torch.full_like(reference, float("nan"))
+                        inline_output = torch.full_like(reference, float("nan"))
+                        control_work, inline_work = [], []
+                        self.assertEqual(len(ordered), len(inline))
+                        for control_row, inline_row in zip(ordered, inline):
+                            control_work.extend(execute(control_output, control_row))
+                            inline_work.extend(execute(inline_output, inline_row, embedded=True))
+                            # Compare partial outputs, not only final coverage: an
+                            # unsorted control produces the same final GEMM but
+                            # changes which values have been written at each step.
+                            torch.testing.assert_close(
+                                control_output, inline_output, equal_nan=True,
+                            )
+                        self.assertEqual(control_work, inline_work)
+                        self.assertNotEqual(control_work, default_work)
+                        torch.testing.assert_close(control_output, reference)
+                        torch.testing.assert_close(inline_output, reference)
+
     def test_table_cta_expansion_matches_grouped_matmul(self):
         """Check full SM90 cluster spans, source transitions, empty experts and tails."""
         make_table = load_cpu_tables().make_table

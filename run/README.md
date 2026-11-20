@@ -21,7 +21,7 @@ are views of the same physical allocation to control data-placement effects.
 | Flag | Additional comparison |
 | --- | --- |
 | `--packed-baseline` | Prepacked grouped GEMM versus indexed gather; packing excluded. |
-| `--inline-indices` | Token indices embedded in table descriptors versus separate indices. |
+| `--inline-indices` | Four-column table traversal order, then embedded indices versus separate indices at the same order. |
 | `--readiness` | Already-ready single/multi-table acquire checks versus unchecked paths. |
 | `--stores` | TMA output, bulk rows, row scatter, unique/duplicate reductions, multiple destinations and compact N-tile-major output. |
 | `--waves` | Completion barrier and GPU ready-prefix publication; implies stores. |
@@ -49,6 +49,35 @@ CUDA_VISIBLE_DEVICES=0 python run/hopper_gemm_communication_bench.py \
   --tile-m 128 --tile-n 128 --cluster-m 2 \
   --packed-baseline --inline-indices --readiness
 ```
+
+`--inline-indices` adds two steps to separate traversal order from index storage:
+
+| Variant | Traversal | `vs control` measures |
+| --- | --- | --- |
+| `single table` | N group → expert → M range | Table path versus `indexed baseline`. |
+| `single table reordered` | Expert → M range → N group | Order change versus `single table`, retaining four-column descriptors and separate indices. |
+| `inline-index table` | Expert → M range → N group | Embedded indices versus `single table reordered`, with the same work-item order. |
+
+Both added tables are built from the same sorted rows; source data, output row
+mapping, tile geometry and launch settings are identical. Table construction is
+excluded from timing. Previously, the inline row used `single table` as its control
+and combined both effects; its old `vs control` percentages are not directly
+comparable to the new column.
+
+For the H200 workload with K=7168 and N=2048, run this focused comparison:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python run/hopper_gemm_communication_bench.py \
+  --k 7168 --n 2048 --buffers 16 \
+  --tile-m 128 --tile-n 128 --cluster-m 2 --inline-indices \
+  --variants "indexed baseline" "single table" \
+             "single table reordered" "inline-index table"
+```
+
+To measure only index embedding, select
+`--variants "single table reordered" "inline-index table"`; the first selected
+variant becomes the overall baseline. This control is also enabled by
+`--inline-indices` in the Blackwell runner.
 
 Measure down-like stores, completion and weighting:
 

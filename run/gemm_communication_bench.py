@@ -42,7 +42,7 @@ def parse_args(argv=None, *, device_capacity=10):
     parser.add_argument("--packed-baseline", action="store_true",
                         help="also compare a non-gather grouped GEMM; packing is excluded")
     parser.add_argument("--inline-indices", action="store_true",
-                        help="also compare work tables that embed token indices directly")
+                        help="compare table order, then embedded indices against the same order")
     parser.add_argument("--stores", action="store_true",
                         help="bulk copy, row scatter, reduction, multi-buffer and compact output")
     parser.add_argument("--readiness", action="store_true",
@@ -146,6 +146,21 @@ def scatter_reference(reference, mapping, dtype, route_weights=None):
     """Round each scaled FP32 contribution before the scatter-add reference."""
     accumulator = reference if route_weights is None else reference * route_weights[:, None]
     return torch.zeros_like(reference).index_add_(0, mapping.long(), accumulator.to(dtype).float())
+
+
+def make_inline_comparison_rows(single_rows, tokens, *, cluster_rows):
+    """Build separate-index and inline tables with identical expert/M/N traversal.
+
+    Inline descriptors require consecutive N-group rows for each M bundle.
+    Keep an ordinary four-column control in that order to separate traversal
+    effects from the cost of embedding indices. Preparation is outside timing.
+    """
+    ordered_rows = sorted(single_rows)
+    inline_rows = [
+        [e, ng, start, end, *tokens[start:end], *([-1] * (cluster_rows - (end - start)))]
+        for e, start, end, ng in ordered_rows
+    ]
+    return ordered_rows, inline_rows
 
 
 def benchmark(args, resources):
@@ -266,13 +281,18 @@ def benchmark(args, resources):
     if args.inline_indices:
         cluster_rows = cta_m * args.cluster_m
         tokens = joined_idx.cpu().tolist()
-        # Indexed descriptors require consecutive N-group rows per M bundle.
-        inline_rows = [[e, ng, start, end, *tokens[start:end],
-                        *([-1] * (cluster_rows - (end - start)))]
-                       for e, start, end, ng in sorted(single_rows)]
+        ordered_rows, inline_rows = make_inline_comparison_rows(
+            single_rows, tokens, cluster_rows=cluster_rows,
+        )
+        ordered_table = torch.tensor(ordered_rows, device=device, dtype=torch.int32)
+        add("single table reordered", joined_x, joined_idx, table=ordered_table,
+            control="single table")
         inline_table = torch.tensor(inline_rows, device=device, dtype=torch.int32)
         unused_idx = torch.full_like(joined_idx, -1)
-        add("inline-index table", joined_x, unused_idx, table=inline_table, control="single table")
+        add("inline-index table", joined_x, unused_idx, table=inline_table,
+            control="single table reordered")
+        print("Inline controls: single table reordered changes only traversal to expert/M/N; "
+              "inline-index table embeds indices with that same traversal.", flush=True)
 
     if args.readiness:
         single_ready = torch.full((1,), len(single_rows), device=device, dtype=torch.int32)
