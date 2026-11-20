@@ -182,6 +182,97 @@ class SingleSourceKernelTests(unittest.TestCase):
         torch.testing.assert_close(output, expected, atol=0, rtol=0)
 
     @torch.inference_mode()
+    def test_packed_validity_crosses_mask_word_boundary(self):
+        """Pack per-thread rows, then observe copies and unused upper mask bits."""
+        import cutlass
+        import cutlass.cute as cute
+        from cutlass import BFloat16, Boolean, Int32, Int64, Uint32
+        from cutlass.cute.runtime import from_dlpack
+        from cutlass.utils import SmemAllocator
+        from cuda.bindings import driver as cuda
+        from quack.copy_utils import _cpasync_gather_row, _pack_gather_row_validity
+
+        @cute.kernel
+        def probe(
+            source: cute.Tensor, flags: cute.Tensor, output: cute.Tensor, masks: cute.Tensor,
+        ):
+            tidx, _, _ = cute.arch.thread_idx()
+            storage = SmemAllocator().allocate_tensor(
+                BFloat16,
+                cute.make_layout((32, 40, 8, 2), stride=(320, 8, 1, 10240)),
+                byte_alignment=128,
+            )
+            row_valid = cute.make_rmem_tensor(40, Boolean)
+            row_masks = cute.make_rmem_tensor(2, Uint32)
+            for word in cutlass.range_constexpr(2):
+                row_masks[word] = Uint32(0xFFFFFFFF)
+            for row in cutlass.range_constexpr(40):
+                row_valid[row] = flags[0, tidx, row] != 0
+                for col in cutlass.range_constexpr(8):
+                    storage[tidx, row, col, 0] = BFloat16(-13)
+                    storage[tidx, row, col, 1] = BFloat16(-13)
+            _pack_gather_row_validity(row_valid, row_masks)
+            for word in cutlass.range_constexpr(2):
+                masks[tidx, word] = Int64(row_masks[word])
+            cute.arch.barrier()
+            cute.arch.fence_view_async_shared()
+            for row in cutlass.range_constexpr(40):
+                _cpasync_gather_row(
+                    storage[tidx, row, None, 0].iterator, source[tidx, row, None].iterator,
+                    row_mask=row_masks[row // 32], row_bit=row % 32,
+                )
+                _cpasync_gather_row(
+                    storage[tidx, row, None, 1].iterator, source[tidx, row, None].iterator,
+                    src_bytes=Int32(flags[1, tidx, row]) * 16,
+                    row_mask=row_masks[row // 32], row_bit=row % 32,
+                )
+                # Keep the probe independent of outstanding cp.async capacity.
+                cute.arch.cp_async_commit_group()
+                cute.arch.cp_async_wait_group(0)
+            cute.arch.barrier()
+            for row in cutlass.range_constexpr(40):
+                for col in cutlass.range_constexpr(8):
+                    output[0, tidx, row, col] = storage[tidx, row, col, 0]
+                    output[1, tidx, row, col] = storage[tidx, row, col, 1]
+
+        @cute.jit
+        def launch(
+            source: cute.Tensor, flags: cute.Tensor, output: cute.Tensor, masks: cute.Tensor,
+            stream: cuda.CUstream,
+        ):
+            probe(source, flags, output, masks).launch(
+                grid=(1, 1, 1), block=(32, 1, 1), stream=stream,
+            )
+
+        source = (torch.arange(32 * 40 * 8).reshape(32, 40, 8) % 127 + 1).to(
+            device="cuda", dtype=torch.bfloat16,
+        )
+        thread, row = torch.arange(32)[:, None], torch.arange(40)[None, :]
+        valid = torch.stack(((3 * thread + row) % 5 != 0, (thread + 2 * row) % 3 != 0))
+        flags = valid.to(device="cuda", dtype=torch.int32)
+        output = torch.full((2, 32, 40, 8), float("nan"), device="cuda", dtype=source.dtype)
+        masks = torch.full((32, 2), -1, device="cuda", dtype=torch.int64)
+        args = tuple(from_dlpack(tensor) for tensor in (source, flags, output, masks))
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        compiled = cute.compile(launch, *args, stream)
+        compiled(*args, stream)
+        torch.cuda.synchronize()
+
+        row_valid, k_valid = valid.to(device="cuda").unbind()
+        expected = torch.full_like(output, -13)
+        expected[0] = torch.where(row_valid[..., None], source, expected[0])
+        tail_source = torch.where(k_valid[..., None], source, torch.zeros_like(source))
+        expected[1] = torch.where(row_valid[..., None], tail_source, expected[1])
+        torch.testing.assert_close(output, expected, atol=0, rtol=0)
+        # Independent integer arithmetic also checks bit 31, bit 32, and that
+        # the last word clears the poisoned 24 bits above the final eight rows.
+        expected_masks = torch.stack([
+            (valid[0, :, start:start + width].long() * (2 ** torch.arange(width))).sum(1)
+            for start, width in ((0, 32), (32, 8))
+        ], dim=1)
+        torch.testing.assert_close(masks.cpu(), expected_masks, atol=0, rtol=0)
+
+    @torch.inference_mode()
     def check_case(self, tile_m, cluster_m, pingpong, *, num_buffers=3):
         from quack.gemm import gemm
 
@@ -192,13 +283,14 @@ class SingleSourceKernelTests(unittest.TestCase):
         torch.backends.cuda.matmul.allow_tf32 = False
         case = make_case(tile_m, cluster_m, "cuda", num_buffers=num_buffers)
         table = torch.tensor(case.rows, device="cuda", dtype=torch.int32)
-        # (single-source fast path, hoisted addresses, guarded copies, explicit copy).
-        # Explicit copies require both hoisting and guards; test both selectors.
+        # (single-source fast path, hoisted addresses, guarded copies,
+        #  explicit copy, packed validity). Test each step with both selectors.
         variants = (
-            (False, False, False, False), (True, False, False, False),
-            (False, True, False, False), (True, True, False, False),
-            (False, True, True, False), (True, True, True, False),
-            (False, True, True, True), (True, True, True, True),
+            (False, False, False, False, False), (True, False, False, False, False),
+            (False, True, False, False, False), (True, True, False, False, False),
+            (False, True, True, False, False), (True, True, True, False, False),
+            (False, True, True, True, False), (True, True, True, True, False),
+            (False, True, True, True, True), (True, True, True, True, True),
         )
         outputs = {
             flags: torch.full(
@@ -208,7 +300,7 @@ class SingleSourceKernelTests(unittest.TestCase):
         }
 
         def launch(flags):
-            fast, hoist, guard, explicit = flags
+            fast, hoist, guard, explicit, packed = flags
             output = outputs[flags]
             output.fill_(float("nan"))
             gemm(
@@ -218,6 +310,7 @@ class SingleSourceKernelTests(unittest.TestCase):
                 gather_hoist_addresses=hoist,
                 gather_guarded_copies=guard,
                 gather_explicit_copy=explicit,
+                gather_packed_validity=packed,
                 tile_M=tile_m, tile_N=128, tile_K=64,
                 cluster_M=cluster_m, cluster_N=1, max_swizzle_size=1,
                 persistent=True, is_dynamic_persistent=False, pingpong=pingpong,

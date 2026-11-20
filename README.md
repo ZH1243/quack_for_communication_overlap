@@ -210,8 +210,17 @@ destination-stage address calculation across row copies. It implies guards,
 hoisting and reordered tables. Generated SASS and performance still need to be
 checked on H200; neither one shared calculation nor a speedup is assumed.
 
+`--pack-gather-validity` adds `multi packed validity`, controlled by
+`multi explicit copy`. It packs each thread's valid-row bits during CTA work-tile
+setup before applying lane offsets; K-loop guards then read that mask. The goal
+is to keep adjusted pointers plus a mask live rather than also retaining raw
+pointers for validity. Register budgets remain unchanged. The flag implies
+explicit copies, guards, hoisting and reordered tables, while source selection
+and mixed/partial-tile checks match its control. SASS and performance still need
+to be verified on H200; this experiment makes no speedup claim.
+
 Run the numerical checks, then keep total routes and tokens at 32768 while
-comparing all five variants with 8 and 16 buffers on H200:
+comparing all six variants with 8 and 16 buffers on H200:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m unittest discover \
@@ -222,9 +231,10 @@ for input_buffers in 8 16; do
     --k 7168 --n 2048 --experts 8 --buffers "$input_buffers" \
     --routes-per-buffer "$((32768 / input_buffers))" \
     --tokens-per-buffer "$((32768 / input_buffers))" \
-    --tile-m 128 --tile-n 128 --cluster-m 2 --explicit-gather-copy \
+    --tile-m 128 --tile-n 128 --cluster-m 2 --pack-gather-validity \
     --variants "single table reordered" "multi table reordered" \
-               "multi hoisted addresses" "multi hoisted guarded" "multi explicit copy"
+               "multi hoisted addresses" "multi hoisted guarded" \
+               "multi explicit copy" "multi packed validity"
 done
 ```
 

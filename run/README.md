@@ -27,6 +27,7 @@ are views of the same physical allocation to control data-placement effects.
 | `--hoist-gather-addresses` | Experimental Hopper-only address hoisting for all multi-buffer CTA types versus the same reordered control; implies reordered tables. |
 | `--guard-gather-copies` | Original per-row copy guards plus hoisted addresses versus address hoisting alone; implies address hoisting and reordered tables. |
 | `--explicit-gather-copy` | Experimental explicit guarded `cp.async` versus the guarded hoisted control; implies guards, address hoisting and reordered tables. |
+| `--pack-gather-validity` | Packed per-thread row-validity mask versus the explicit-copy control; implies explicit copies, guards, address hoisting and reordered tables. |
 | `--readiness` | Already-ready single/multi-table acquire checks versus unchecked paths, including any enabled reordered tables. |
 | `--stores` | TMA output, bulk rows, row scatter, unique/duplicate reductions, multiple destinations and compact N-tile-major output. |
 | `--waves` | Completion barrier and GPU ready-prefix publication; implies stores. |
@@ -43,7 +44,7 @@ CUDA_VISIBLE_DEVICES=0 python run/hopper_gemm_communication_bench.py \
   --routes-per-buffer 129 --tokens-per-buffer 257 \
   --tile-m 128 --tile-n 128 --cluster-m 2 --sm-count 8 \
   --packed-baseline --inline-indices --single-source-fast-path --readiness --host-ready \
-  --explicit-gather-copy --weighted-contributions --swiglu \
+  --pack-gather-validity --weighted-contributions --swiglu \
   --warmup 1 --rounds 1 --repetitions 1
 ```
 
@@ -198,13 +199,27 @@ with no speedup claim.
 the same hoisted source-address formula, source selection, row validity and
 K-tail checks. The change aims to share the destination-stage address calculation
 across row copies; whether that becomes one calculation in SASS must be checked
-on H200. Mixed-source and partial tiles remain supported. Only the new variant
+on H200. Mixed-source and partial tiles remain supported. This variant
 passes `gather_explicit_copy=True`, together with `gather_hoist_addresses=True`
 and `gather_guarded_copies=True`; single-source specialization and readiness stay
 disabled. This is opt-in and makes no speedup claim.
 
+`--pack-gather-validity` adds `multi packed validity`, controlled by
+`multi explicit copy`. During setup for each CTA work tile, it packs each
+thread's row validity into a mask before adding lane offsets to the row pointers.
+The K-loop copy guards read those bits. The goal is to retain only adjusted row
+pointers and the mask across K iterations, so raw pointers need not remain live
+solely for validity checks. This is a representation experiment, not a register
+budget change; the compiler's resulting liveness and SASS must be checked on H200.
+
+Only the new variant passes `gather_packed_validity=True`, together with the
+three explicit/guarded/hoisted copy flags. It uses the same inputs, table order,
+geometry, source-address formula and mixed/partial-tile checks as its control.
+Single-source specialization and readiness checks remain disabled. Existing
+variants keep their previous implementations, and no speedup is assumed.
+
 Run the numerical suite first, then compare 8 and 16 input buffers with 32768
-total routes and 32768 source tokens across all five variants in each invocation:
+total routes and 32768 source tokens across all six variants in each invocation:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m unittest discover \
@@ -215,21 +230,23 @@ for input_buffers in 8 16; do
     --k 7168 --n 2048 --experts 8 --buffers "$input_buffers" \
     --routes-per-buffer "$((32768 / input_buffers))" \
     --tokens-per-buffer "$((32768 / input_buffers))" \
-    --tile-m 128 --tile-n 128 --cluster-m 2 --explicit-gather-copy \
+    --tile-m 128 --tile-n 128 --cluster-m 2 --pack-gather-validity \
     --variants "single table reordered" "multi table reordered" \
-               "multi hoisted addresses" "multi hoisted guarded" "multi explicit copy"
+               "multi hoisted addresses" "multi hoisted guarded" \
+               "multi explicit copy" "multi packed validity"
 done
 ```
 
 `--guard-gather-copies` implies `--hoist-gather-addresses` and `--reordered-tables`;
-`--explicit-gather-copy` additionally implies `--guard-gather-copies`. Both reject
+`--explicit-gather-copy` additionally implies `--guard-gather-copies`, and
+`--pack-gather-validity` implies `--explicit-gather-copy`. These options reject
 Blackwell and `--baseline-only`, and can coexist with other feature flags without
 changing their variants. Read each row's `vs control` against its named control
 within the same invocation. The loop fixes total workload size across buffer
 counts but constructs routing separately for each.
 
 For focused instruction profiling, replace the `--variants` list with
-`--profile-variant "multi explicit copy"`, retaining `--explicit-gather-copy`
+`--profile-variant "multi packed validity"`, retaining `--pack-gather-validity`
 and the workload flags. The checked, warmed call appears in the `quack_profile`
 NVTX range; use the interleaved graph comparison above for latency measurements.
 

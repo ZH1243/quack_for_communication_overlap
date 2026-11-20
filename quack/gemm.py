@@ -111,6 +111,7 @@ def _compile_gemm(
     gather_hoist_addresses=False,
     gather_guarded_copies=False,
     gather_explicit_copy=False,
+    gather_packed_validity=False,
 ):
     sm_to_cls = {
         8: GemmDefaultSm80,
@@ -289,6 +290,7 @@ def _compile_gemm(
         gather_hoist_addresses=gather_hoist_addresses,
         gather_guarded_copies=gather_guarded_copies,
         gather_explicit_copy=gather_explicit_copy,
+        gather_packed_validity=gather_packed_validity,
     )
 
 
@@ -702,6 +704,8 @@ def gemm(
     gather_guarded_copies: bool = False,
     # Experimental explicit cp.async emission; requires gather_guarded_copies=True.
     gather_explicit_copy: bool = False,
+    # Pack row validity independently of source pointers; requires gather_explicit_copy=True.
+    gather_packed_validity: bool = False,
 ) -> _GemmPlan:
     if sm_count is not None and not persistent:
         raise ValueError("sm_count requires persistent=True")
@@ -793,6 +797,8 @@ def gemm(
         raise ValueError("gather_guarded_copies requires gather_hoist_addresses=True")
     if gather_explicit_copy and not gather_guarded_copies:
         raise ValueError("gather_explicit_copy requires gather_guarded_copies=True")
+    if gather_packed_validity and not gather_explicit_copy:
+        raise ValueError("gather_packed_validity requires gather_explicit_copy=True")
 
     # tensor_key excludes device, so enforce this on warm plan-cache hits too.
     if route_weights is not None and (
@@ -842,6 +848,7 @@ def gemm(
         gather_hoist_addresses,
         gather_guarded_copies,
         gather_explicit_copy,
+        gather_packed_validity,
         epilogue_store,
         bulk_row_double_buffer,
         bulk_row_swizzle,
@@ -943,6 +950,7 @@ def gemm(
             gather_hoist_addresses=gather_hoist_addresses,
             gather_guarded_copies=gather_guarded_copies,
             gather_explicit_copy=gather_explicit_copy,
+            gather_packed_validity=gather_packed_validity,
         )
         _gemm_plan_cache[key] = plan
     run_gemm_plan(
@@ -1169,6 +1177,7 @@ def _build_gemm_plan(
     gather_hoist_addresses=False,
     gather_guarded_copies=False,
     gather_explicit_copy=False,
+    gather_packed_validity=False,
 ) -> _GemmPlan:
     if route_weights is not None:
         if (
@@ -1710,6 +1719,7 @@ def _build_gemm_plan(
         gather_hoist_addresses=gather_hoist_addresses,
         gather_guarded_copies=gather_guarded_copies,
         gather_explicit_copy=gather_explicit_copy,
+        gather_packed_validity=gather_packed_validity,
     )
 
     scheduler_uses_semaphore = is_dynamic_persistent and device_capacity[0] <= 9

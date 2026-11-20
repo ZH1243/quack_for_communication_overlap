@@ -7,7 +7,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils.blackwell_helpers as sm100_utils
 
-from cutlass import Int64, Int32, Int16, Boolean, const_expr
+from cutlass import Int64, Int32, Int16, Uint32, Boolean, const_expr
 from cutlass.base_dsl.enums import Arch
 from cutlass.cute.nvgpu import cpasync, tcgen05, warp
 from cutlass.cute.nvgpu.tcgen05.mma import CtaGroup  # noqa
@@ -1541,13 +1541,27 @@ def gather_m_get_copy_fn(
     return copy_fn
 
 
+@cute.jit
+def _pack_gather_row_validity(row_valid: cute.Tensor, row_masks: cute.Tensor):
+    """Pack this thread's row predicates, including a partial final mask word."""
+    num_rows = const_expr(cute.size(row_valid))
+    assert cute.size(row_masks) == cute.ceil_div(num_rows, 32)
+    for word in cutlass.range_constexpr(cute.size(row_masks)):
+        bits = Uint32(0)
+        for bit in cutlass.range_constexpr(min(32, num_rows - word * 32)):
+            bits = bits | (Uint32(row_valid[word * 32 + bit]) << bit)
+        row_masks[word] = bits
+
+
 @dsl_user_op
 def _cpasync_gather_row(
     dst: cute.Pointer,
     src: cute.Pointer,
-    row_valid: Boolean,
+    row_valid: Optional[Boolean] = None,
     *,
     src_bytes: Optional[Int32] = None,
+    row_mask: Optional[Uint32] = None,
+    row_bit: int = 0,
     loc=None,
     ip=None,
 ):
@@ -1558,18 +1572,35 @@ def _cpasync_gather_row(
     from the existing swizzled tensor view and retains pipeline commit/arrival.
     ``src_bytes`` is omitted for full K tiles and is 0 or 16 for the final tile.
     This matches the GLOBAL-cache CopyG2SOp used by the SM90 gather loader.
+
+    Alternatively, take ``row_bit`` from a packed ``row_mask``. Extract the bit
+    inside PTX so the copy consumes the packed value, rather than exposing a
+    per-row Boolean expression that can be traced back to a raw row pointer.
     """
     args = [
         Int32(dst.toint(loc=loc, ip=ip)),
         Int64(src.toint(loc=loc, ip=ip)),
-        row_valid,
     ]
+    prefix, suffix, guard = "", "", "{$r2}"
+    if row_mask is None:
+        assert row_valid is not None
+        args.append(row_valid)
+    else:
+        assert row_valid is None and 0 <= row_bit < 32
+        args.append(row_mask)
+        prefix = (
+            "{\n.reg .b32 row_bit_value;\n.reg .pred row_is_valid;\n"
+            "and.b32 row_bit_value, {$r2}, " + hex(1 << row_bit) + ";\n"
+            "setp.ne.u32 row_is_valid, row_bit_value, 0;\n"
+        )
+        suffix, guard = "\n}", "row_is_valid"
     tail_operand = ""
     if src_bytes is not None:
         args.append(src_bytes)
         tail_operand = ", {$r3}"
     cute.arch.inline_ptx(
-        "@{$r2} cp.async.cg.shared.global [{$r0}], [{$r1}], 16" + tail_operand + ";",
+        prefix + "@" + guard + " cp.async.cg.shared.global [{$r0}], [{$r1}], 16"
+        + tail_operand + ";" + suffix,
         read_only_args=args,
         loc=loc,
         ip=ip,
@@ -1590,6 +1621,7 @@ def multi_buffer_gather_m_get_copy_fn(
     hoist_addresses: cutlass.Constexpr[bool] = False,
     guarded_copies: cutlass.Constexpr[bool] = False,
     explicit_copy: cutlass.Constexpr[bool] = False,
+    packed_validity: cutlass.Constexpr[bool] = False,
 ) -> Callable:
     """Gather one packed A tile from independent X/A_idx buffers.
 
@@ -1603,11 +1635,14 @@ def multi_buffer_gather_m_get_copy_fn(
     the original row guard instead of passing row validity to the copy atom.
     Explicit copies move that guard into PTX to expose shared destination-stage
     address calculation outside row-dependent IR branches.
+    Packed validity makes the copy consume a setup-time bitmask so the K loop
+    needs only lane-adjusted row pointers and masks, not the raw row bases.
     """
     num_buffers = const_expr(len(mAs))
     assert len(gAIdxs) == num_buffers and len(route_ranges) == 2 * num_buffers
     assert not guarded_copies or hoist_addresses
     assert not explicit_copy or guarded_copies
+    assert not packed_validity or explicit_copy
     tile_M, tile_K = cute.size(sA, mode=[0]), cute.size(sA, mode=[1])
     assert cute.size(sRowPtrs) == tile_M
     tAsA = partition_D_position_independent(thr_copy_A, sA)
@@ -1712,6 +1747,15 @@ def multi_buffer_gather_m_get_copy_fn(
         # can overwrite sRowPtrs. The fast path never accesses this scratch.
         address_barrier.arrive_and_wait()
 
+    validity_masks = None
+    if const_expr(packed_validity):
+        # Resolve the mask before adding lane offsets to the row pointers.
+        # Invalid zero bases can become nonzero after that adjustment. Decode
+        # bits only inside the copy PTX so raw-base comparisons are not inputs
+        # to the K-loop closure in this variant. Verify hoisting in SASS.
+        validity_masks = cute.make_rmem_tensor(cute.ceil_div(rows_per_thread, 32), Uint32)
+        _pack_gather_row_validity(row_valid, validity_masks)
+
     # Keep validity from the original row base: adding a lane offset would make
     # an invalid zero pointer nonzero. K is contiguous (validated by gemm()).
     element_bytes = const_expr(mAs[0].element_type.width // 8)
@@ -1769,12 +1813,21 @@ def multi_buffer_gather_m_get_copy_fn(
                 # One contiguous vector, matching the original ((V, 1),) view.
                 mA_vec = cute.make_tensor(row_ptr, cute.make_layout(((elems_per_load, 1),)))
                 if const_expr(explicit_copy):
-                    _cpasync_gather_row(
-                        tAsA_stage[(None, m),].iterator,
-                        row_ptr,
-                        row_valid[m],
-                        src_bytes=src_bytes,
-                    )
+                    if const_expr(packed_validity):
+                        _cpasync_gather_row(
+                            tAsA_stage[(None, m),].iterator,
+                            row_ptr,
+                            src_bytes=src_bytes,
+                            row_mask=validity_masks[m // 32],
+                            row_bit=m % 32,
+                        )
+                    else:
+                        _cpasync_gather_row(
+                            tAsA_stage[(None, m),].iterator,
+                            row_ptr,
+                            row_valid[m],
+                            src_bytes=src_bytes,
+                        )
                 elif const_expr(guarded_copies):
                     # Keep address formation outside the row guard. This
                     # control changes copy predication only at source level;
