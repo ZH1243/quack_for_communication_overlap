@@ -257,13 +257,14 @@ class HopperBenchmarkGpuTests(unittest.TestCase):
     def test_gather_and_stores_without_pingpong(self):
         self.run_benchmark([
             "--no-pingpong", "--stores", "--single-source-fast-path", "--hoist-gather-addresses",
+            "--guard-gather-copies",
         ])
 
     @torch.inference_mode()
     def test_all_features_with_pingpong_and_partial_waves(self):
         self.run_benchmark([
             "--host-ready", "--weighted-contributions", "--swiglu", "--single-source-fast-path",
-            "--hoist-gather-addresses",
+            "--hoist-gather-addresses", "--guard-gather-copies",
         ])
 
 

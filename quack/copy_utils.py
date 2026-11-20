@@ -1553,6 +1553,7 @@ def multi_buffer_gather_m_get_copy_fn(
     address_barrier: cutlass.pipeline.NamedBarrier,
     single_source_fast_path: cutlass.Constexpr[bool] = False,
     hoist_addresses: cutlass.Constexpr[bool] = False,
+    guarded_copies: cutlass.Constexpr[bool] = False,
 ) -> Callable:
     """Gather one packed A tile from independent X/A_idx buffers.
 
@@ -1561,11 +1562,13 @@ def multi_buffer_gather_m_get_copy_fn(
     valid destination row. The buffer tuple length is compile-time static.
     The optional fast path resolves a sole contributing source once per warp,
     then reads indices directly without the shared row-pointer exchange.
-    Address hoisting is independent: cache lane-adjusted row bases and predicate
-    the copies directly, keeping the common K offset outside row conditionals.
+    Address hoisting is independent: cache lane-adjusted row bases and form the
+    common K offset outside row conditionals. Its guarded-copy control restores
+    the original row guard instead of passing row validity to the copy atom.
     """
     num_buffers = const_expr(len(mAs))
     assert len(gAIdxs) == num_buffers and len(route_ranges) == 2 * num_buffers
+    assert not guarded_copies or hoist_addresses
     tile_M, tile_K = cute.size(sA, mode=[0]), cute.size(sA, mode=[1])
     assert cute.size(sRowPtrs) == tile_M
     tAsA = partition_D_position_independent(thr_copy_A, sA)
@@ -1717,17 +1720,29 @@ def multi_buffer_gather_m_get_copy_fn(
                 )
                 # One contiguous vector, matching the original ((V, 1),) view.
                 mA_vec = cute.make_tensor(row_ptr, cute.make_layout(((elems_per_load, 1),)))
-                copy_pred[0] = row_valid[m]
-                if const_expr(pred):
-                    copy_pred[0] = row_valid[m] & tApA_k[0]
-                # Tensor construction only forms an address. Invalid rows and
-                # K-tail vectors must be masked at the actual memory operation.
-                cute.copy(
-                    thr_copy_A,
-                    mA_vec,
-                    tAsA[(None, m), dst_idx],
-                    pred=copy_pred,
-                )
+                if const_expr(guarded_copies):
+                    # Keep address formation outside the row guard. This
+                    # control changes copy predication only at source level;
+                    # inspect SASS for compiler sinking or other restructuring.
+                    if row_valid[m]:
+                        cute.copy(
+                            thr_copy_A,
+                            mA_vec,
+                            tAsA[(None, m), dst_idx],
+                            pred=tApA_k,
+                        )
+                else:
+                    copy_pred[0] = row_valid[m]
+                    if const_expr(pred):
+                        copy_pred[0] = row_valid[m] & tApA_k[0]
+                    # Tensor construction only forms an address. Invalid rows and
+                    # K-tail vectors must be masked at the actual memory operation.
+                    cute.copy(
+                        thr_copy_A,
+                        mA_vec,
+                        tAsA[(None, m), dst_idx],
+                        pred=copy_pred,
+                    )
         else:
             for m in cutlass.range_constexpr(rows_per_thread):
                 if row_valid[m]:

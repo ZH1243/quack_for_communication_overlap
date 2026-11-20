@@ -1,4 +1,4 @@
-"""Numerical tests for Hopper gather source selection and address hoisting.
+"""Numerical tests for Hopper gather source selection, address hoisting and guards.
 
 Run CPU fixture checks and optional Hopper kernel checks from the repository root:
     python -m unittest discover -s tests -p test_hopper_single_source_fast_path.py -v
@@ -139,8 +139,13 @@ class SingleSourceKernelTests(unittest.TestCase):
         torch.backends.cuda.matmul.allow_tf32 = False
         case = make_case(tile_m, cluster_m, "cuda", num_buffers=num_buffers)
         table = torch.tensor(case.rows, device="cuda", dtype=torch.int32)
-        # Separate controls for each optimization, plus their combined path.
-        variants = ((False, False), (True, False), (False, True), (True, True))
+        # (single-source fast path, hoisted addresses, guarded copies).
+        # Guarded copies require hoisting; test them with both source selectors.
+        variants = (
+            (False, False, False), (True, False, False),
+            (False, True, False), (True, True, False),
+            (False, True, True), (True, True, True),
+        )
         outputs = {
             flags: torch.full(
                 (case.capacity, case.n), float("nan"), device="cuda", dtype=torch.bfloat16,
@@ -149,7 +154,7 @@ class SingleSourceKernelTests(unittest.TestCase):
         }
 
         def launch(flags):
-            fast, hoist = flags
+            fast, hoist, guard = flags
             output = outputs[flags]
             output.fill_(float("nan"))
             gemm(
@@ -157,6 +162,7 @@ class SingleSourceKernelTests(unittest.TestCase):
                 gather_work_table=table, multi_buffer_gather=True,
                 gather_single_source_fast_path=fast,
                 gather_hoist_addresses=hoist,
+                gather_guarded_copies=guard,
                 tile_M=tile_m, tile_N=128, tile_K=64,
                 cluster_M=cluster_m, cluster_N=1, max_swizzle_size=1,
                 persistent=True, is_dynamic_persistent=False, pingpong=pingpong,
@@ -175,7 +181,8 @@ class SingleSourceKernelTests(unittest.TestCase):
                 )
                 self.assertTrue(torch.isnan(output[case.routes:]).all().item())
                 torch.testing.assert_close(
-                    output[:case.routes], outputs[(False, False)][:case.routes], atol=0, rtol=0,
+                    output[:case.routes], outputs[(False, False, False)][:case.routes],
+                    atol=0, rtol=0,
                 )
 
         for _ in range(2):

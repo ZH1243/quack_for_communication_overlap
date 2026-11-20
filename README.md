@@ -189,12 +189,37 @@ CUDA_VISIBLE_DEVICES=0 python run/hopper_gemm_communication_bench.py \
   --variants "single table reordered" "multi table reordered" "multi hoisted addresses"
 ```
 
-Only `multi hoisted addresses` enables `gather_hoist_addresses=True`, with
+The `multi hoisted addresses` variant enables `gather_hoist_addresses=True`, with
 `multi table reordered` as its control. It precomputes lane row bases outside the
 K loop and a common K offset before per-row copy predicates, retaining mixed-source
 and partial-tile handling. This opt-in experiment keeps readiness disabled in
 the compared pair and makes no speedup claim; validate correctness and measure
 the generated kernel on H200.
+
+An additional `--guard-gather-copies` experiment retains the original per-row
+copy guard with hoisted addresses. It adds `multi hoisted guarded`, controlled
+by `multi hoisted addresses`, and implies both hoisting and reordered tables.
+The compared variants share inputs, table order and geometry; single-source
+specialization and readiness checks remain disabled. Mixed-source and partial
+tiles remain supported, with no speedup claim.
+
+Run the numerical checks, then keep total routes and tokens at 32768 while
+comparing 8 and 16 buffers on H200:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m unittest discover \
+  -s tests -p test_hopper_single_source_fast_path.py -v
+
+for input_buffers in 8 16; do
+  CUDA_VISIBLE_DEVICES=0 python run/hopper_gemm_communication_bench.py \
+    --k 7168 --n 2048 --experts 8 --buffers "$input_buffers" \
+    --routes-per-buffer "$((32768 / input_buffers))" \
+    --tokens-per-buffer "$((32768 / input_buffers))" \
+    --tile-m 128 --tile-n 128 --cluster-m 2 --guard-gather-copies \
+    --variants "single table reordered" "multi table reordered" \
+               "multi hoisted addresses" "multi hoisted guarded"
+done
+```
 
 ## Blackwell node development environment (CUDA 12.9)
 

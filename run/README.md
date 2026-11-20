@@ -25,6 +25,7 @@ are views of the same physical allocation to control data-placement effects.
 | `--reordered-tables` | Single/multi-buffer tables in the same expert/M/N order, alongside the original N-group-first paths. |
 | `--single-source-fast-path` | Experimental Hopper-only single-source CTA specialization versus the matching reordered multi-buffer path; implies reordered tables. |
 | `--hoist-gather-addresses` | Experimental Hopper-only address hoisting for all multi-buffer CTA types versus the same reordered control; implies reordered tables. |
+| `--guard-gather-copies` | Original per-row copy guards plus hoisted addresses versus address hoisting alone; implies address hoisting and reordered tables. |
 | `--readiness` | Already-ready single/multi-table acquire checks versus unchecked paths, including any enabled reordered tables. |
 | `--stores` | TMA output, bulk rows, row scatter, unique/duplicate reductions, multiple destinations and compact N-tile-major output. |
 | `--waves` | Completion barrier and GPU ready-prefix publication; implies stores. |
@@ -41,7 +42,7 @@ CUDA_VISIBLE_DEVICES=0 python run/hopper_gemm_communication_bench.py \
   --routes-per-buffer 129 --tokens-per-buffer 257 \
   --tile-m 128 --tile-n 128 --cluster-m 2 --sm-count 8 \
   --packed-baseline --inline-indices --single-source-fast-path --readiness --host-ready \
-  --hoist-gather-addresses --weighted-contributions --swiglu \
+  --guard-gather-copies --weighted-contributions --swiglu \
   --warmup 1 --rounds 1 --repetitions 1
 ```
 
@@ -173,7 +174,7 @@ CUDA_VISIBLE_DEVICES=0 python run/hopper_gemm_communication_bench.py \
   --variants "single table reordered" "multi table reordered" "multi hoisted addresses"
 ```
 
-Only `multi hoisted addresses` passes `gather_hoist_addresses=True`; its control
+The `multi hoisted addresses` variant passes `gather_hoist_addresses=True`; its control
 is `multi table reordered`, using identical source allocations, indices, table
 contents, traversal and launch settings. Both have readiness disabled. The
 flag implies `--reordered-tables`, rejects Blackwell and `--baseline-only`, and
@@ -181,6 +182,39 @@ can coexist with `--single-source-fast-path` to add separate experimental rows.
 SwiGLU and ready-check variants remain independent and unmodified. This is an
 opt-in code-generation experiment, with no speedup claim: validate values, read
 its `vs control` latency, and inspect generated instructions on the target GPU.
+
+`--guard-gather-copies` adds `multi hoisted guarded`, controlled by
+`multi hoisted addresses`. Both use the same hoisted row bases and K offset;
+the new variant retains the original per-row validity guard around each copy.
+It passes `gather_hoist_addresses=True` and `gather_guarded_copies=True`, with
+single-source specialization and readiness checks disabled. Inputs, table order,
+geometry and all other launch settings match. Mixed-source and partial-tile
+handling remain supported. This is an experimental code-generation comparison,
+with no speedup claim.
+
+Run the numerical suite first, then compare 8 and 16 input buffers with 32768
+total routes and 32768 source tokens in each invocation:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m unittest discover \
+  -s tests -p test_hopper_single_source_fast_path.py -v
+
+for input_buffers in 8 16; do
+  CUDA_VISIBLE_DEVICES=0 python run/hopper_gemm_communication_bench.py \
+    --k 7168 --n 2048 --experts 8 --buffers "$input_buffers" \
+    --routes-per-buffer "$((32768 / input_buffers))" \
+    --tokens-per-buffer "$((32768 / input_buffers))" \
+    --tile-m 128 --tile-n 128 --cluster-m 2 --guard-gather-copies \
+    --variants "single table reordered" "multi table reordered" \
+               "multi hoisted addresses" "multi hoisted guarded"
+done
+```
+
+The flag implies `--hoist-gather-addresses` and `--reordered-tables`. It rejects
+Blackwell and `--baseline-only`, and can coexist with the other feature flags
+without changing their variants. Read the guarded row's `vs control` against
+the unguarded hoisted row within the same invocation; the loop fixes total
+workload size across buffer counts but constructs routing separately for each.
 
 Measure down-like stores, completion and weighting:
 
