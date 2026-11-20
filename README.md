@@ -135,6 +135,29 @@ print("QuACK works:", y.shape, torch.cuda.get_device_name())
 PY
 ```
 
+## Hopper communication GEMM feature benchmark
+
+On H100/H200, `run/hopper_gemm_communication_bench.py` compares indexed gather,
+single/multi-buffer gather tables, readiness, output stores, completion signaling,
+fused SwiGLU and route weighting using matched inputs and interleaved CUDA graphs.
+Start with the small all-feature numerical check in the
+[Hopper benchmark instructions](run/README.md#hopper_gemm_communication_benchpy),
+then measure gather-table overhead from the repository root:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python run/hopper_gemm_communication_bench.py \
+  --k 4096 --n 1024 --buffers 16 \
+  --tile-m 128 --tile-n 128 --cluster-m 2 \
+  --packed-baseline --inline-indices --readiness
+```
+
+The default is pingpong for all controls and features. `--host-ready` enables
+bulk stores, scatter/reduction, wave barriers and GPU/host ready publication;
+`--weighted-contributions` adds matched route-scaling comparisons. Each result
+includes latency, TFLOPS and percentage change against its named control. This
+measures GEMM-path costs; metadata preparation and communication are excluded.
+GPU compilation and numerical checks still need to run on the Hopper node.
+
 ## Blackwell node development environment (CUDA 12.9)
 
 The following setup was validated on a Linux x86_64 node with eight NVIDIA B300 GPUs
@@ -483,8 +506,8 @@ counts `2 * total_routes * N * K`, including the full preactivation N for SwiGLU
 
 Ready checks here measure the already-ready path, and completion tests have no
 concurrent consumer. Producer arrival delays, CPU polling, and RDMA/NVLink overlap
-require the two-node proxy benchmark. This benchmark's `--swiglu` variants still
-reject `--sm-count`; their runner does not forward the activation API's cap.
+require the two-node proxy benchmark. `--sm-count` applies to every variant,
+including the fused `--swiglu` paths.
 Use `--baseline-only` to measure the
 existing indexed-gather path separately; compare identical configurations, data, and
 node conditions across revisions to check for regressions in ordinary GEMM.

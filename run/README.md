@@ -7,6 +7,96 @@ the Hopper table-scheduled runner also supports uneven expert lengths.
 
 ## Scripts
 
+### `hopper_gemm_communication_bench.py`
+
+Matched feature-cost comparisons for H100/H200 (SM90), sharing the workloads,
+numerical references and timing implementation with
+`blackwell_gemm_communication_bench.py`. The default compares `indexed baseline`,
+`single table` (control: indexed baseline), and `multi table` (control: single table).
+The indexed baseline already gathers tokens; its comparison with a single table
+measures the additional table path. All variants use the same BF16 source data,
+expert weights, tile, cluster, static persistence and SM cap. Multi-buffer sources
+are views of the same physical allocation to control data-placement effects.
+
+| Flag | Additional comparison |
+| --- | --- |
+| `--packed-baseline` | Prepacked grouped GEMM versus indexed gather; packing excluded. |
+| `--inline-indices` | Token indices embedded in table descriptors versus separate indices. |
+| `--readiness` | Already-ready single/multi-table acquire checks versus unchecked paths. |
+| `--stores` | TMA output, bulk rows, row scatter, unique/duplicate reductions, multiple destinations and compact N-tile-major output. |
+| `--waves` | Completion barrier and GPU ready-prefix publication; implies stores. |
+| `--host-ready` | Mapped-host publication versus GPU publication; implies waves. |
+| `--weighted-contributions` | FP32 per-route scaling versus matching unweighted scatter/completion paths; implies stores. |
+| `--swiglu` | Indexed/single-table/multi-table fused SwiGLU, without preactivation stores. |
+
+Activate the Hopper environment and run from the repository root. First check all
+variants on a small, ragged workload (these timings are not throughput results):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python run/hopper_gemm_communication_bench.py \
+  --k 64 --n 272 --buffers 3 --experts 2 \
+  --routes-per-buffer 129 --tokens-per-buffer 257 \
+  --tile-m 128 --tile-n 128 --cluster-m 2 --sm-count 8 \
+  --packed-baseline --inline-indices --readiness --host-ready \
+  --weighted-contributions --swiglu --warmup 1 --rounds 1 --repetitions 1
+```
+
+Measure gather-table and readiness overhead at a larger size:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python run/hopper_gemm_communication_bench.py \
+  --k 4096 --n 1024 --buffers 16 \
+  --tile-m 128 --tile-n 128 --cluster-m 2 \
+  --packed-baseline --inline-indices --readiness
+```
+
+Measure down-like stores, completion and weighting:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python run/hopper_gemm_communication_bench.py \
+  --k 512 --n 4096 --buffers 16 \
+  --tile-m 128 --tile-n 128 --cluster-m 2 \
+  --packed-baseline --host-ready --weighted-contributions
+```
+
+Hopper defaults to `--pingpong` for **every** variant, including controls. Use
+`--no-pingpong` to compare cooperative kernels in a separate invocation; wave
+barriers and ready publication require pingpong. `--tile-k` optionally pins the
+K tile. Hopper's `tile-m` is the per-CTA row count; table spans and inline index
+slots use `tile_m * cluster_m`. Blackwell's two-CTA geometry is different, so do
+not copy its wide tile settings. Blackwell-only bulk-SMEM and trace overrides
+are not accepted by the Hopper entry point. No cache override is needed here.
+
+`--sm-count` caps all variants equally, including SwiGLU. Wave group size must
+divide the actual resident cluster count. `--n` is the full projection width;
+SwiGLU writes `N/2` columns, so plain-versus-SwiGLU timing includes both activation
+and the changed output-store volume. Fused table variants have fused controls.
+
+Each variant checks numerical values against an FP32 PyTorch reference on repeated
+eager calls and after CUDA graph replay. Launches are interleaved individually,
+with rotated order and GPU backlog. Output reports median microseconds, useful
+GEMM TFLOPS, baseline drift, `time/base`, and
+`vs control = 100 * (variant_us / control_us - 1)`.
+For a focused table comparison, append
+`--variants "indexed baseline" "single table" "multi table"`.
+`--profile-variant "single table"` exposes one checked, warmed eager call inside
+the `quack_profile` NVTX range for profiling.
+
+Packing, metadata/weight preparation, output zeroing and mapped-host resets are
+excluded. Mandatory wave-counter reset remains timed. Ready checks have all rows
+available; producer stalls, CPU polling, communication and concurrent combine
+are not measured. Use the streaming/proxy runners for those costs.
+
+Host numerical regressions and Hopper-only GPU checks can also be run with:
+
+```bash
+python -m unittest discover -s tests -p test_hopper_communication_bench.py -v
+```
+
+The GPU cases skip on machines without SM90. H200 compilation, correctness and
+throughput must be verified on the remote GPU; local CPU checks do not establish
+GPU correctness or performance.
+
 ### `blackwell_gather_gemm.py`
 
 The Blackwell counterpart of the indexed Hopper gather runner. It shares input
