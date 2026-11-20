@@ -23,6 +23,7 @@ are views of the same physical allocation to control data-placement effects.
 | `--packed-baseline` | Prepacked grouped GEMM versus indexed gather; packing excluded. |
 | `--inline-indices` | Four-column table traversal order, then embedded indices versus separate indices at the same order. |
 | `--reordered-tables` | Single/multi-buffer tables in the same expert/M/N order, alongside the original N-group-first paths. |
+| `--single-source-fast-path` | Experimental Hopper-only single-source CTA specialization versus the matching reordered multi-buffer path; implies reordered tables. |
 | `--readiness` | Already-ready single/multi-table acquire checks versus unchecked paths, including any enabled reordered tables. |
 | `--stores` | TMA output, bulk rows, row scatter, unique/duplicate reductions, multiple destinations and compact N-tile-major output. |
 | `--waves` | Completion barrier and GPU ready-prefix publication; implies stores. |
@@ -38,7 +39,7 @@ CUDA_VISIBLE_DEVICES=0 python run/hopper_gemm_communication_bench.py \
   --k 64 --n 272 --buffers 3 --experts 2 \
   --routes-per-buffer 129 --tokens-per-buffer 257 \
   --tile-m 128 --tile-n 128 --cluster-m 2 --sm-count 8 \
-  --packed-baseline --inline-indices --reordered-tables --readiness --host-ready \
+  --packed-baseline --inline-indices --single-source-fast-path --readiness --host-ready \
   --weighted-contributions --swiglu --warmup 1 --rounds 1 --repetitions 1
 ```
 
@@ -110,6 +111,46 @@ so it matches single-buffer work even when tiles cross source boundaries.
 Ready counters contain the full table length for both orders; these are acquire
 costs with no producer delay. This experiment does not change the streaming or
 completion variants, whose N-group-first order supports early column publication.
+
+Before timing the experimental single-source optimization, run its numerical
+regressions on H200. The GPU cases exercise independent source allocations,
+single-source and mixed-source CTAs, empty sources/CTAs and partial tiles:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m unittest discover \
+  -s tests -p test_hopper_single_source_fast_path.py -v
+```
+
+Then start with readiness disabled and compare the same reordered tables:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python run/hopper_gemm_communication_bench.py \
+  --k 7168 --n 2048 --buffers 16 \
+  --tile-m 128 --tile-n 128 --cluster-m 2 --single-source-fast-path \
+  --variants "single table reordered" "multi table reordered" "multi single-source fast"
+```
+
+`--single-source-fast-path` is opt-in and implies `--reordered-tables`. The new
+`multi single-source fast` variant uses `multi table reordered` as its control:
+source allocations, indices, table contents, traversal, tile geometry and launch
+settings are identical. Only that new variant passes
+`gather_single_source_fast_path=True` to GEMM; existing variants retain the
+original implementation.
+
+For a CTA whose valid rows all come from one source buffer, the experimental
+loader resolves that source once per loader warp. It then reads the source's
+indices directly, bypassing the per-row source scan and shared row-pointer
+exchange with its two barriers. Mixed-source and empty CTAs use the original
+path. Partial CTAs can use the optimization when all their valid rows share a
+source. The runner prints table-derived counts of eligible, mixed and empty CTA
+work tiles, including N-group expansion, before numerical validation and timing.
+
+The optimized variant and its control have readiness checks disabled, including
+when `--readiness` enables separate ready-check variants. The specialization applies
+only to this plain Hopper GEMM variant; `--swiglu` can still add the independent,
+unmodified activation variants. The CLI rejects Blackwell and `--baseline-only`
+combinations. It does not change streamed table publication. No speedup is assumed:
+use the new row's `vs control` result after numerical checks pass on H200.
 
 Measure down-like stores, completion and weighting:
 

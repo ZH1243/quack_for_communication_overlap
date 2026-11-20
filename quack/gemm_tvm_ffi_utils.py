@@ -815,6 +815,7 @@ def compile_gemm_kernel(
     bulk_row_swizzle=False,
     bulk_store_rows=None,
     bulk_store_config=None,
+    gather_single_source_fast_path=False,
 ):
     """Build GemmCls instance, apply SM90 partial, and cute.compile with TVM-FFI."""
     split_k_kwargs = {}
@@ -839,6 +840,10 @@ def compile_gemm_kernel(
     if bulk_row_double_buffer:
         assert device_capacity[0] == 9 and pingpong and epilogue_store != "tma"
         split_k_kwargs["bulk_row_double_buffer"] = True
+    if gather_single_source_fast_path:
+        if device_capacity[0] != 9 or not gather_table or gather_table_num_buffers <= 1:
+            raise ValueError("gather_single_source_fast_path requires SM90 multi-buffer gather")
+        split_k_kwargs["gather_single_source_fast_path"] = True
     if transform_a is not None:
         assert device_capacity[0] in (9, 12), "A-operand transforms are SM90/SM120 only"
         split_k_kwargs["transform_a"] = transform_a

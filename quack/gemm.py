@@ -107,6 +107,7 @@ def _compile_gemm(
     bulk_store_rows=None,
     bulk_store_config=None,
     has_route_weights=False,
+    gather_single_source_fast_path=False,
 ):
     sm_to_cls = {
         8: GemmDefaultSm80,
@@ -281,6 +282,7 @@ def _compile_gemm(
         bulk_store_rows=bulk_store_rows,
         bulk_store_config=bulk_store_config,
         n_tile_major_output=n_tile_major_output,
+        gather_single_source_fast_path=gather_single_source_fast_path,
     )
 
 
@@ -684,6 +686,9 @@ def gemm(
     # be finite and nonnegative (caller validates contents outside timed launches).
     # Zero weights still perform stores and participate in completion accounting.
     route_weights: Optional[Tensor] = None,
+    # Experimental SM90 multi-buffer gather: resolve a CTA's sole source per loader warp.
+    # Mixed-source CTA tiles retain the general gather path; defaults to disabled.
+    gather_single_source_fast_path: bool = False,
 ) -> _GemmPlan:
     if sm_count is not None and not persistent:
         raise ValueError("sm_count requires persistent=True")
@@ -759,6 +764,13 @@ def gemm(
             raise ValueError("tensor sequences require multi_buffer_gather=True")
         A_buffers, A_idx_buffers = (A,), (A_idx,) if A_idx is not None else ()
 
+    if gather_single_source_fast_path and (
+        multi_buffer_gather_args is None
+        or gather_work_table is None
+        or get_device_capacity(A.device)[0] != 9
+    ):
+        raise ValueError("gather_single_source_fast_path requires SM90 multi-buffer gather")
+
     # tensor_key excludes device, so enforce this on warm plan-cache hits too.
     if route_weights is not None and (
         not isinstance(route_weights, Tensor) or route_weights.device != A.device
@@ -803,6 +815,7 @@ def gemm(
         tuple(tensor_key(t) for t in A_buffers),
         tuple(tensor_key(t) for t in A_idx_buffers),
         multi_buffer_gather,
+        gather_single_source_fast_path,
         epilogue_store,
         bulk_row_double_buffer,
         bulk_row_swizzle,
@@ -900,6 +913,7 @@ def gemm(
             multi_buffer_scatter=multi_buffer_scatter,
             n_tile_major_output=n_tile_major_output,
             sm_count=sm_count,
+            gather_single_source_fast_path=gather_single_source_fast_path,
         )
         _gemm_plan_cache[key] = plan
     run_gemm_plan(
@@ -1122,6 +1136,7 @@ def _build_gemm_plan(
     bulk_store_config=None,
     sm_count=None,
     route_weights=None,
+    gather_single_source_fast_path=False,
 ) -> _GemmPlan:
     if route_weights is not None:
         if (
@@ -1659,6 +1674,7 @@ def _build_gemm_plan(
         bulk_store_rows=bulk_store_rows,
         bulk_store_config=bulk_store_config,
         has_route_weights=route_weights is not None,
+        gather_single_source_fast_path=gather_single_source_fast_path,
     )
 
     scheduler_uses_semaphore = is_dynamic_persistent and device_capacity[0] <= 9

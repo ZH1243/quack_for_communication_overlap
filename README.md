@@ -158,6 +158,26 @@ includes latency, TFLOPS and percentage change against its named control. This
 measures GEMM-path costs; metadata preparation and communication are excluded.
 GPU compilation and numerical checks still need to run on the Hopper node.
 
+An opt-in experimental Hopper multi-buffer loader is available for CTAs whose
+valid rows all belong to one source. Compare it against the original path with
+the same expert/M/N table order and readiness checks disabled:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python run/hopper_gemm_communication_bench.py \
+  --k 7168 --n 2048 --buffers 16 \
+  --tile-m 128 --tile-n 128 --cluster-m 2 --single-source-fast-path \
+  --variants "single table reordered" "multi table reordered" "multi single-source fast"
+```
+
+The flag implies `--reordered-tables`; only `multi single-source fast` enables the
+new specialization, controlled by `multi table reordered`. It resolves a sole
+source once per loader warp and bypasses the per-row source scan and shared
+row-pointer exchange/barriers. Mixed-source and empty CTAs retain the original
+path. This is a plain-GEMM experiment, with no speedup claim; numerical checks and
+interleaved timings on H200 determine the result. See the
+[runner documentation](run/README.md#hopper_gemm_communication_benchpy) for coverage
+counts and supported combinations.
+
 ## Blackwell node development environment (CUDA 12.9)
 
 The following setup was validated on a Linux x86_64 node with eight NVIDIA B300 GPUs

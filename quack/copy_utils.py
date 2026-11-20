@@ -1551,12 +1551,15 @@ def multi_buffer_gather_m_get_copy_fn(
     route_ranges: tuple,
     limit_k: Int32,
     address_barrier: cutlass.pipeline.NamedBarrier,
+    single_source_fast_path: cutlass.Constexpr[bool] = False,
 ) -> Callable:
     """Gather one packed A tile from independent X/A_idx buffers.
 
     ``route_ranges`` contains CTA-clipped ``(start_j, end_j)`` pairs. Their
     rows are packed into sA in buffer order; exactly one buffer owns each
     valid destination row. The buffer tuple length is compile-time static.
+    The optional fast path resolves a sole contributing source once per warp,
+    then reads indices directly without the shared row-pointer exchange.
     """
     num_buffers = const_expr(len(mAs))
     assert len(gAIdxs) == num_buffers and len(route_ranges) == 2 * num_buffers
@@ -1574,42 +1577,95 @@ def multi_buffer_gather_m_get_copy_fn(
     rows_per_thread = const_expr(cute.size(tAcA.shape, mode=[1]))
     cols_per_thread = const_expr(cute.size(tAcA.shape, mode=[2]))
 
-    # Cooperatively resolve one source-row base address per destination row.
-    # Exactly the 128 gather-A loader threads enter this function.  A loader
-    # owns rows ``thread + i * 128``, so buffer-range checks and A_idx loads are
-    # performed once per row instead of once by every cp.async lane for it.
-    loader_threads = const_expr(128)
-    loader_idx = thr_copy_A.thr_idx
-    rows_to_prepare = const_expr(cute.ceil_div(tile_M, loader_threads))
-    for i in cutlass.range_constexpr(rows_to_prepare):
-        row = loader_idx + i * loader_threads
-        if row < tile_M:
-            row_ptr = Int64(0)
-            prefix = Int32(0)
-            for j in cutlass.range_constexpr(num_buffers):
-                length = route_ranges[2 * j + 1] - route_ranges[2 * j]
-                pred = row >= prefix
-                pred &= row < prefix + length
-                if pred:
-                    row_idx = gAIdxs[j][route_ranges[2 * j] + row - prefix]
-                    row_ptr = mAs[j][row_idx, None].iterator.toint()
-                prefix += length
-            sRowPtrs[row] = row_ptr
-
-    # Publish the completed table before the cp.async lane groups consume it.
-    address_barrier.arrive_and_wait()
     row_valid = cute.make_rmem_tensor(rows_per_thread, Boolean)
     row_ptrs = cute.make_rmem_tensor(rows_per_thread, Int64)
-    for m in cutlass.range_constexpr(rows_per_thread):
-        row = tAcA[0, m, 0][0]
-        row_ptrs[m] = sRowPtrs[row]
-        row_valid[m] = row_ptrs[m] != Int64(0)
+    use_single_source = Boolean(False)
+    if const_expr(single_source_fast_path):
+        active_sources = Int32(0)
+        source_ptr = Int64(0)
+        indices_ptr = Int64(0)
+        source_start = Int32(0)
+        source_length = Int32(0)
+        # Each warp observes the same CTA-clipped ranges. Selecting in lane 0
+        # and broadcasting needs no shared state or CTA rendezvous.
+        if cute.arch.lane_idx() == 0:
+            for j in cutlass.range_constexpr(num_buffers):
+                length = route_ranges[2 * j + 1] - route_ranges[2 * j]
+                if length > 0:
+                    active_sources += 1
+                    source_ptr = mAs[j].iterator.toint()
+                    indices_ptr = gAIdxs[j].iterator.toint()
+                    source_start = route_ranges[2 * j]
+                    source_length = length
+        active_sources = cute.arch.shuffle_sync(active_sources, 0)
+        use_single_source = active_sources == 1
+        # This branch is uniform across all 128 loaders, including empty and
+        # partial CTAs. Mixed/empty CTAs all take the barrier-bearing fallback.
+        if use_single_source:
+            source_ptr = cute.arch.shuffle_sync(source_ptr, 0)
+            indices_ptr = cute.arch.shuffle_sync(indices_ptr, 0)
+            source_start = cute.arch.shuffle_sync(source_start, 0)
+            source_length = cute.arch.shuffle_sync(source_length, 0)
+            selected_A = cute.make_tensor(
+                cute.make_ptr(
+                    mAs[0].element_type,
+                    source_ptr,
+                    mAs[0].iterator.memspace,
+                    assumed_align=mAs[0].iterator.alignment,
+                ),
+                mAs[0].layout,
+            )
+            selected_indices = cute.make_tensor(
+                cute.make_ptr(
+                    gAIdxs[0].element_type,
+                    indices_ptr,
+                    gAIdxs[0].iterator.memspace,
+                    assumed_align=gAIdxs[0].iterator.alignment,
+                ),
+                gAIdxs[0].layout,
+            )
+            for m in cutlass.range_constexpr(rows_per_thread):
+                row = tAcA[0, m, 0][0]
+                row_valid[m] = row < source_length
+                row_ptr = Int64(0)
+                if row_valid[m]:
+                    row_idx = selected_indices[source_start + row]
+                    row_ptr = selected_A[row_idx, None].iterator.toint()
+                row_ptrs[m] = row_ptr
 
-    # Every lane has now cached its table entries in registers.  This second
-    # rendezvous makes it safe for fast warps to reach the next persistent tile
-    # and overwrite sRowPtrs while slower warps are still issuing this tile's
-    # cp.async loads.
-    address_barrier.arrive_and_wait()
+    if const_expr(not single_source_fast_path) or not use_single_source:
+        # Cooperatively resolve one source-row base address per destination
+        # row. Exactly the 128 gather-A loader threads enter this function.
+        # A loader owns rows ``thread + i * 128``, so range checks and index
+        # loads happen once per row rather than once per cp.async lane for it.
+        loader_threads = const_expr(128)
+        loader_idx = thr_copy_A.thr_idx
+        rows_to_prepare = const_expr(cute.ceil_div(tile_M, loader_threads))
+        for i in cutlass.range_constexpr(rows_to_prepare):
+            row = loader_idx + i * loader_threads
+            if row < tile_M:
+                row_ptr = Int64(0)
+                prefix = Int32(0)
+                for j in cutlass.range_constexpr(num_buffers):
+                    length = route_ranges[2 * j + 1] - route_ranges[2 * j]
+                    pred = row >= prefix
+                    pred &= row < prefix + length
+                    if pred:
+                        row_idx = gAIdxs[j][route_ranges[2 * j] + row - prefix]
+                        row_ptr = mAs[j][row_idx, None].iterator.toint()
+                    prefix += length
+                sRowPtrs[row] = row_ptr
+
+        # Publish the completed table before the cp.async lanes consume it.
+        address_barrier.arrive_and_wait()
+        for m in cutlass.range_constexpr(rows_per_thread):
+            row = tAcA[0, m, 0][0]
+            row_ptrs[m] = sRowPtrs[row]
+            row_valid[m] = row_ptrs[m] != Int64(0)
+
+        # All lanes must cache their entries before a later mixed-source tile
+        # can overwrite sRowPtrs. The fast path never accesses this scratch.
+        address_barrier.arrive_and_wait()
 
     # The X buffers have identical dtype/layout/stride (validated by gemm()),
     # so a selected row address can be viewed through the first buffer's static

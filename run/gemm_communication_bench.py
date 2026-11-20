@@ -45,6 +45,9 @@ def parse_args(argv=None, *, device_capacity=10):
                         help="compare table order, then embedded indices against the same order")
     parser.add_argument("--reordered-tables", action="store_true",
                         help="compare single/multi-buffer tables in matched expert/M/N order")
+    parser.add_argument("--single-source-fast-path", action="store_true",
+                        help="experimental Hopper multi-buffer gather optimization; "
+                             "implies --reordered-tables")
     parser.add_argument("--stores", action="store_true",
                         help="bulk copy, row scatter, reduction, multi-buffer and compact output")
     parser.add_argument("--readiness", action="store_true",
@@ -79,6 +82,9 @@ def parse_args(argv=None, *, device_capacity=10):
     parser.add_argument("--repetitions", type=int, default=16)
     parser.add_argument("--warmup", type=int, default=100, help="full graph replays")
     args = parser.parse_args(argv)
+    if args.single_source_fast_path and not hopper:
+        parser.error("--single-source-fast-path requires Hopper (SM90)")
+    args.reordered_tables = args.reordered_tables or args.single_source_fast_path
     args.waves = args.waves or args.host_ready
     args.stores = args.stores or args.waves or args.weighted_contributions
     if min(args.k, args.n, args.buffers, args.experts, args.routes_per_buffer,
@@ -177,6 +183,28 @@ def make_inline_comparison_rows(single_rows, tokens, *, cluster_rows):
         for e, start, end, ng in ordered_rows
     ]
     return ordered_rows, inline_rows
+
+
+def single_source_cta_coverage(rows, *, cta_rows, cluster_m, group_size=1):
+    """Count single-source, mixed-source and empty CTA work tiles from metadata.
+
+    Each descriptor concatenates its source ranges before splitting rows across
+    CTAs. A partial CTA is eligible when its valid rows belong to one source.
+    N-group expansion repeats that eligibility for every tile in the group.
+    """
+    single, mixed, empty = 0, 0, 0
+    for row in rows:
+        lengths = [end - start for start, end in zip(row[2::2], row[3::2])]
+        for cta in range(cluster_m):
+            lo, hi = cta * cta_rows, (cta + 1) * cta_rows
+            prefix, active = 0, 0
+            for length in lengths:
+                active += max(lo, prefix) < min(hi, prefix + length)
+                prefix += length
+            single += (active == 1) * group_size
+            mixed += (active > 1) * group_size
+            empty += (active == 0) * group_size
+    return single, mixed, empty
 
 
 def benchmark(args, resources):
@@ -308,6 +336,21 @@ def benchmark(args, resources):
             control="single table reordered")
         print("Reordered controls: single/multi tables traverse expert/M/N; "
               "multi table reordered compares against single table reordered.", flush=True)
+
+    if args.single_source_fast_path:
+        add("multi single-source fast", xs, indices, table=ordered_multi_table,
+            control="multi table reordered", gather_single_source_fast_path=True)
+        single, mixed, empty = single_source_cta_coverage(
+            ordered_multi_rows, cta_rows=cta_m, cluster_m=args.cluster_m,
+            group_size=args.group_size,
+        )
+        print(f"Experimental single-source fast path: CTA work tiles from metadata "
+              f"(including N groups): {single} eligible, {mixed} mixed, {empty} empty. "
+              "Mixed/empty CTAs retain the original gather path.", flush=True)
+        print("Fast-path control: identical multi-buffer inputs, table, expert/M/N order "
+              "and launch settings; only the single-source specialization is enabled. "
+              "Readiness checks are disabled for this pair; SwiGLU variants are unchanged.",
+              flush=True)
 
     if args.inline_indices:
         _, inline_rows = make_inline_comparison_rows(
