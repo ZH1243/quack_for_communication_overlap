@@ -178,6 +178,7 @@ class GemmSm90(GemmTmaBase):
         gather_guarded_copies: bool = False,
         gather_explicit_copy: bool = False,
         gather_packed_validity: bool = False,
+        gather_early_addresses: bool = False,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -274,6 +275,9 @@ class GemmSm90(GemmTmaBase):
         if gather_packed_validity and not gather_explicit_copy:
             raise ValueError("gather_packed_validity requires gather_explicit_copy=True")
         self.gather_packed_validity = gather_packed_validity
+        if gather_early_addresses and not gather_packed_validity:
+            raise ValueError("gather_early_addresses requires gather_packed_validity=True")
+        self.gather_early_addresses = gather_early_addresses
         self.concat_layout = concat_layout or ()
         if gather_A:
             assert cluster_shape_mnk[1] == 1, "Cluster shape N must be 1 for gather A "
@@ -1999,7 +2003,7 @@ class GemmSm90(GemmTmaBase):
             multi_args = tile_sched_params.multi_buffer_gather
             mAs = (mA_mkl, *multi_args.x_buffers)
             gAIdxs = (varlen_manager.params.mAIdx, *multi_args.a_idx_buffers)
-            copy_A = copy_utils.multi_buffer_gather_m_get_copy_fn(
+            copy_A, prefetch_A = copy_utils.multi_buffer_gather_m_get_copy_fn(
                 thr_copy_A,
                 mAs,
                 sA,
@@ -2013,6 +2017,7 @@ class GemmSm90(GemmTmaBase):
                 guarded_copies=self.gather_guarded_copies,
                 explicit_copy=self.gather_explicit_copy,
                 packed_validity=self.gather_packed_validity,
+                early_addresses=self.gather_early_addresses,
             )
         elif const_expr(self.gather_table):
             copy_A = copy_utils.gather_m_get_copy_fn(

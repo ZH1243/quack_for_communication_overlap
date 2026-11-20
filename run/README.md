@@ -28,6 +28,7 @@ are views of the same physical allocation to control data-placement effects.
 | `--guard-gather-copies` | Original per-row copy guards plus hoisted addresses versus address hoisting alone; implies address hoisting and reordered tables. |
 | `--explicit-gather-copy` | Experimental explicit guarded `cp.async` versus the guarded hoisted control; implies guards, address hoisting and reordered tables. |
 | `--pack-gather-validity` | Packed per-thread row-validity mask versus the explicit-copy control; implies explicit copies, guards, address hoisting and reordered tables. |
+| `--early-gather-addresses` | Source-address preparation before pipeline acquire versus the packed-validity control; implies packed validity and its prerequisite flags. |
 | `--readiness` | Already-ready single/multi-table acquire checks versus unchecked paths, including any enabled reordered tables. |
 | `--stores` | TMA output, bulk rows, row scatter, unique/duplicate reductions, multiple destinations and compact N-tile-major output. |
 | `--waves` | Completion barrier and GPU ready-prefix publication; implies stores. |
@@ -44,7 +45,7 @@ CUDA_VISIBLE_DEVICES=0 python run/hopper_gemm_communication_bench.py \
   --routes-per-buffer 129 --tokens-per-buffer 257 \
   --tile-m 128 --tile-n 128 --cluster-m 2 --sm-count 8 \
   --packed-baseline --inline-indices --single-source-fast-path --readiness --host-ready \
-  --pack-gather-validity --weighted-contributions --swiglu \
+  --early-gather-addresses --weighted-contributions --swiglu \
   --warmup 1 --rounds 1 --repetitions 1
 ```
 
@@ -212,14 +213,26 @@ pointers and the mask across K iterations, so raw pointers need not remain live
 solely for validity checks. This is a representation experiment, not a register
 budget change; the compiler's resulting liveness and SASS must be checked on H200.
 
-Only the new variant passes `gather_packed_validity=True`, together with the
+This variant passes `gather_packed_validity=True`, together with the
 three explicit/guarded/hoisted copy flags. It uses the same inputs, table order,
 geometry, source-address formula and mixed/partial-tile checks as its control.
 Single-source specialization and readiness checks remain disabled. Existing
 variants keep their previous implementations, and no speedup is assumed.
 
+`--early-gather-addresses` adds `multi early addresses`, controlled by
+`multi packed validity`. It uses the existing `prefetch_A` hook to prepare source
+addresses before `producer_acquire`; all actual copies remain after acquire.
+This tests whether earlier address calculation can hide address latency while
+preserving the same source formula, packed validity, mixed/partial-tile checks,
+copy order, inputs, table order and launch settings. The new variant passes
+`gather_early_addresses=True` with the four packed/explicit/guarded/hoisted flags.
+Single-source specialization and readiness checks remain disabled, and register
+budgets are unchanged. The compiler may sink the calculations back or introduce
+spills as pointer lifetimes grow. Inspect SASS and resource usage to confirm the
+scheduling change before interpreting timing; no speedup is assumed.
+
 Run the numerical suite first, then compare 8 and 16 input buffers with 32768
-total routes and 32768 source tokens across all six variants in each invocation:
+total routes and 32768 source tokens across all seven variants in each invocation:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m unittest discover \
@@ -230,25 +243,51 @@ for input_buffers in 8 16; do
     --k 7168 --n 2048 --experts 8 --buffers "$input_buffers" \
     --routes-per-buffer "$((32768 / input_buffers))" \
     --tokens-per-buffer "$((32768 / input_buffers))" \
-    --tile-m 128 --tile-n 128 --cluster-m 2 --pack-gather-validity \
+    --tile-m 128 --tile-n 128 --cluster-m 2 --early-gather-addresses \
     --variants "single table reordered" "multi table reordered" \
                "multi hoisted addresses" "multi hoisted guarded" \
-               "multi explicit copy" "multi packed validity"
+               "multi explicit copy" "multi packed validity" "multi early addresses" || break
 done
 ```
 
 `--guard-gather-copies` implies `--hoist-gather-addresses` and `--reordered-tables`;
-`--explicit-gather-copy` additionally implies `--guard-gather-copies`, and
-`--pack-gather-validity` implies `--explicit-gather-copy`. These options reject
+`--explicit-gather-copy` additionally implies `--guard-gather-copies`;
+`--pack-gather-validity` implies `--explicit-gather-copy`; and
+`--early-gather-addresses` implies `--pack-gather-validity`. These options reject
 Blackwell and `--baseline-only`, and can coexist with other feature flags without
 changing their variants. Read each row's `vs control` against its named control
 within the same invocation. The loop fixes total workload size across buffer
 counts but constructs routing separately for each.
 
-For focused instruction profiling, replace the `--variants` list with
-`--profile-variant "multi packed validity"`, retaining `--pack-gather-validity`
-and the workload flags. The checked, warmed call appears in the `quack_profile`
-NVTX range; use the interleaved graph comparison above for latency measurements.
+For focused instruction profiling on H200, collect the checked, warmed call in
+the `quack_profile` NVTX range and export both details and SASS:
+
+```bash
+for input_buffers in 8 16; do
+  CUDA_VISIBLE_DEVICES=0 ncu --nvtx --nvtx-include "quack_profile/" \
+    --set full \
+    -o "run/hopper_early_b${input_buffers}" \
+    python run/hopper_gemm_communication_bench.py \
+    --k 7168 --n 2048 --experts 8 --buffers "$input_buffers" \
+    --routes-per-buffer "$((32768 / input_buffers))" \
+    --tokens-per-buffer "$((32768 / input_buffers))" \
+    --tile-m 128 --tile-n 128 --cluster-m 2 --early-gather-addresses \
+    --profile-variant "multi early addresses" || break
+
+  ncu --import "run/hopper_early_b${input_buffers}.ncu-rep" \
+    --page details --print-details all \
+    > "run/hopper_early_b${input_buffers}_details.txt"
+  ncu --import "run/hopper_early_b${input_buffers}.ncu-rep" \
+    --page source --print-source sass \
+    > "run/hopper_early_b${input_buffers}_sass.txt"
+done
+```
+
+The report exports use the [Nsight Compute CLI output pages](https://docs.nvidia.com/nsight-compute/NsightComputeCli/index.html#console-output).
+Use the interleaved graph comparison above for latency measurements. Compare the
+new SASS with the packed-validity control, checking address placement relative to
+acquire, copy order, register usage and spills; instruction counts alone do not
+establish an improvement.
 
 Measure down-like stores, completion and weighting:
 

@@ -820,6 +820,7 @@ def compile_gemm_kernel(
     gather_guarded_copies=False,
     gather_explicit_copy=False,
     gather_packed_validity=False,
+    gather_early_addresses=False,
 ):
     """Build GemmCls instance, apply SM90 partial, and cute.compile with TVM-FFI."""
     split_k_kwargs = {}
@@ -864,6 +865,10 @@ def compile_gemm_kernel(
         if not gather_explicit_copy:
             raise ValueError("gather_packed_validity requires gather_explicit_copy=True")
         split_k_kwargs["gather_packed_validity"] = True
+    if gather_early_addresses:
+        if not gather_packed_validity:
+            raise ValueError("gather_early_addresses requires gather_packed_validity=True")
+        split_k_kwargs["gather_early_addresses"] = True
     if transform_a is not None:
         assert device_capacity[0] in (9, 12), "A-operand transforms are SM90/SM120 only"
         split_k_kwargs["transform_a"] = transform_a

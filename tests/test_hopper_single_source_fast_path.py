@@ -13,9 +13,9 @@ import torch
 from run.gemm_communication_bench import single_source_cta_coverage
 
 
-def make_case(tile_m, cluster_m, device="cpu", *, num_buffers=3):
+def make_case(tile_m, cluster_m, device="cpu", *, num_buffers=3, k=80):
     """Alternate full/tail single-source tiles with mixed and empty CTA ranges."""
-    span, k, n = tile_m * cluster_m, 80, 136
+    span, n = tile_m * cluster_m, 136
     # Each expert occupies one M cluster. Nonzero source IDs deliberately
     # dominate the fast path; expert 4 crosses a source boundary in both CTAs.
     counts = [
@@ -88,11 +88,12 @@ def reference(case, *, same_dtype=False):
 class SingleSourceFixtureTests(unittest.TestCase):
     def test_fixture_values_and_cta_branch_coverage(self):
         configurations = (
-            (128, 2, 3, (16, 6, 2)), (64, 1, 3, (8, 4, 0)), (128, 2, 16, (16, 10, 2)),
+            (128, 2, 3, 80, (16, 6, 2)), (64, 1, 3, 80, (8, 4, 0)),
+            (128, 2, 16, 80, (16, 10, 2)), (128, 2, 16, 464, (16, 10, 2)),
         )
-        for tile_m, cluster_m, num_buffers, expected in configurations:
-            with self.subTest(tile_m=tile_m, cluster_m=cluster_m, num_buffers=num_buffers):
-                case = make_case(tile_m, cluster_m, num_buffers=num_buffers)
+        for tile_m, cluster_m, num_buffers, k, expected in configurations:
+            with self.subTest(tile_m=tile_m, cluster_m=cluster_m, num_buffers=num_buffers, k=k):
+                case = make_case(tile_m, cluster_m, num_buffers=num_buffers, k=k)
                 expected_values = reference(case)
                 output = torch.full_like(expected_values, float("nan"))
                 self.assertEqual(
@@ -273,7 +274,9 @@ class SingleSourceKernelTests(unittest.TestCase):
         torch.testing.assert_close(masks.cpu(), expected_masks, atol=0, rtol=0)
 
     @torch.inference_mode()
-    def check_case(self, tile_m, cluster_m, pingpong, *, num_buffers=3):
+    def check_case(
+        self, tile_m, cluster_m, pingpong, *, num_buffers=3, k=80, compare_early_only=False,
+    ):
         from quack.gemm import gemm
 
         self.addCleanup(
@@ -281,17 +284,23 @@ class SingleSourceKernelTests(unittest.TestCase):
             torch.backends.cuda.matmul.allow_tf32,
         )
         torch.backends.cuda.matmul.allow_tf32 = False
-        case = make_case(tile_m, cluster_m, "cuda", num_buffers=num_buffers)
+        case = make_case(tile_m, cluster_m, "cuda", num_buffers=num_buffers, k=k)
         table = torch.tensor(case.rows, device="cuda", dtype=torch.int32)
         # (single-source fast path, hoisted addresses, guarded copies,
-        #  explicit copy, packed validity). Test each step with both selectors.
+        #  explicit copy, packed validity, early addresses).
+        # Test each step with both source selectors.
         variants = (
-            (False, False, False, False, False), (True, False, False, False, False),
-            (False, True, False, False, False), (True, True, False, False, False),
-            (False, True, True, False, False), (True, True, True, False, False),
-            (False, True, True, True, False), (True, True, True, True, False),
-            (False, True, True, True, True), (True, True, True, True, True),
+            (False, False, False, False, False, False), (True, False, False, False, False, False),
+            (False, True, False, False, False, False), (True, True, False, False, False, False),
+            (False, True, True, False, False, False), (True, True, True, False, False, False),
+            (False, True, True, True, False, False), (True, True, True, True, False, False),
+            (False, True, True, True, True, False), (True, True, True, True, True, False),
+            (False, True, True, True, True, True), (True, True, True, True, True, True),
         )
+        if compare_early_only:
+            variants = (
+                (False, True, True, True, True, False), (False, True, True, True, True, True),
+            )
         outputs = {
             flags: torch.full(
                 (case.capacity, case.n), float("nan"), device="cuda", dtype=torch.bfloat16,
@@ -300,7 +309,7 @@ class SingleSourceKernelTests(unittest.TestCase):
         }
 
         def launch(flags):
-            fast, hoist, guard, explicit, packed = flags
+            fast, hoist, guard, explicit, packed, early = flags
             output = outputs[flags]
             output.fill_(float("nan"))
             gemm(
@@ -311,6 +320,7 @@ class SingleSourceKernelTests(unittest.TestCase):
                 gather_guarded_copies=guard,
                 gather_explicit_copy=explicit,
                 gather_packed_validity=packed,
+                gather_early_addresses=early,
                 tile_M=tile_m, tile_N=128, tile_K=64,
                 cluster_M=cluster_m, cluster_N=1, max_swizzle_size=1,
                 persistent=True, is_dynamic_persistent=False, pingpong=pingpong,
@@ -366,6 +376,10 @@ class SingleSourceKernelTests(unittest.TestCase):
 
     def test_sixteen_sources_pingpong(self):
         self.check_case(128, 2, True, num_buffers=16)
+
+    def test_early_addresses_wrap_pipeline_with_sixteen_sources(self):
+        # Eight K tiles wrap the six-stage pipeline, ending in a partial tile.
+        self.check_case(128, 2, True, num_buffers=16, k=464, compare_early_only=True)
 
 
 if __name__ == "__main__":

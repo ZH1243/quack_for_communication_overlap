@@ -2370,7 +2370,7 @@ class GemmSm100(GemmTmaBase):
         len_k = varlen_manager.len_k(tile_coord[3])
         if const_expr(self.multi_buffer_gather):
             args = params.multi_buffer_gather
-            copy_A = copy_utils.multi_buffer_gather_m_get_copy_fn(
+            copy_A, _ = copy_utils.multi_buffer_gather_m_get_copy_fn(
                 thr_copy, (mA, *args.x_buffers), sA, sRowPtrs,
                 (varlen_manager.params.mAIdx, *args.a_idx_buffers), tile_coord[4:],
                 limit_k=len_k, address_barrier=self.gather_address_barrier,

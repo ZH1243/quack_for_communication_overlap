@@ -60,6 +60,9 @@ def parse_args(argv=None, *, device_capacity=10):
     parser.add_argument("--pack-gather-validity", action="store_true",
                         help="experimental Hopper per-thread packed row-validity mask; "
                              "implies --explicit-gather-copy")
+    parser.add_argument("--early-gather-addresses", action="store_true",
+                        help="experimental Hopper source-address preparation before acquire; "
+                             "implies --pack-gather-validity")
     parser.add_argument("--stores", action="store_true",
                         help="bulk copy, row scatter, reduction, multi-buffer and compact output")
     parser.add_argument("--readiness", action="store_true",
@@ -96,6 +99,9 @@ def parse_args(argv=None, *, device_capacity=10):
     args = parser.parse_args(argv)
     if args.single_source_fast_path and not hopper:
         parser.error("--single-source-fast-path requires Hopper (SM90)")
+    if args.early_gather_addresses and not hopper:
+        parser.error("--early-gather-addresses requires Hopper (SM90)")
+    args.pack_gather_validity = args.pack_gather_validity or args.early_gather_addresses
     if args.pack_gather_validity and not hopper:
         parser.error("--pack-gather-validity requires Hopper (SM90)")
     args.explicit_gather_copy = args.explicit_gather_copy or args.pack_gather_validity
@@ -416,6 +422,18 @@ def benchmark(args, resources):
               "during CTA setup before lane offsets, then reads mask bits in K-loop guards. "
               "The goal is to retain adjusted pointers plus a mask; verify generated SASS "
               "and timing on H200. Single-source optimization and readiness are disabled.",
+              flush=True)
+
+    if args.early_gather_addresses:
+        add("multi early addresses", xs, indices, table=ordered_multi_table,
+            control="multi packed validity", gather_hoist_addresses=True,
+            gather_guarded_copies=True, gather_explicit_copy=True,
+            gather_packed_validity=True, gather_early_addresses=True)
+        print("Experimental early addresses: identical inputs, table, expert/M/N order and "
+              "launch settings as multi packed validity; prepares source addresses through "
+              "prefetch_A before producer_acquire, with all copies after acquire. "
+              "The goal is to hide address latency; inspect SASS for sinking and spills, "
+              "then measure on H200. Single-source optimization and readiness are disabled.",
               flush=True)
 
     if args.inline_indices:

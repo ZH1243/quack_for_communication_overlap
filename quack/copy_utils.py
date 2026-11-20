@@ -1622,7 +1622,8 @@ def multi_buffer_gather_m_get_copy_fn(
     guarded_copies: cutlass.Constexpr[bool] = False,
     explicit_copy: cutlass.Constexpr[bool] = False,
     packed_validity: cutlass.Constexpr[bool] = False,
-) -> Callable:
+    early_addresses: cutlass.Constexpr[bool] = False,
+) -> Tuple[Callable, Optional[Callable]]:
     """Gather one packed A tile from independent X/A_idx buffers.
 
     ``route_ranges`` contains CTA-clipped ``(start_j, end_j)`` pairs. Their
@@ -1637,12 +1638,16 @@ def multi_buffer_gather_m_get_copy_fn(
     address calculation outside row-dependent IR branches.
     Packed validity makes the copy consume a setup-time bitmask so the K loop
     needs only lane-adjusted row pointers and masks, not the raw row bases.
+    Early address preparation supplies a prefetch callback for the SM90 loader:
+    it computes source addresses before stage acquire, without issuing loads
+    or touching shared memory. The copy callback still runs after acquire.
     """
     num_buffers = const_expr(len(mAs))
     assert len(gAIdxs) == num_buffers and len(route_ranges) == 2 * num_buffers
     assert not guarded_copies or hoist_addresses
     assert not explicit_copy or guarded_copies
     assert not packed_validity or explicit_copy
+    assert not early_addresses or packed_validity
     tile_M, tile_K = cute.size(sA, mode=[0]), cute.size(sA, mode=[1])
     assert cute.size(sRowPtrs) == tile_M
     tAsA = partition_D_position_independent(thr_copy_A, sA)
@@ -1783,7 +1788,21 @@ def multi_buffer_gather_m_get_copy_fn(
             selected_mA = cute.make_tensor(row_ptr, mAs[0].layout)
             selected_mAs_k.append(cute.logical_divide(selected_mA, (None, tile_K)))
 
-    def copy_fn(src_idx, dst_idx, pred: cutlass.Constexpr[bool] = False):
+    def prepare_addresses_fn(src_idx, pred: cutlass.Constexpr[bool] = False):
+        # Only register arithmetic is allowed here: the stage can still be in
+        # use by MMA. K-tail and row predicates stay at the actual copy below.
+        prepared_row_ptrs = cute.make_rmem_tensor(rows_per_thread, Int64)
+        k_byte_offset = Int64(src_idx) * (tile_K * element_bytes)
+        for m in cutlass.range_constexpr(rows_per_thread):
+            prepared_row_ptrs[m] = row_ptrs[m] + k_byte_offset
+        return prepared_row_ptrs
+
+    def copy_fn(
+        src_idx,
+        dst_idx,
+        prepared_row_ptrs: Optional[cute.Tensor] = None,
+        pred: cutlass.Constexpr[bool] = False,
+    ):
         tApA_k = None
         if const_expr(pred):
             tApA_k = cute.make_rmem_tensor(cols_per_thread, Boolean)
@@ -1794,7 +1813,11 @@ def multi_buffer_gather_m_get_copy_fn(
             # Do not put the uniform K offset inside a row-dependent branch:
             # The profiled SM90 16-buffer specialization repeats VOTEU/USHF and
             # lane-address arithmetic before each cp.async in the hot K loop.
-            k_byte_offset = Int64(src_idx) * (tile_K * element_bytes)
+            k_byte_offset = None
+            if const_expr(early_addresses):
+                assert prepared_row_ptrs is not None
+            else:
+                k_byte_offset = Int64(src_idx) * (tile_K * element_bytes)
             copy_pred = cute.make_rmem_tensor(cols_per_thread, Boolean)
             tAsA_stage, src_bytes = None, None
             if const_expr(explicit_copy):
@@ -1804,9 +1827,14 @@ def multi_buffer_gather_m_get_copy_fn(
                 if const_expr(pred):
                     src_bytes = Int32(tApA_k[0]) * 16
             for m in cutlass.range_constexpr(rows_per_thread):
+                row_address = Int64(0)
+                if const_expr(early_addresses):
+                    row_address = prepared_row_ptrs[m]
+                else:
+                    row_address = row_ptrs[m] + k_byte_offset
                 row_ptr = cute.make_ptr(
                     mAs[0].element_type,
-                    row_ptrs[m] + k_byte_offset,
+                    row_address,
                     mAs[0].iterator.memspace,
                     assumed_align=vector_alignment,
                 )
@@ -1868,7 +1896,7 @@ def multi_buffer_gather_m_get_copy_fn(
                         pred=tApA_k,
                     )
 
-    return copy_fn
+    return copy_fn, prepare_addresses_fn if const_expr(early_addresses) else None
 
 
 @cute.jit

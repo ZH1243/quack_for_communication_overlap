@@ -219,8 +219,19 @@ explicit copies, guards, hoisting and reordered tables, while source selection
 and mixed/partial-tile checks match its control. SASS and performance still need
 to be verified on H200; this experiment makes no speedup claim.
 
+`--early-gather-addresses` adds `multi early addresses`, controlled by
+`multi packed validity`, and implies packed validity plus its prerequisite flags.
+It prepares source addresses through the existing `prefetch_A` hook before
+`producer_acquire`, while all actual copies remain after acquire. The source
+formula, row and K-tail checks, copy order, inputs, table order and launch settings
+match the control; single-source specialization and readiness remain disabled.
+The goal is to hide address latency. Register budgets remain unchanged, but the
+compiler may sink calculations back or introduce spills as pointer lifetimes
+grow. Verify the scheduling change and resources in SASS before interpreting
+timing; this experiment makes no speedup claim.
+
 Run the numerical checks, then keep total routes and tokens at 32768 while
-comparing all six variants with 8 and 16 buffers on H200:
+comparing all seven variants with 8 and 16 buffers on H200:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m unittest discover \
@@ -231,12 +242,40 @@ for input_buffers in 8 16; do
     --k 7168 --n 2048 --experts 8 --buffers "$input_buffers" \
     --routes-per-buffer "$((32768 / input_buffers))" \
     --tokens-per-buffer "$((32768 / input_buffers))" \
-    --tile-m 128 --tile-n 128 --cluster-m 2 --pack-gather-validity \
+    --tile-m 128 --tile-n 128 --cluster-m 2 --early-gather-addresses \
     --variants "single table reordered" "multi table reordered" \
                "multi hoisted addresses" "multi hoisted guarded" \
-               "multi explicit copy" "multi packed validity"
+               "multi explicit copy" "multi packed validity" "multi early addresses" || break
 done
 ```
+
+Collect and export the new variant's Nsight Compute reports with the same workloads:
+
+```bash
+for input_buffers in 8 16; do
+  CUDA_VISIBLE_DEVICES=0 ncu --nvtx --nvtx-include "quack_profile/" \
+    --set full \
+    -o "run/hopper_early_b${input_buffers}" \
+    python run/hopper_gemm_communication_bench.py \
+    --k 7168 --n 2048 --experts 8 --buffers "$input_buffers" \
+    --routes-per-buffer "$((32768 / input_buffers))" \
+    --tokens-per-buffer "$((32768 / input_buffers))" \
+    --tile-m 128 --tile-n 128 --cluster-m 2 --early-gather-addresses \
+    --profile-variant "multi early addresses" || break
+
+  ncu --import "run/hopper_early_b${input_buffers}.ncu-rep" \
+    --page details --print-details all \
+    > "run/hopper_early_b${input_buffers}_details.txt"
+  ncu --import "run/hopper_early_b${input_buffers}.ncu-rep" \
+    --page source --print-source sass \
+    > "run/hopper_early_b${input_buffers}_sass.txt"
+done
+```
+
+These [Nsight Compute CLI output pages](https://docs.nvidia.com/nsight-compute/NsightComputeCli/index.html#console-output)
+provide instruction and stall details. Use the interleaved graph benchmark for
+latency; verify address placement relative to acquire, copy order, register usage
+and spills against the packed-validity control before attributing any difference.
 
 ## Blackwell node development environment (CUDA 12.9)
 
