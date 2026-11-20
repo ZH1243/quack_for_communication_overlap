@@ -560,6 +560,16 @@ M-cluster rather than bundle ordering.
 All runners exclude kernel compilation, warmup, CUDA graph capture, and the
 correctness check from the reported kernel time.
 
+### `hopper_pooled_gather_table_gemm.py`
+
+Run `python run/hopper_pooled_gather_table_gemm.py` on Hopper to time the
+single-buffer kernel with eight logical sources in one X allocation. The
+defaults match the multi-buffer run with 2,048 tokens and 4,096 routes per
+source, 16 experts, K = 7,168, N = 2,048 and a cooperative 128×256 tile.
+It uses the same per-source sampling and tile order. Before timing, it rebases
+each source's token IDs into X and builds the four-column work table. The
+reference checks the result using the original local IDs and logical X slices.
+
 ### `hopper_stream_gather_table_gemm.py`
 
 Runs the single- or multi-buffer table kernel while `run/cpu_proxy/stream_gather_proxy`

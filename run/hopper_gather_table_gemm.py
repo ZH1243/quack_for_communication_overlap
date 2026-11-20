@@ -131,7 +131,7 @@ def make_arg_parser(
     parser.add_argument(
         "--multi-buffer-gather",
         action="store_true",
-        help="Gather directly from multiple independent X/A_idx buffers",
+        help="Use per-buffer token and route counts for multiple input sources",
     )
     parser.add_argument("--num-input-buffers", type=int, default=2)
     parser.add_argument(
@@ -620,7 +620,9 @@ def balanced_buffer_allocations(remaining: list[int], capacity: int) -> list[int
 
 
 @torch.inference_mode()
-def prepare_inputs(args: argparse.Namespace, device: torch.device) -> TableGatherInputs:
+def prepare_inputs(
+    args: argparse.Namespace, device: torch.device, *, input_pool: torch.Tensor | None = None
+) -> TableGatherInputs:
     dtype = DTYPES[args.dtype]
     gated = args.activation in GATED_ACTIVATIONS
     gemm_output_dim = args.output_dim * (2 if gated else 1)
@@ -645,10 +647,16 @@ def prepare_inputs(args: argparse.Namespace, device: torch.device) -> TableGathe
         counts_by_buffer = multi_buffer_route_counts(
             routes, args.experts, args.num_input_buffers
         )
-        X = tuple(
-            torch.randn((tokens, args.hidden), dtype=dtype, device=device)
-            for _ in range(args.num_input_buffers)
-        )
+        if input_pool is None:
+            X = tuple(
+                torch.randn((tokens, args.hidden), dtype=dtype, device=device)
+                for _ in range(args.num_input_buffers)
+            )
+        else:
+            X = input_pool.view(args.num_input_buffers, tokens, args.hidden).unbind(0)
+            # Match the separate allocations' RNG calls while writing directly into the pool.
+            for source in X:
+                torch.randn(source.shape, out=source)
         A_idx = tuple(
             covered_token_routes(
                 tokens, counts, replacement=args.routing_with_replacement, device=device
@@ -1072,19 +1080,23 @@ def check_down_correctness(
     return max_abs_error, max_allowed_error
 
 
-def main() -> None:
-    args = parse_args()
-    validate_args(args)
+def hopper_device(device_id: int) -> torch.device:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
-    torch.cuda.set_device(args.device)
-    device = torch.device("cuda", args.device)
+    torch.cuda.set_device(device_id)
+    device = torch.device("cuda", device_id)
     capability = torch.cuda.get_device_capability(device)
     if capability[0] != 9:
         raise RuntimeError(f"this runner requires Hopper SM90, got capability {capability}")
 
-    torch.manual_seed(args.seed)
-    inputs = prepare_inputs(args, device)
+    return device
+
+
+def benchmark_inputs(
+    args: argparse.Namespace, inputs: TableGatherInputs, *, reference_inputs: TableGatherInputs
+) -> None:
+    device = inputs.W.device
+    capability = torch.cuda.get_device_capability(device)
     torch.cuda.synchronize(device)
     counts = [
         [b - a for a, b in zip(offsets[:-1], offsets[1:])]
@@ -1201,7 +1213,7 @@ def main() -> None:
 
     if not args.skip_check:
         max_abs_error, max_allowed_error = check_correctness(
-            inputs, activation=args.activation, atol=args.atol, rtol=args.rtol
+            reference_inputs, activation=args.activation, atol=args.atol, rtol=args.rtol
         )
         if has_down_projection(args):
             down_error, down_allowed = check_down_correctness(
@@ -1218,6 +1230,15 @@ def main() -> None:
                 f"(max absolute error {max_abs_error:.6g}, "
                 f"permitted bound {max_allowed_error:.6g})"
             )
+
+
+def main() -> None:
+    args = parse_args()
+    validate_args(args)
+    device = hopper_device(args.device)
+    torch.manual_seed(args.seed)
+    inputs = prepare_inputs(args, device)
+    benchmark_inputs(args, inputs, reference_inputs=inputs)
 
 
 if __name__ == "__main__":
