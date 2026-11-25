@@ -80,9 +80,11 @@ from quack.gemm_interface import act_to_pytorch_fn_map, gated_to_pytorch_fn_map
 if __package__:
     from . import hopper_pregather_gemm as pregather
     from .token_routing import covered_token_routes
+    from .wave_ready import build_expert_wave_schedule
 else:
     import hopper_pregather_gemm as pregather
     from token_routing import covered_token_routes
+    from wave_ready import build_expert_wave_schedule
 
 
 DTYPES = {
@@ -383,6 +385,13 @@ def build_work_table(
     from quack.gemm_config import cta_tile_shape_m
 
     cluster_rows = cta_tile_shape_m(tile_m, cluster_m, device_capacity) * cluster_m
+    if wave_work_ids is not None:
+        table, _ = build_expert_wave_schedule(
+            counts, cluster_rows=cluster_rows, num_groups=clusters_n // x,
+            group_size=x, wave_work_ids=wave_work_ids, with_ready_prefix=False,
+        )
+        return table.to(device), (tuple(route_offsets),), x
+
     rows: list[tuple[int, int, int, int]] = []
 
     for expert, count in enumerate(counts):
@@ -398,28 +407,7 @@ def build_work_table(
                 end = min(start + cluster_rows, expert_end)
                 rows.append((expert, start, end, cid_n_base))
 
-    if wave_work_ids is not None:
-        # The default rows are already each expert's complete serpentine stream.
-        # A cursor also records groups consumed early to fill a previous wave.
-        expert_rows = [[] for _ in counts]
-        for row in rows:
-            expert_rows[row[0]].append(row)
-        cursors = [0] * len(counts)
-        rows_per_wave = wave_work_ids // x
-        rows = []
-        for group in range(clusters_n // x):
-            experts = range(len(counts))
-            if group % 2:
-                experts = reversed(experts)
-            for expert in experts:
-                stream = expert_rows[expert]
-                group_end = (group + 1) * math.ceil(counts[expert] / cluster_rows)
-                while cursors[expert] < group_end:
-                    room = rows_per_wave - len(rows) % rows_per_wave
-                    end = min(cursors[expert] + room, len(stream))
-                    rows.extend(stream[cursors[expert] : end])
-                    cursors[expert] = end
-    elif n_group_major:
+    if n_group_major:
         # Global route offsets order both experts and their M clusters. Reverse
         # that complete traversal on odd N groups, keeping each descriptor intact.
         rows.sort(key=lambda row: (row[3], -row[1] if (row[3] // x) % 2 else row[1]))

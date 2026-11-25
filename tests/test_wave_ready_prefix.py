@@ -3,7 +3,58 @@
 import pytest
 import torch
 
-from run.wave_ready import build_wave_ready_prefix
+from run.wave_ready import build_expert_wave_schedule, build_wave_ready_prefix
+
+
+@pytest.mark.parametrize("group_size", [1, 2, 4])
+@pytest.mark.parametrize(
+    "rows_per_wave,order,prefix",
+    [
+        # A fresh wave per descriptor follows the alternating group traversal.
+        (1, [(0, 0), (1, 0), (2, 0), (2, 1), (1, 1), (0, 1), (0, 2), (1, 2), (2, 2)],
+         [0, 0, 1, 1, 1, 2, 2, 2, 3]),
+        # Expert 0 borrows two rows from group 1. The last wave has only one row.
+        (4, [(0, 0), (1, 0), (1, 1), (0, 1), (2, 0), (2, 1), (2, 2), (0, 2), (1, 2)],
+         [0, 2, 3]),
+        # The whole schedule fits in one wave, so each expert exhausts its stream.
+        (12, [(0, 0), (1, 0), (1, 1), (0, 1), (0, 2), (1, 2), (2, 0), (2, 1), (2, 2)],
+         [3]),
+    ],
+)
+def test_expert_wave_schedule_exact_rows_and_prefix(group_size, rows_per_wave, order, prefix):
+    # Expert 1 is empty, and expert 0 has both a full cluster and a tail.
+    blocks = [(0, 0, 3), (0, 3, 5), (2, 5, 7)]
+    expected = torch.tensor(
+        [(*blocks[block], group * group_size) for block, group in order], dtype=torch.int32
+    )
+    geometry = dict(cluster_rows=3, num_groups=3, group_size=group_size,
+                    wave_work_ids=rows_per_wave * group_size)
+    table, ready = build_expert_wave_schedule([5, 0, 2], **geometry)
+    torch.testing.assert_close(table, expected)
+    assert table.is_contiguous()
+    assert ready == prefix
+    table, ready = build_expert_wave_schedule([5, 0, 2], **geometry, with_ready_prefix=False)
+    torch.testing.assert_close(table, expected)
+    assert ready is None
+
+
+def test_expert_wave_schedule_empty_experts():
+    geometry = dict(cluster_rows=192, num_groups=28, group_size=2, wave_work_ids=124)
+    with pytest.raises(ValueError):
+        build_expert_wave_schedule([0, 0], **geometry)
+    table, ready = build_expert_wave_schedule([0, 0], **geometry, with_ready_prefix=False)
+    torch.testing.assert_close(table, torch.empty(0, dtype=torch.int32))
+    assert ready is None
+
+
+def test_expert_wave_schedule_int32_route_boundary():
+    limit = 2**31 - 1
+    geometry = dict(cluster_rows=limit, num_groups=1, group_size=1, wave_work_ids=2)
+    table, ready = build_expert_wave_schedule([1, limit - 1], **geometry)
+    assert table.tolist() == [[0, 0, 1, 0], [1, 1, limit, 0]]
+    assert ready == [1]
+    with pytest.raises(RuntimeError, match="int32"):
+        build_expert_wave_schedule([1, limit], **geometry)
 
 
 @pytest.mark.parametrize("x", [1, 2])

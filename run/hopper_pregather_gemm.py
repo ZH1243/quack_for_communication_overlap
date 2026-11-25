@@ -733,33 +733,17 @@ def prepare_grouped_inputs(
     wave_store_workspace = None
     identity_A_idx = None
     if args.gather_table:
-        # Support both direct script execution and python -m run.hopper_pregather_gemm.
-        if __package__:
-            from .hopper_gather_table_gemm import build_work_table
-        else:
-            from hopper_gather_table_gemm import build_work_table
-
-        gather_work_table, _, _ = build_work_table(
-            counts,
-            output_dim=gemm_output_dim,
-            tile_m=args.tile_m,
-            tile_n=args.tile_n,
-            cluster_m=args.cluster_m,
-            max_swizzle_size=args.max_swizzle_size,
-            device=torch.device("cpu") if getattr(args, "gather_table_publish_ready", False) else device,
-            n_group_major=args.gather_table_n_group_major,
-            wave_work_ids=wave_work_ids,
-            device_capacity=capacity,
-        )
         if getattr(args, "gather_table_publish_ready", False):
             if __package__:
-                from .wave_ready import build_wave_ready_prefix
+                from .wave_ready import build_expert_wave_schedule
             else:
-                from wave_ready import build_wave_ready_prefix
+                from wave_ready import build_expert_wave_schedule
 
-            prefixes = build_wave_ready_prefix(
-                gather_work_table.tolist(), group_size=x,
-                num_groups=clusters_n // x, wave_work_ids=wave_work_ids,
+            if wave_work_ids is None or clusters_n % x:
+                raise ValueError("ready publication requires expert waves with whole column groups")
+            gather_work_table, prefixes = build_expert_wave_schedule(
+                counts, cluster_rows=cta_m * args.cluster_m, num_groups=clusters_n // x,
+                group_size=x, wave_work_ids=wave_work_ids,
             )
             wave_ready_prefix = torch.tensor(prefixes, dtype=torch.int32, device=device)
             # Reset together with the barrier counter; no second reset launch.
@@ -768,6 +752,18 @@ def prepare_grouped_inputs(
             with torch.inference_mode(False):
                 wave_store_workspace = torch.zeros((2,), dtype=torch.int32, device=device)
             gather_work_table = gather_work_table.to(device)
+        else:
+            if __package__:
+                from .hopper_gather_table_gemm import build_work_table
+            else:
+                from hopper_gather_table_gemm import build_work_table
+
+            gather_work_table, _, _ = build_work_table(
+                counts, output_dim=gemm_output_dim, tile_m=args.tile_m, tile_n=args.tile_n,
+                cluster_m=args.cluster_m, max_swizzle_size=args.max_swizzle_size, device=device,
+                n_group_major=args.gather_table_n_group_major, wave_work_ids=wave_work_ids,
+                device_capacity=capacity,
+            )
         # Preserve the original routing indices separately from the kernel indices.
         identity_A_idx = torch.arange(args.routes, dtype=torch.int32, device=A.device)
     if output_buffers is not None:
