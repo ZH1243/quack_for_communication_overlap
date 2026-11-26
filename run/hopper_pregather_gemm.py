@@ -680,9 +680,15 @@ def prepare_grouped_inputs(
     *,
     output_buffers: tuple[torch.Tensor, ...] | None = None,
     scatter_mapping: torch.Tensor | None = None,
+    scatter_row_addresses: torch.Tensor | None = None,
     route_weights: torch.Tensor | None = None,
 ) -> PregatherInputs:
-    """Prepare output and scheduling metadata around an existing expert-major input."""
+    """Prepare output and scheduling metadata around an existing expert-major input.
+
+    A producer may supply its final scatter address tensor for external output buffers.
+    It owns the address contents, including bounds, and must publish them before launch.
+    Preparation only inspects the tensor layout.
+    """
     if len(counts) != args.experts or sum(counts) != A.shape[0] or any(c < 0 for c in counts):
         raise ValueError("expert counts must partition the input rows")
     if A.shape != (args.routes, args.hidden) or W_up.shape != (
@@ -697,6 +703,23 @@ def prepare_grouped_inputs(
                 or route_weights.device != A.device or not route_weights.is_contiguous()):
             raise ValueError("route_weights must be contiguous FP32[routes] on the input device")
     device, dtype = A.device, A.dtype
+    if scatter_row_addresses is not None:
+        if output_buffers is None or scatter_mapping is not None or args.activation is not None:
+            raise ValueError(
+                "external scatter addresses require plain GEMM, output_buffers and no scatter_mapping"
+            )
+        expected_shape = (args.routes, 2) if args.n_tile_major_output else (args.routes,)
+        if (
+            scatter_row_addresses.shape != expected_shape
+            or scatter_row_addresses.dtype != torch.int64
+            or not scatter_row_addresses.is_cuda
+            or scatter_row_addresses.device != device
+            or not scatter_row_addresses.is_contiguous()
+        ):
+            raise ValueError(
+                f"external scatter addresses must be contiguous int64 of shape {expected_shape} "
+                "on the input CUDA device"
+            )
     capacity = device_capacity_for_args(args, device)
     if get_device_capacity(device)[0] != capacity:
         raise ValueError("configured device_capacity does not match the input GPU")
@@ -767,8 +790,9 @@ def prepare_grouped_inputs(
         # Preserve the original routing indices separately from the kernel indices.
         identity_A_idx = torch.arange(args.routes, dtype=torch.int32, device=A.device)
     if output_buffers is not None:
-        if not args.multi_buffer_scatter or scatter_mapping is None or args.down_projection:
-            raise ValueError("external outputs require mapped multi-buffer plain GEMM")
+        if (not args.multi_buffer_scatter or args.down_projection
+                or (scatter_mapping is None and scatter_row_addresses is None)):
+            raise ValueError("external outputs require multi-buffer plain GEMM with scatter destinations")
         sizes = [
             b.shape[1] // args.tile_n if args.n_tile_major_output else b.shape[0]
             for b in output_buffers
@@ -814,8 +838,7 @@ def prepare_grouped_inputs(
             if args.scatter_table_with_replacement
             else torch.randperm(args.routes, dtype=torch.int32, device=device)
         )
-    scatter_row_addresses = None
-    if args.multi_buffer_scatter:
+    if args.multi_buffer_scatter and scatter_row_addresses is None:
         offsets = torch.tensor([0, *sizes], device=device, dtype=torch.int64).cumsum(0)
         if scatter_mapping is None:
             destinations = scatter_table.long()

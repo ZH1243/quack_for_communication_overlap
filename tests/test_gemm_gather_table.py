@@ -2,6 +2,7 @@
 
 import math
 import time
+from dataclasses import replace
 
 import pytest
 import torch
@@ -714,8 +715,11 @@ def test_down_combine_in_place_original_tokens(tiled):
 
 
 @torch.inference_mode()
-@pytest.mark.parametrize("cluster_m,single_wave", [(1, True), (1, False), (2, False)])
-def test_wave_ready_publication_tail_and_replay(monkeypatch, cluster_m, single_wave):
+@pytest.mark.parametrize(
+    "cluster_m,single_wave,external_addresses",
+    [(1, True, False), (1, False, False), (2, False, False), (1, True, True)],
+)
+def test_wave_ready_publication_tail_and_replay(monkeypatch, cluster_m, single_wave, external_addresses):
     """Numerical scatter reduction plus final publication/reset on partial waves."""
     from quack.cute_dsl_utils import get_max_active_clusters
     from run import hopper_pregather_gemm as runner
@@ -742,6 +746,24 @@ def test_wave_ready_publication_tail_and_replay(monkeypatch, cluster_m, single_w
     a = torch.randn(sum(counts), args.hidden, dtype=torch.bfloat16, device="cuda")
     weights = torch.randn(2, args.hidden, args.output_dim, dtype=a.dtype, device=a.device) / 8
     inputs = runner.prepare_grouped_inputs(args, a, weights, counts)
+    reference_inputs = inputs
+    if external_addresses:
+        initial = inputs
+        addresses = torch.empty_like(initial.scatter_row_addresses)
+
+        def unexpected_build(*args, **kwargs):
+            pytest.fail("prepare_grouped_inputs rebuilt externally published scatter addresses")
+
+        monkeypatch.setattr(runner, "build_scatter_row_addresses", unexpected_build)
+        inputs = runner.prepare_grouped_inputs(
+            args, a, weights, counts, output_buffers=initial.output_buffers(),
+            scatter_row_addresses=addresses,
+        )
+        assert inputs.scatter_row_addresses is addresses
+        assert inputs.scatter_mapping is None and inputs.scatter_table is None
+        # Publish after preparation. The independent logical row indices are for the reference.
+        addresses.copy_(initial.scatter_row_addresses)
+        reference_inputs = replace(inputs, scatter_table=initial.scatter_table)
     launch = runner.make_launch(args, inputs)
     num_work = inputs.gather_work_table.shape[0]  # x=1
     if single_wave:
@@ -755,7 +777,7 @@ def test_wave_ready_publication_tail_and_replay(monkeypatch, cluster_m, single_w
 
     def verify():
         torch.cuda.synchronize()
-        runner.check_correctness(inputs, activation=None, atol=args.atol, rtol=args.rtol)
+        runner.check_correctness(reference_inputs, activation=None, atol=args.atol, rtol=args.rtol)
         assert inputs.ready_groups.item() == 3
         assert inputs.wave_store_workspace[0].item() == num_work * cluster_m
 

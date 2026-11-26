@@ -431,6 +431,14 @@ Weights are applied once; ready-gated consumers continue adding partial results.
 Omitting the tensor retains the existing unweighted specialization. Keep the
 tensor alive and update packed values when the upstream row order changes.
 
+With external output buffers, a producer can pass `scatter_row_addresses=` to
+`prepare_grouped_inputs` in place of `scatter_mapping=`. Use contiguous CUDA
+int64 storage on the input device, shaped `[routes, 2]` for N-tile-major output
+(address and tile stride in bytes) or `[routes]` for row-major output. The
+producer must validate the destinations, retain the output buffers and order
+its address upload before GEMM reads the table. This path leaves the logical
+reference mapping with the producer.
+
 The proxy integration test includes distinct weights, all-zero completion and
 all-one equivalence to the unweighted reference with repeated launches and
 per-call bulk store settings. On each Hopper and Blackwell machine also run the
