@@ -682,12 +682,14 @@ def prepare_grouped_inputs(
     scatter_mapping: torch.Tensor | None = None,
     scatter_row_addresses: torch.Tensor | None = None,
     route_weights: torch.Tensor | None = None,
+    external_wave_schedule: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> PregatherInputs:
     """Prepare output and scheduling metadata around an existing expert-major input.
 
     A producer may supply its final scatter address tensor for external output buffers.
     It owns the address contents, including bounds, and must publish them before launch.
-    Preparation only inspects the tensor layout.
+    External expert-wave table and prefix views have the same ownership and
+    publication contract. Preparation only inspects their layout.
     """
     if len(counts) != args.experts or sum(counts) != A.shape[0] or any(c < 0 for c in counts):
         raise ValueError("expert counts must partition the input rows")
@@ -702,6 +704,9 @@ def prepare_grouped_inputs(
         if (route_weights.shape != (args.routes,) or route_weights.dtype != torch.float32
                 or route_weights.device != A.device or not route_weights.is_contiguous()):
             raise ValueError("route_weights must be contiguous FP32[routes] on the input device")
+    if external_wave_schedule is not None and not (args.gather_table and
+            args.gather_table_expert_waves and getattr(args, "gather_table_publish_ready", False)):
+        raise ValueError("external_wave_schedule requires expert-wave gather-table ready publication")
     device, dtype = A.device, A.dtype
     if scatter_row_addresses is not None:
         if output_buffers is None or scatter_mapping is not None or args.activation is not None:
@@ -757,24 +762,34 @@ def prepare_grouped_inputs(
     identity_A_idx = None
     if args.gather_table:
         if getattr(args, "gather_table_publish_ready", False):
-            if __package__:
-                from .wave_ready import build_expert_wave_schedule
-            else:
-                from wave_ready import build_expert_wave_schedule
-
             if wave_work_ids is None or clusters_n % x:
                 raise ValueError("ready publication requires expert waves with whole column groups")
-            gather_work_table, prefixes = build_expert_wave_schedule(
-                counts, cluster_rows=cta_m * args.cluster_m, num_groups=clusters_n // x,
-                group_size=x, wave_work_ids=wave_work_ids,
-            )
-            wave_ready_prefix = torch.tensor(prefixes, dtype=torch.int32, device=device)
+            if external_wave_schedule is None:
+                if __package__:
+                    from .wave_ready import build_expert_wave_schedule
+                else:
+                    from wave_ready import build_expert_wave_schedule
+
+                gather_work_table, prefixes = build_expert_wave_schedule(
+                    counts, cluster_rows=cta_m * args.cluster_m, num_groups=clusters_n // x,
+                    group_size=x, wave_work_ids=wave_work_ids,
+                )
+                wave_ready_prefix = torch.tensor(prefixes, dtype=torch.int32, device=device)
+                gather_work_table = gather_work_table.to(device)
+            else:
+                gather_work_table, wave_ready_prefix = external_wave_schedule
+                for tensor, shape in (
+                    (gather_work_table, (num_work // x, 4)),
+                    (wave_ready_prefix, (math.ceil(num_work / wave_work_ids),)),
+                ):
+                    if (tensor.shape != shape or tensor.dtype != torch.int32
+                            or tensor.device != device or not tensor.is_contiguous()):
+                        raise ValueError(f"external wave schedule requires contiguous int32{shape} on {device}")
             # Reset together with the barrier counter; no second reset launch.
             # This is mutable launch state even when input preparation runs in
             # inference mode; normal callers may reset it outside inference mode.
             with torch.inference_mode(False):
                 wave_store_workspace = torch.zeros((2,), dtype=torch.int32, device=device)
-            gather_work_table = gather_work_table.to(device)
         else:
             if __package__:
                 from .hopper_gather_table_gemm import build_work_table

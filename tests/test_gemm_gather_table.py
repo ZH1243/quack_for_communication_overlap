@@ -751,18 +751,28 @@ def test_wave_ready_publication_tail_and_replay(monkeypatch, cluster_m, single_w
         initial = inputs
         addresses = torch.empty_like(initial.scatter_row_addresses)
 
+        slab = torch.empty(initial.gather_work_table.numel() + initial.wave_ready_prefix.numel(),
+                           dtype=torch.int32, device=a.device)
+        table = slab[:initial.gather_work_table.numel()].view_as(initial.gather_work_table)
+        prefix = slab[table.numel():]
+
         def unexpected_build(*args, **kwargs):
-            pytest.fail("prepare_grouped_inputs rebuilt externally published scatter addresses")
+            pytest.fail("prepare_grouped_inputs rebuilt externally published metadata")
 
         monkeypatch.setattr(runner, "build_scatter_row_addresses", unexpected_build)
+        from run import wave_ready
+        monkeypatch.setattr(wave_ready, "build_expert_wave_schedule", unexpected_build)
         inputs = runner.prepare_grouped_inputs(
             args, a, weights, counts, output_buffers=initial.output_buffers(),
-            scatter_row_addresses=addresses,
+            scatter_row_addresses=addresses, external_wave_schedule=(table, prefix),
         )
+        assert inputs.gather_work_table is table and inputs.wave_ready_prefix is prefix
         assert inputs.scatter_row_addresses is addresses
         assert inputs.scatter_mapping is None and inputs.scatter_table is None
         # Publish after preparation. The independent logical row indices are for the reference.
         addresses.copy_(initial.scatter_row_addresses)
+        table.copy_(initial.gather_work_table)
+        prefix.copy_(initial.wave_ready_prefix)
         reference_inputs = replace(inputs, scatter_table=initial.scatter_table)
     launch = runner.make_launch(args, inputs)
     num_work = inputs.gather_work_table.shape[0]  # x=1
