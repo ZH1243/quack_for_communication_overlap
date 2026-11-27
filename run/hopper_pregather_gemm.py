@@ -686,6 +686,8 @@ def prepare_grouped_inputs(
 ) -> PregatherInputs:
     """Prepare output and scheduling metadata around an existing expert-major input.
 
+    For prepacked inputs, A_idx and the optional gather-table identity_A_idx share
+    the same read-only row indices.
     A producer may supply its final scatter address tensor for external output buffers.
     It owns the address contents, including bounds, and must publish them before launch.
     External expert-wave table and prefix views have the same ownership and
@@ -759,7 +761,6 @@ def prepare_grouped_inputs(
     gather_work_table = None
     wave_ready_prefix = None
     wave_store_workspace = None
-    identity_A_idx = None
     if args.gather_table:
         if getattr(args, "gather_table_publish_ready", False):
             if wave_work_ids is None or clusters_n % x:
@@ -802,8 +803,6 @@ def prepare_grouped_inputs(
                 n_group_major=args.gather_table_n_group_major, wave_work_ids=wave_work_ids,
                 device_capacity=capacity,
             )
-        # Preserve the original routing indices separately from the kernel indices.
-        identity_A_idx = torch.arange(args.routes, dtype=torch.int32, device=A.device)
     if output_buffers is not None:
         if (not args.multi_buffer_scatter or args.down_projection
                 or (scatter_mapping is None and scatter_row_addresses is None)):
@@ -869,6 +868,7 @@ def prepare_grouped_inputs(
             tile_n=args.tile_n if args.n_tile_major_output else None,
             used_rows=sizes if args.n_tile_major_output else None,
         )
+    row_indices = torch.arange(args.routes, dtype=torch.int32, device=device)
     return PregatherInputs(
         n_tile_major_tile_n=args.tile_n if args.n_tile_major_output else None,
         scatter_output_rows=tuple(sizes) if args.multi_buffer_scatter else None,
@@ -879,13 +879,13 @@ def prepare_grouped_inputs(
         X=A,
         W_up=W_up,
         W_down=W_down,
-        A_idx=torch.arange(args.routes, dtype=torch.int32, device=device),
+        A_idx=row_indices,
         cu_seqlens_m=cu_seqlens_m,
         A=A,
         up_output=up_output,
         output=output,
         gather_work_table=gather_work_table,
-        identity_A_idx=identity_A_idx,
+        identity_A_idx=row_indices if args.gather_table else None,
         wave_work_ids=wave_work_ids,
         wave_ready_prefix=wave_ready_prefix,
         wave_store_workspace=wave_store_workspace,

@@ -774,6 +774,7 @@ def test_wave_ready_publication_tail_and_replay(monkeypatch, cluster_m, single_w
         table.copy_(initial.gather_work_table)
         prefix.copy_(initial.wave_ready_prefix)
         reference_inputs = replace(inputs, scatter_table=initial.scatter_table)
+    assert inputs.A_idx is inputs.identity_A_idx
     launch = runner.make_launch(args, inputs)
     num_work = inputs.gather_work_table.shape[0]  # x=1
     if single_wave:
