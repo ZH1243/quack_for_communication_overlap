@@ -158,7 +158,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import sys
-from typing import NamedTuple, Optional
+from typing import Callable, NamedTuple, Optional
 
 
 import cutlass.cute as cute
@@ -625,6 +625,7 @@ class EpiMod:
         #                        calls when the kernel leaves them reusable (serial
         #                        split-k self-resets); None = fresh per call
         _launch=True,  # False: resolve/compile only (EpiMod.plan) — no kernel launch
+        plan_observer: Optional[Callable[[str], None]] = None,
     ) -> GemmEpiPlan:
         if sm_count is not None and not persistent:
             raise ValueError("sm_count requires persistent=True")
@@ -718,6 +719,8 @@ class EpiMod:
         # previously validated call (the key subsumes everything validation
         # reads), so only the per-call views and the launch remain. The key
         # matches the cold path's record below.
+        if plan_observer is not None:
+            plan_observer("key_start")
         key = _mod_gemm_key(
             A,
             B,
@@ -778,6 +781,8 @@ class EpiMod:
             ),
         )
         plan = self._plan_cache.get(key)
+        if plan_observer is not None:
+            plan_observer("cache_hit" if plan is not None else "cache_miss")
         if plan is not None:
             if _launch:
                 run_gemm_epi_plan(
@@ -1265,6 +1270,8 @@ class EpiMod:
             split_k_mode=split_k_mode,
         )
         self._plan_cache[key] = plan
+        if plan_observer is not None:
+            plan_observer("plan_built")
         if _launch:
             run_gemm_epi_plan(
                 plan,

@@ -1,7 +1,7 @@
 # Copyright (c) 2025-2026, QuACK team.
 # GEMM compilation via TVM-FFI with fake tensors and NamedTuple args.
 
-from typing import NamedTuple, Optional
+from typing import Callable, NamedTuple, Optional
 
 import torch
 from torch import Tensor
@@ -710,6 +710,8 @@ def gemm(
     gather_packed_validity: bool = False,
     # Prepare copy addresses before the pipeline wait; requires gather_packed_validity=True.
     gather_early_addresses: bool = False,
+    # Host plan-cache events: key_start, cache_hit or cache_miss, then plan_built on a miss.
+    plan_observer: Optional[Callable[[str], None]] = None,
 ) -> _GemmPlan:
     if sm_count is not None and not persistent:
         raise ValueError("sm_count requires persistent=True")
@@ -827,6 +829,8 @@ def gemm(
         # for every frontend via plan_scheduler_args; checked here too so a
         # bad-geometry cold call fails before the (expensive) compile.
         validate_ag_geometry(A, ag_args, tile_M, cluster_M)
+    if plan_observer is not None:
+        plan_observer("key_start")
     key = (
         tensor_key(A),
         tensor_key(B),
@@ -895,6 +899,8 @@ def gemm(
         scalar_mode(sfd_norm_const) if sfd_norm_const is not None else 0,
     )
     plan = _gemm_plan_cache.get(key)
+    if plan_observer is not None:
+        plan_observer("cache_hit" if plan is not None else "cache_miss")
     if plan is None:
         plan = _build_gemm_plan(
             A,
@@ -961,6 +967,8 @@ def gemm(
             gather_early_addresses=gather_early_addresses,
         )
         _gemm_plan_cache[key] = plan
+        if plan_observer is not None:
+            plan_observer("plan_built")
     run_gemm_plan(
         plan,
         A,

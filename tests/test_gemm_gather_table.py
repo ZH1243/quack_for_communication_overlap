@@ -3,6 +3,7 @@
 import math
 import time
 from dataclasses import replace
+from importlib import import_module
 
 import pytest
 import torch
@@ -18,6 +19,62 @@ pytestmark = pytest.mark.skipif(
     or get_device_capacity(torch.device("cuda"))[0] != 9,
     reason="gather_work_table is SM90 only",
 )
+
+
+@torch.inference_mode()
+@pytest.mark.parametrize("fused", [False, True], ids=["plain", "swiglu"])
+def test_gather_table_plan_observer(fused, monkeypatch):
+    from quack.epilogue.library import linear_act_mod
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    xs = tuple(torch.randn(16, 64, dtype=torch.bfloat16, device=device) for _ in range(2))
+    w = torch.randn(1, 256 if fused else 128, 64, dtype=torch.bfloat16, device=device) / 8
+    ids = torch.arange(8, dtype=torch.int32, device=device)
+    ready = torch.ones(1, dtype=torch.int32, device=device)
+    if fused:
+        mod = linear_act_mod(
+            "swiglu", gated=True, has_c=False, has_rowvec=False, has_colvec=False,
+            sr=False, has_alpha=False,
+        )
+        monkeypatch.setattr(mod, "_plan_cache", {})
+        config = GemmConfig(
+            tile_m=64, tile_n=128, pingpong=True, cluster_m=2, cluster_n=1,
+            cluster_k=1, max_swizzle_size=2, device_capacity=9, use_tma_gather=False,
+        )
+        module, runner = import_module("quack.epilogue.frontend"), "run_gemm_epi_plan"
+    else:
+        module, runner = import_module("quack.gemm"), "run_gemm_plan"
+        monkeypatch.setattr(module, "_gemm_plan_cache", {})
+
+    run_plan = getattr(module, runner)
+    events = []
+
+    def record_dispatch(*args, **kwargs):
+        events.append("dispatch")
+        return run_plan(*args, **kwargs)
+
+    monkeypatch.setattr(module, runner, record_dispatch)
+    for rows, hit in ((3, False), (5, False), (3, True)):
+        events.clear()
+        table = torch.tensor([[0, 0, 0, rows, 0, rows]], dtype=torch.int32, device=device)
+        out = torch.empty(2 * rows, 128, dtype=torch.bfloat16, device=device)
+        gather = dict(A_idx=(ids[:rows], ids[:rows]), gather_work_table=table,
+                      gather_work_table_ready=ready, multi_buffer_gather=True,
+                      plan_observer=events.append)
+        reference = torch.cat([x[:rows] for x in xs]).float() @ w[0].float().mT
+        if fused:
+            gemm_act(xs, w.mT, activation="swiglu", postact_out=out, store_preact=False,
+                     config=config, tuned=False, concat_layout=("B",), **gather)
+            reference = gated_to_pytorch_fn_map["swiglu"](*reference.chunk(2, dim=-1))
+        else:
+            quack_gemm(xs, w, out, C=None, tile_count_semaphore=None, tile_M=64, tile_N=128,
+                       cluster_M=2, cluster_N=1, cluster_K=1, persistent=True, pingpong=True,
+                       is_dynamic_persistent=False, max_swizzle_size=2, use_tma_gather=False,
+                       **gather)
+        expected = ["key_start", "cache_hit"] if hit else ["key_start", "cache_miss", "plan_built"]
+        assert events == [*expected, "dispatch"]
+        torch.testing.assert_close(out.float(), reference, atol=6e-2, rtol=2e-3)
 
 
 @torch.inference_mode()

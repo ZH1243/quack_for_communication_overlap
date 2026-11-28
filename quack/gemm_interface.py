@@ -1,6 +1,6 @@
 # Copyright (c) 2025, Tri Dao
 from dataclasses import replace
-from typing import NamedTuple, Optional, Tuple, Literal
+from typing import Callable, NamedTuple, Optional, Tuple, Literal
 from functools import partial
 
 import torch
@@ -829,6 +829,7 @@ def _gemm_act_call(
     tuned: bool,
     config: Optional[GemmConfig] = None,
     sm_count: Optional[int] = None,
+    plan_observer: Optional[Callable[[str], None]] = None,
 ) -> None:
     from quack.epilogue.library import linear_act_mod
 
@@ -884,6 +885,7 @@ def _gemm_act_call(
             multi_buffer_gather=multi_buffer_gather_args,
             use_tma_gather=config.use_tma_gather,
             concat_layout=concat_layout,
+            plan_observer=plan_observer,
         )
         return
     mod(
@@ -2181,6 +2183,7 @@ def gemm_act(
     split_k: Optional[int] = 1,
     split_k_mode: int = SplitKMode.SERIAL,
     sm_count: Optional[int] = None,
+    plan_observer: Optional[Callable[[str], None]] = None,
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM with activation (or gated activation) and optional output tensors.
 
@@ -2193,6 +2196,8 @@ def gemm_act(
     ``None`` preserves the hardware-derived default.
 
     On SM90/SM100, ``gather_work_table`` selects the table-scheduled gather-A path.
+    For an eager gather-table call, ``plan_observer`` receives ``key_start``,
+    ``cache_hit`` or ``cache_miss``, and ``plan_built`` after a miss, before launch.
     Pass tensor sequences for ``A`` and ``A_idx`` together with
     ``multi_buffer_gather=True`` to gather from multiple independent buffers.
     Single-buffer tables of width ``4 + cta_tile_m * cluster_m`` instead contain
@@ -2230,6 +2235,8 @@ def gemm_act(
     out_dtype = default_dtype if out_dtype is None else out_dtype
     postact_dtype = default_dtype if postact_dtype is None else postact_dtype
     gather_table = gather_work_table is not None
+    if plan_observer is not None and not gather_table:
+        raise ValueError("gemm_act plan_observer requires gather_work_table")
     if multi_buffer_gather_args is not None and not gather_table:
         raise ValueError("multi_buffer_gather requires gather_work_table")
     varlen_m = cu_seqlens_m is not None or gather_table
@@ -2316,6 +2323,7 @@ def gemm_act(
         tuned=tuned,
         config=config,
         sm_count=sm_count,
+        plan_observer=plan_observer,
     )
     return preact_out, postact_out
 
