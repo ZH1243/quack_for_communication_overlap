@@ -830,7 +830,7 @@ def _gemm_act_call(
     config: Optional[GemmConfig] = None,
     sm_count: Optional[int] = None,
     plan_observer: Optional[Callable[[str], None]] = None,
-) -> None:
+):
     from quack.epilogue.library import linear_act_mod
 
     if concat_layout:
@@ -863,7 +863,8 @@ def _gemm_act_call(
             config = default_config(A.device)
         if dynamic_scheduler or config.is_dynamic_persistent:
             raise ValueError("gather_work_table requires static persistent scheduling")
-        mod.gemm(
+        # Return the validated plan after dispatch so a bound gather can reuse it.
+        return mod.gemm(
             A,
             B.mT,
             preact_out,
@@ -887,7 +888,6 @@ def _gemm_act_call(
             concat_layout=concat_layout,
             plan_observer=plan_observer,
         )
-        return
     mod(
         A,
         B,
