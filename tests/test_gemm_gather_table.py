@@ -41,6 +41,7 @@ def test_gather_table_plan_observer(fused, monkeypatch):
         config = GemmConfig(
             tile_m=64, tile_n=128, pingpong=True, cluster_m=2, cluster_n=1,
             cluster_k=1, max_swizzle_size=2, device_capacity=9, use_tma_gather=False,
+            is_dynamic_persistent=False,
         )
         module, runner = import_module("quack.epilogue.frontend"), "run_gemm_epi_plan"
     else:
@@ -75,6 +76,70 @@ def test_gather_table_plan_observer(fused, monkeypatch):
         expected = ["key_start", "cache_hit"] if hit else ["key_start", "cache_miss", "plan_built"]
         assert events == [*expected, "dispatch"]
         torch.testing.assert_close(out.float(), reference, atol=6e-2, rtol=2e-3)
+
+
+@torch.inference_mode()
+def test_prepared_swiglu_gather_live_prefixes(monkeypatch):
+    from quack.epilogue.library import linear_act_mod
+    from quack.hopper_swiglu_gather import HopperSwiGLUGatherPlan
+
+    torch.manual_seed(123)
+    device, k, n = "cuda", 64, 128
+    xs = tuple(torch.randn(16, k, dtype=torch.bfloat16, device=device) for _ in range(2))
+    weights = (torch.randn(2, 2 * n, k, dtype=torch.bfloat16, device=device) / 8).mT
+    ids = tuple(torch.empty(9, dtype=torch.int32, device=device) for _ in xs)
+    table = torch.zeros(3, 6, dtype=torch.int32, device=device)
+    ready = torch.zeros(1, dtype=torch.int32, device=device)
+    out = torch.empty(18, n, dtype=torch.bfloat16, device=device)
+    config = GemmConfig(
+        tile_m=64, tile_n=128, pingpong=True, cluster_m=2, cluster_n=1, cluster_k=1,
+        is_dynamic_persistent=False, max_swizzle_size=2, device_capacity=9, use_tma_gather=False,
+    )
+    mod = linear_act_mod("swiglu", gated=True, has_c=False, has_rowvec=False,
+                         has_colvec=False, sr=False, has_alpha=False)
+    monkeypatch.setattr(mod, "_plan_cache", {})
+    plan = HopperSwiGLUGatherPlan(xs, weights, A_idx=ids, gather_work_table=table,
+                                  gather_work_table_ready=ready, postact_out=out, config=config)
+    with pytest.raises(ValueError, match="extents"):
+        plan.bind(10, 1)
+    with pytest.raises(ValueError, match="extents"):
+        plan.bind(2, 4)
+    for epoch, (rows, work) in enumerate(((1, 0), (3, 1), (5, 2), (1, 0), (2, 1), (3, 2))):
+        out.fill_(77)
+        for src, index in enumerate(ids):
+            index.copy_((torch.arange(9, device=device) * (1 + src) + epoch) % xs[src].shape[0])
+        binding = plan.bind(rows, work)
+        ready.fill_(work)
+        events = []
+        if not work:
+            binding.launch(plan_observer=events.append)
+            assert events == [] and (out == 77).all()
+            continue
+        ends = [[rows // 2, rows - rows // 2], [rows, rows]] if work == 2 else [[rows, rows]]
+        lo = [0, 0]
+        reference = []
+        for expert, hi in enumerate(ends):
+            table[expert] = torch.tensor(
+                [expert, 0, lo[0], hi[0], lo[1], hi[1]], dtype=torch.int32, device=device
+            )
+            for src, x in enumerate(xs):
+                selected = x[ids[src][lo[src]:hi[src]].long()]
+                gate, up = (selected.float() @ weights[expert].float()).chunk(2, dim=-1)
+                reference.append(gated_to_pytorch_fn_map["swiglu"](gate, up))
+            lo = hi
+        binding.launch(plan_observer=events.append)
+        if epoch == 1:
+            assert events == ["key_start", "cache_miss", "plan_built"]
+
+            def reject_lookup(*args, **kwargs):
+                pytest.fail("a bound SwiGLU plan rebuilt the shape cache key")
+
+            monkeypatch.setattr("quack.epilogue.frontend._mod_gemm_key", reject_lookup)
+        else:
+            assert events == ["plan_reused"]
+        torch.testing.assert_close(binding.output.float(), torch.cat(reference),
+                                   atol=6e-2, rtol=2e-3)
+        assert (out[2 * rows:] == 77).all()
 
 
 @torch.inference_mode()
